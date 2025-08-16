@@ -1,0 +1,9 @@
+{
+  "source": "sentinel",
+  "index": "ΔK200",
+  "level": "LV2",
+  "delta_pct": -1.12,
+  "covix": 3.1,
+  "triggered_at": "2025-08-16T11:10:00+09:00",
+  "note": "manual-test"
+}
