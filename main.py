@@ -1,13 +1,14 @@
-# main.py  (Assistants API v2)
+# main.py  (Assistants API v2, thread 고정 지원)
 import os, time, logging, requests
 from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 
-APP_VERSION = "sentinel-fastapi-v2-1.0.0"
+APP_VERSION = "sentinel-fastapi-v2-1.1.0"
 
 # ── 환경변수 ───────────────────────────────────────────────
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
 ASSISTANT_ID     = os.getenv("CAIA_ASSISTANT_ID", "")  # v2 Assistant ID
+CAIA_THREAD_ID   = os.getenv("CAIA_THREAD_ID", "")     # ★ 메인 대화창 Thread ID (있으면 그걸로 전송)
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 LOG_LEVEL        = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -30,6 +31,7 @@ def within_dedup(idx, lvl):
 # ── 외부 전송 함수 ──────────────────────────────────────────
 def send_telegram(text: str):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        log.warning("Telegram env 미설정 → 스킵")
         return False
     try:
         r = requests.post(
@@ -37,34 +39,48 @@ def send_telegram(text: str):
             data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=10,
         )
+        if not r.ok:
+            log.error("Telegram 실패 %s %s", r.status_code, r.text)
         return r.ok
     except Exception as e:
         log.exception("Telegram 예외: %s", e)
         return False
 
 def send_caia_v2(text: str):
+    """
+    v2 Assistants API
+    - CAIA_THREAD_ID가 있으면 그 스레드에 직접 메시지 추가 + Run 실행
+    - 없으면 새 스레드 생성 후 메시지 추가 + Run 실행
+    """
     if not (OPENAI_API_KEY and ASSISTANT_ID):
+        log.warning("OpenAI env 미설정 → 스킵")
         return False
+
     base = "https://api.openai.com/v1"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
         "OpenAI-Beta": "assistants=v2",
     }
+
     try:
-        # 1) 새 Thread 생성
-        tr = requests.post(f"{base}/threads", headers=headers, timeout=8)
-        if not tr.ok:
-            log.error("Thread 생성 실패 %s %s", tr.status_code, tr.text)
-            return False
-        thread_id = tr.json()["id"]
+        # 1) Thread 결정
+        if CAIA_THREAD_ID:
+            thread_id = CAIA_THREAD_ID
+            log.info("기존 Thread 사용: %s", thread_id)
+        else:
+            tr = requests.post(f"{base}/threads", headers=headers, timeout=8)
+            if not tr.ok:
+                log.error("Thread 생성 실패 %s %s", tr.status_code, tr.text)
+                return False
+            thread_id = tr.json().get("id", "")
+            log.info("새 Thread 생성: %s", thread_id)
 
         # 2) 메시지 추가
-        msg_payload = {"role": "user", "content": text}
         r1 = requests.post(
             f"{base}/threads/{thread_id}/messages",
             headers=headers,
-            json=msg_payload,
+            json={"role": "user", "content": text},
             timeout=8,
         )
         if not r1.ok:
@@ -72,14 +88,18 @@ def send_caia_v2(text: str):
             return False
 
         # 3) Run 실행
-        run_payload = {"assistant_id": ASSISTANT_ID}
         r2 = requests.post(
-            f"{base}/threads/{thread_id}/runs", headers=headers, json=run_payload, timeout=8
+            f"{base}/threads/{thread_id}/runs",
+            headers=headers,
+            json={"assistant_id": ASSISTANT_ID},
+            timeout=12,
         )
         if not r2.ok:
             log.error("Run 실행 실패 %s %s", r2.status_code, r2.text)
             return False
+
         return True
+
     except Exception as e:
         log.exception("OpenAI 예외: %s", e)
         return False
@@ -94,6 +114,7 @@ def health():
         "version": APP_VERSION,
         "assistant_set": bool(ASSISTANT_ID),
         "tg_set": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
+        "thread_fixed": bool(CAIA_THREAD_ID),
         "dedup_min": DEDUP_WINDOW_MIN,
     }
 
@@ -106,7 +127,7 @@ async def sentinel_alert(request: Request):
         if f not in data:
             raise HTTPException(status_code=400, detail=f"missing field {f}")
 
-    idx, lvl = data["index"], data["level"].upper()
+    idx, lvl = data["index"], str(data["level"]).upper()
     if lvl not in {"LV1", "LV2", "LV3"}:
         raise HTTPException(status_code=400, detail="level must be LV1/LV2/LV3")
 
@@ -118,7 +139,10 @@ async def sentinel_alert(request: Request):
     covix = data.get("covix")
     msg = f"📡 [{lvl}] {idx} {delta:+.2f}%"
     if covix is not None:
-        msg += f" / COVIX {covix:+.2f}"
+        try:
+            msg += f" / COVIX {float(covix):+.2f}"
+        except Exception:
+            msg += f" / COVIX {covix}"
     msg += f" / ⏱ {data['triggered_at']}"
     if note := data.get("note"):
         msg += f" / 📝 {note}"
