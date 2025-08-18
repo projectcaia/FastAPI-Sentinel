@@ -1,27 +1,25 @@
-# market_watcher.py — FGPT Sentinel 시장감시 워커 (강화판)
+# market_watcher.py — FGPT Sentinel 시장감시 워커 (안정화 멀티소스 버전)
 # - 주기: 기본 30분 (WATCH_INTERVAL_SEC=1800)
-# - 알림 정책: 레벨이 "충족/강화/약화/해제" 될 때만 전송 (동일 레벨 유지 시 미전송)
-# - 세션: KST 기준 주간(KR: ΔK200) / 야간(US: S&P500, NASDAQ, VIX) 자동 전환
-# - Fallback: ΔK200은 ^KS200 → (069500.KS, 102110.KS) 평균 → ^KS11
-# - Yahoo 401 회피: 헤더 보강 + query2 사용 + 재시도/백오프
-# - 선택: yfinance 지원 (YF_ENABLED=true 설정 시)
-# - 확장: DATA_PROVIDERS 환경변수로 소스 우선순위 지정 (예: "yahoo,yfinance")
+# - 알림 정책: 레벨이 "진입/변경/해제" 때만 전송
+# - 세션: KST 주간(KR: ΔK200) / 야간(US: S&P500, NASDAQ, VIX) 자동 전환
+# - 데이터 소스: yfinance → alphavantage → yahoo (체인 폴백)
+# - Yahoo 401 회피: 헤더 보강 + query2 + 재시도/백오프
+# - URL 보정: SENTINEL_BASE_URL에 스킴 미입력 시 https:// 자동 보정
 #
-# 필요 환경변수(.env):
-#   SENTINEL_BASE_URL=https://fastapi-sentinel-production.up.railway.app   # 끝에 / 없음
-#   SENTINEL_KEY=sentinel_...                                              # web/worker 동일
+# 필요 ENV
+#   SENTINEL_BASE_URL=fastapi-sentinel-production.up.railway.app  # 스킴 없어도 됨(코드가 보정)
+#   SENTINEL_KEY=sentinel_...
 #   WATCH_INTERVAL_SEC=1800
 #   LOG_LEVEL=INFO
 #   BOLL_K_SIGMA=2.0
 #   BOLL_WINDOW=20
 #   WATCHER_STATE_PATH=./market_state.json
-#   # 선택:
-#   YF_ENABLED=true                  # yfinance 사용 허용 (requirements.txt에 yfinance 추가)
-#   DATA_PROVIDERS=yahoo,yfinance    # 우선순위 (쉼표 구분, 미설정 시 yahoo만)
+#   YF_ENABLED=true
+#   DATA_PROVIDERS=yfinance,alphavantage,yahoo
+#   ALPHAVANTAGE_API_KEY=YOUR_KEY
 #   ALERT_CAP=2000
 #
-# 상태 저장:
-#   ./market_state.json 에 마지막 레벨 상태를 저장하여 레벨변경 감지
+# 권장: SENTINEL_BASE_URL은 가능하면 https://포함 형태로 넣기
 
 import os, time, json, logging, requests, math
 from datetime import datetime, timezone, timedelta
@@ -31,7 +29,15 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("market-watcher")
 
-SENTINEL_BASE_URL = os.getenv("SENTINEL_BASE_URL", "https://fastapi-sentinel-production.up.railway.app").rstrip("/")
+def _normalize_base(url: str) -> str:
+    u = (url or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if not (u.startswith("http://") or u.startswith("https://")):
+        u = "https://" + u
+    return u
+
+SENTINEL_BASE_URL = _normalize_base(os.getenv("SENTINEL_BASE_URL", ""))
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "").strip()
 
 def parse_int_env(key: str, default: int) -> int:
@@ -54,8 +60,18 @@ STATE_PATH     = os.getenv("WATCHER_STATE_PATH", "./market_state.json")
 K_SIGMA        = parse_float_env("BOLL_K_SIGMA", 2.0)
 BB_WINDOW      = parse_int_env("BOLL_WINDOW", 20)
 
+# 멀티소스 설정
 YF_ENABLED     = os.getenv("YF_ENABLED", "false").lower() in ("1", "true", "yes")
-DATA_PROVIDERS = [s.strip().lower() for s in os.getenv("DATA_PROVIDERS", "yahoo").split(",") if s.strip()]
+DATA_PROVIDERS = [s.strip().lower() for s in os.getenv("DATA_PROVIDERS", "yfinance,alphavantage,yahoo").split(",") if s.strip()]
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+
+# 지수 → ETF 프록시 (Alpha Vantage는 지수 직접 조회 제약. ETF로 Δ% 대체)
+AV_PROXY_MAP = {
+    "^GSPC": "SPY",       # S&P500
+    "^IXIC": "QQQ",       # NASDAQ100
+    "^VIX":  "VIXY",      # VIX
+    "^KS200": "069500.KS" # 필요 시 사용(국내는 yfinance/네이버 권장)
+}
 
 # 공통 헤더 (Yahoo 401 회피)
 COMMON_HEADERS = {
@@ -96,7 +112,7 @@ def _load_state() -> dict:
     except Exception:
         return {}
 
-# -------------------- 데이터 소스: Yahoo --------------------
+# -------------------- HTTP 유틸 (재시도/백오프) --------------------
 def _http_get(url: str, params=None, timeout=10, max_retry=3):
     last = None
     for i in range(max_retry):
@@ -113,7 +129,6 @@ def _http_get(url: str, params=None, timeout=10, max_retry=3):
                 continue
             raise
         except Exception as e:
-            # 네트워크 등 → 소폭 재시도
             time.sleep(1.0 + i)
             last = e
             continue
@@ -121,18 +136,15 @@ def _http_get(url: str, params=None, timeout=10, max_retry=3):
         raise last
     raise RuntimeError("HTTP 요청 실패(원인 미상)")
 
+# -------------------- 데이터 소스: Yahoo --------------------
 def _yahoo_quote(symbols):
-    if isinstance(symbols, (list, tuple)):
-        symbols_param = ",".join(symbols)
-    else:
-        symbols_param = symbols
+    symbols_param = ",".join(symbols) if isinstance(symbols, (list, tuple)) else symbols
     # query2로 전환
     url = "https://query2.finance.yahoo.com/v7/finance/quote"
     r = _http_get(url, params={"symbols": symbols_param}, timeout=12, max_retry=3)
     return r.json()
 
 def _yahoo_chart(symbol: str, rng: str, interval: str):
-    # chart도 query2 사용
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {"range": rng, "interval": interval}
     r = _http_get(url, params=params, timeout=12, max_retry=3)
@@ -162,7 +174,7 @@ def _extract_change_percent(q: dict):
 _YF_READY = False
 if YF_ENABLED:
     try:
-        import yfinance as yf  # requirements.txt: yfinance>=0.2.40 추가 필요
+        import yfinance as yf  # requirements.txt: yfinance>=0.2.40 필요
         _YF_READY = True
     except Exception as e:
         log.warning("yfinance import 실패(YF_ENABLED=true): %s", e)
@@ -170,34 +182,75 @@ if YF_ENABLED:
 def _yf_change_percent(symbol: str):
     if not _YF_READY:
         raise RuntimeError("yfinance not ready")
-    try:
-        t = yf.Ticker(symbol)
-        info = getattr(t, "fast_info", None)
-        if info and getattr(info, "last_price", None) is not None and getattr(info, "previous_close", None) not in (None, 0):
-            last = float(info.last_price)
-            prev = float(info.previous_close)
-            return (last - prev) / prev * 100.0
-        # fallback: history
-        hist = t.history(period="2d", interval="1d")
-        if hist is not None and len(hist) >= 2:
-            prev = float(hist["Close"].iloc[-2])
-            last = float(hist["Close"].iloc[-1])
-            return (last - prev) / prev * 100.0
-        raise RuntimeError("yfinance insufficient data")
-    except Exception as e:
-        raise RuntimeError(f"yfinance fetch failed: {e}")
+    t = yf.Ticker(symbol)
+    info = getattr(t, "fast_info", None)
+    if info and getattr(info, "last_price", None) is not None and getattr(info, "previous_close", None) not in (None, 0):
+        last = float(info.last_price)
+        prev = float(info.previous_close)
+        return (last - prev) / prev * 100.0
+    # fallback: history
+    hist = t.history(period="2d", interval="1d")
+    if hist is not None and len(hist) >= 2:
+        prev = float(hist["Close"].iloc[-2])
+        last = float(hist["Close"].iloc[-1])
+        return (last - prev) / prev * 100.0
+    raise RuntimeError("yfinance insufficient data")
 
-# -------------------- 심볼별 Δ% 계산 --------------------
+# -------------------- 데이터 소스: Alpha Vantage (ETF 프록시) --------------------
+def _alphavantage_change_percent(symbol: str) -> float:
+    if not ALPHAVANTAGE_API_KEY:
+        raise RuntimeError("ALPHAVANTAGE_API_KEY not set")
+    sym = AV_PROXY_MAP.get(symbol, symbol)
+    url = "https://www.alphavantage.co/query"
+    params = {"function": "GLOBAL_QUOTE", "symbol": sym, "apikey": ALPHAVANTAGE_API_KEY}
+    r = _http_get(url, params=params, timeout=12, max_retry=2)
+    data = r.json()
+    # 레이트리밋/오류 메시지 대응
+    if not isinstance(data, dict) or "Note" in data or "Information" in data:
+        raise RuntimeError(f"AV rate/info: {data}")
+    q = data.get("Global Quote") or data.get("globalQuote") or data
+    if not isinstance(q, dict) or not q:
+        raise RuntimeError(f"AV empty for {sym}")
+    cp = q.get("10. change percent") or q.get("changePercent")
+    if cp:
+        try:
+            return float(str(cp).strip().rstrip("%"))
+        except Exception:
+            pass
+    price = q.get("05. price") or q.get("price")
+    prev  = q.get("08. previous close") or q.get("previousClose")
+    if price is not None and prev not in (None, "0", 0):
+        price_f = float(price); prev_f = float(prev)
+        if prev_f != 0:
+            return (price_f - prev_f) / prev_f * 100.0
+    raise RuntimeError(f"AV invalid quote for {sym}: {q}")
+
+# -------------------- 프로바이더 체인 --------------------
 def _provider_chain_get_change(symbols):
-    """
-    DATA_PROVIDERS 순서대로 시도.
-    지원: yahoo, yfinance
-    symbols: str or list
-    """
     last_err = None
     for provider in DATA_PROVIDERS:
         try:
-            if provider == "yahoo":
+            if provider == "yfinance":
+                if not _YF_READY:
+                    raise RuntimeError("yfinance disabled/not ready")
+                if isinstance(symbols, (list, tuple)):
+                    vals = [_yf_change_percent(s) for s in symbols]
+                    if vals:
+                        return sum(vals) / len(vals)
+                    raise RuntimeError("yfinance empty")
+                else:
+                    return _yf_change_percent(symbols)
+
+            elif provider == "alphavantage":
+                if isinstance(symbols, (list, tuple)):
+                    vals = [_alphavantage_change_percent(s) for s in symbols]
+                    if vals:
+                        return sum(vals) / len(vals)
+                    raise RuntimeError("alphavantage empty")
+                else:
+                    return _alphavantage_change_percent(symbols)
+
+            elif provider == "yahoo":
                 data = _yahoo_quote(symbols)
                 items = data.get("quoteResponse", {}).get("result", [])
                 if isinstance(symbols, (list, tuple)):
@@ -207,34 +260,17 @@ def _provider_chain_get_change(symbols):
                         if cp is not None:
                             vals.append(float(cp))
                     if vals:
-                        return sum(vals)/len(vals)
-                    raise RuntimeError("yahoo: no valid change%")
+                        return sum(vals) / len(vals)
+                    raise RuntimeError("yahoo empty")
                 else:
                     if not items:
-                        raise RuntimeError("yahoo: empty result")
+                        raise RuntimeError("yahoo empty")
                     cp = _extract_change_percent(items[0])
                     if cp is None:
-                        raise RuntimeError("yahoo: change% none")
+                        raise RuntimeError("yahoo cp None")
                     return float(cp)
-
-            elif provider == "yfinance":
-                if isinstance(symbols, (list, tuple)):
-                    vals = []
-                    for s in symbols:
-                        vals.append(_yf_change_percent(s))
-                    if vals:
-                        return sum(vals)/len(vals)
-                    raise RuntimeError("yfinance: no values")
-                else:
-                    return _yf_change_percent(symbols)
-
-            # TODO: tradingview / investing / naver 플러그인 위치
-            # elif provider == "tradingview": ...
-            # elif provider == "investing": ...
-            # elif provider == "naver": ...
             else:
                 raise RuntimeError(f"unknown provider {provider}")
-
         except Exception as e:
             last_err = e
             log.debug("provider %s failed: %s", provider, e)
@@ -243,6 +279,10 @@ def _provider_chain_get_change(symbols):
         raise last_err
     raise RuntimeError("no provider available")
 
+# -------------------- Δ% 계산 --------------------
+def get_delta(symbol) -> float:
+    return float(_provider_chain_get_change([symbol]))
+
 def get_delta_k200() -> tuple[float, str]:
     # 1) ^KS200
     try:
@@ -250,27 +290,21 @@ def get_delta_k200() -> tuple[float, str]:
         return float(cp), SYMBOL_PRIMARY
     except Exception as e:
         log.warning("primary ^KS200 실패: %s", e)
-
     # 2) ETF 평균
     try:
         cp = _provider_chain_get_change(SYMBOL_FALLBACKS[:2])
         return float(cp), "ETF_AVG(069500.KS,102110.KS)"
     except Exception as e:
         log.warning("ETF 평균 실패: %s", e)
-
     # 3) KOSPI 본지수
     try:
         cp = _provider_chain_get_change([SYMBOL_FALLBACKS[-1]])
         return float(cp), SYMBOL_FALLBACKS[-1]
     except Exception as e:
         log.warning("KOSPI 본지수 ^KS11 실패: %s", e)
+    raise RuntimeError("ΔK200 추정 실패")
 
-    raise RuntimeError("ΔK200 추정 실패: 모든 소스에서 데이터 없음")
-
-def get_delta(symbol) -> float:
-    cp = _provider_chain_get_change([symbol])
-    return float(cp)
-
+# -------------------- 레벨링 --------------------
 def grade_level(delta_pct: float) -> str | None:
     a = abs(delta_pct)
     if a >= 1.5: return "LV3"
@@ -279,25 +313,25 @@ def grade_level(delta_pct: float) -> str | None:
     return None
 
 # -------------------- 알림 --------------------
-def post_alert(index_name: str, delta_pct: float, level: str | None, source_tag: str, note: str):
-    # level이 None이면 '해제' 알림으로 처리, 볼린저는 특수 레벨 사용
-    if level in ["BREACH", "RECOVER", "CLEARED"]:
-        display_level = "LV2" if level != "CLEARED" else level
-        note = f"[BB {level}] " + note
-    else:
-        display_level = level if level else "CLEARED"
-
+def post_alert(index_name: str, delta_pct: float | None, level: str | None, source_tag: str, note: str):
+    # level None → CLEARED
+    display_level = level if level else "CLEARED"
     payload = {
         "index": index_name,
         "level": display_level,
         "delta_pct": round(delta_pct, 2) if delta_pct is not None else None,
         "triggered_at": _now_kst_iso(),
-        "note": note + f" [{source_tag}]",
+        "note": f"{note} [{source_tag}]",
     }
     headers = {"Content-Type": "application/json"}
     if SENTINEL_KEY:
         headers["x-sentinel-key"] = SENTINEL_KEY
-    url = f"{SENTINEL_BASE_URL}/sentinel/alert"
+
+    url = f"{SENTINEL_BASE_URL}/sentinel/alert" if SENTINEL_BASE_URL else ""
+    if not url.startswith("http"):
+        # 추가 안전망 (베이스가 비어있거나 보정 실패한 경우)
+        raise RuntimeError(f"SENTINEL_BASE_URL invalid: '{SENTINEL_BASE_URL}'")
+
     r = requests.post(url, headers=headers, json=payload, timeout=15)
     if not r.ok:
         log.error("알람 전송 실패 %s %s", r.status_code, r.text)
@@ -375,18 +409,11 @@ def check_and_alert_bb(state: dict, sess: str):
                 continue
     return state
 
-# -------------------- 메인 감시 루프 --------------------
-def grade_level(delta_pct: float) -> str | None:
-    a = abs(delta_pct)
-    if a >= 1.5: return "LV3"
-    if a >= 1.0: return "LV2"
-    if a >= 0.4: return "LV1"
-    return None
-
+# -------------------- 메인 감시 --------------------
 def check_and_alert():
     state = _load_state()
-
     sess = current_session()
+
     if sess == "KR":
         try:
             delta, tag = get_delta_k200()
@@ -428,7 +455,7 @@ def check_and_alert():
     _save_state(state)
 
 def run_loop():
-    log.info("시장감시 워커 시작: interval=%ss, base=%s", WATCH_INTERVAL, SENTINEL_BASE_URL)
+    log.info("시장감시 워커 시작: 간격=%ss, base=%s", WATCH_INTERVAL, SENTINEL_BASE_URL or "(unset)")
     log.info("정책: %d초 유지, 레벨 변경시에만 업데이트, 한/미 자동 전환", WATCH_INTERVAL)
     log.info("볼린저 밴드: ±%.1fσ 기준, %d기간 이동평균", K_SIGMA, BB_WINDOW)
     # 초기 즉시 체크
