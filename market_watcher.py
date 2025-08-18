@@ -57,7 +57,7 @@ def parse_float_env(key: str, default: float) -> float:
 
 WATCH_INTERVAL = parse_int_env("WATCH_INTERVAL_SEC", 1800)  # 30분 기본
 STATE_PATH     = os.getenv("WATCHER_STATE_PATH", "./market_state.json")
-K_SIGMA        = parse_float_env("BOLL_K_SIGMA", 2.0)
+K_SIGMA        = parse_float_env("BOLL_K_SIGMA", 2.5)  # 2.5 시그마로 상향 (노이즈 감소)
 BB_WINDOW      = parse_int_env("BOLL_WINDOW", 20)
 
 # 멀티소스 설정
@@ -305,11 +305,20 @@ def get_delta_k200() -> tuple[float, str]:
     raise RuntimeError("ΔK200 추정 실패")
 
 # -------------------- 레벨링 --------------------
-def grade_level(delta_pct: float) -> str | None:
+def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
+    """레벨 판정 - VIX는 별도 기준 적용"""
     a = abs(delta_pct)
-    if a >= 1.5: return "LV3"
-    if a >= 1.0: return "LV2"
-    if a >= 0.4: return "LV1"
+    
+    if is_vix:
+        # VIX는 변동성이 크므로 더 높은 임계값 적용
+        if a >= 10.0: return "LV3"  # ±10% 이상
+        if a >= 7.0: return "LV2"   # ±7% 이상  
+        if a >= 5.0: return "LV1"   # ±5% 이상
+    else:
+        # 일반 지수 (KOSPI, S&P500, NASDAQ)
+        if a >= 2.5: return "LV3"   # ±2.5% 이상 (기존 1.5%에서 상향)
+        if a >= 1.5: return "LV2"   # ±1.5% 이상 (기존 1.0%에서 상향)
+        if a >= 0.8: return "LV1"   # ±0.8% 이상 (기존 0.4%에서 상향)
     return None
 
 # -------------------- 알림 --------------------
@@ -457,7 +466,9 @@ def check_and_alert():
 def run_loop():
     log.info("시장감시 워커 시작: 간격=%ss, base=%s", WATCH_INTERVAL, SENTINEL_BASE_URL or "(unset)")
     log.info("정책: %d초 유지, 레벨 변경시에만 업데이트, 한/미 자동 전환", WATCH_INTERVAL)
-    log.info("볼린저 밴드: ±%.1fσ 기준, %d기간 이동평균", K_SIGMA, BB_WINDOW)
+    log.info("볼린저 밴드: ±%.1fσ 기준, %d기간 이동평균 (현재 비활성화)", K_SIGMA, BB_WINDOW)
+    log.info("일반지수 임계값: LV1=±0.8%%, LV2=±1.5%%, LV3=±2.5%%")
+    log.info("VIX 임계값: LV1=±5%%, LV2=±7%%, LV3=±10%%")
     # 초기 즉시 체크
     try:
         log.info("초기 시장 체크 실행...")
