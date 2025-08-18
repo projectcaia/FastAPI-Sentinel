@@ -30,7 +30,9 @@ def test_env_vars():
         "TELEGRAM_BOT_TOKEN": "텔레그램 봇 토큰",
         "TELEGRAM_CHAT_ID": "텔레그램 채팅 ID",
         "SENTINEL_KEY": "Sentinel 보안 키",
-        "SENTINEL_BASE_URL": "Sentinel API URL"
+        "SENTINEL_BASE_URL": "Sentinel API URL",
+        "DEDUP_WINDOW_MIN": "중복 억제 시간(분)",
+        "WATCH_INTERVAL_SEC": "감시 주기(초)"
     }
     
     missing = []
@@ -40,8 +42,19 @@ def test_env_vars():
             # 민감한 정보는 일부만 표시
             if "KEY" in var or "TOKEN" in var:
                 display = f"{value[:10]}..." if len(value) > 10 else "SET"
+            elif var in ["DEDUP_WINDOW_MIN", "WATCH_INTERVAL_SEC"]:
+                # 숫자 환경변수 검증
+                import re
+                if re.search(r'\d+', value):
+                    num = re.search(r'\d+', value).group()
+                    if value != num:
+                        display = f"{value[:20]}... ⚠️ 숫자만 입력하세요! (예: {num})"
+                    else:
+                        display = value
+                else:
+                    display = f"{value} ❌ 잘못된 값"
             else:
-                display = value
+                display = value[:50] if len(value) > 50 else value
             log.info(f"  ✅ {var}: {display}")
         else:
             log.warning(f"  ❌ {var}: NOT SET ({desc})")

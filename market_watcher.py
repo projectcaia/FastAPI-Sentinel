@@ -22,7 +22,17 @@ log = logging.getLogger("market-watcher")
 
 SENTINEL_BASE_URL = os.getenv("SENTINEL_BASE_URL", "https://fastapi-sentinel-production.up.railway.app").rstrip("/")
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "").strip()
-WATCH_INTERVAL    = int(os.getenv("WATCH_INTERVAL_SEC", "300"))  # 5분 기본 (기존 30분은 너무 김)
+# 환경변수에서 숫자만 추출 (설명 텍스트 제거)
+def parse_int_env(key: str, default: int) -> int:
+    """환경변수를 정수로 파싱 (설명 텍스트 자동 제거)"""
+    value = os.getenv(key, str(default))
+    import re
+    match = re.search(r'\d+', value)
+    if match:
+        return int(match.group())
+    return default
+
+WATCH_INTERVAL    = parse_int_env("WATCH_INTERVAL_SEC", 1800)  # 30분 기본 (충분한 간격)
 STATE_PATH        = os.getenv("WATCHER_STATE_PATH", "./market_state.json")  # 로컬 디렉토리로 변경
 
 UA = {"User-Agent": "Mozilla/5.0 (FGPT-Caia MarketWatcher)"}
@@ -189,8 +199,21 @@ def current_session() -> str:
 
 import math
 
-K_SIGMA = float(os.getenv("BOLL_K_SIGMA", "1.5"))  # 1.5 시그마로 민감도 상향
-BB_WINDOW = int(os.getenv("BOLL_WINDOW", "20"))
+# float 환경변수도 안전하게 파싱
+def parse_float_env(key: str, default: float) -> float:
+    """환경변수를 실수로 파싱 (설명 텍스트 자동 제거)"""
+    value = os.getenv(key, str(default))
+    import re
+    match = re.search(r'[\d.]+', value)
+    if match:
+        try:
+            return float(match.group())
+        except ValueError:
+            return default
+    return default
+
+K_SIGMA = parse_float_env("BOLL_K_SIGMA", 2.0)  # 2.0 시그마 기본값 (안정적)
+BB_WINDOW = parse_int_env("BOLL_WINDOW", 20)
 
 def _yahoo_chart(symbol: str, rng: str, interval: str):
     """Yahoo chart API 호출, (timestamps, closes) 반환"""

@@ -13,8 +13,19 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "")        # (선택) POST 보호용 공유키
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()
-DEDUP_WINDOW_MIN  = int(os.getenv("DEDUP_WINDOW_MIN", "10"))  # 10분으로 줄임 (5분 주기 고려)
-ALERT_CAP         = int(os.getenv("ALERT_CAP", "2000"))  # 링버퍼 크기
+# 환경변수에서 숫자만 추출 (설명 텍스트 제거)
+def parse_int_env(key: str, default: int) -> int:
+    """환경변수를 정수로 파싱 (설명 텍스트 자동 제거)"""
+    value = os.getenv(key, str(default))
+    # 숫자만 추출 (첫 번째 숫자 그룹)
+    import re
+    match = re.search(r'\d+', value)
+    if match:
+        return int(match.group())
+    return default
+
+DEDUP_WINDOW_MIN  = parse_int_env("DEDUP_WINDOW_MIN", 30)  # 30분 기본값 (충분한 간격)
+ALERT_CAP         = parse_int_env("ALERT_CAP", 2000)  # 링버퍼 크기
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -26,10 +37,12 @@ log = logging.getLogger("sentinel-fastapi-v2")
 log.info("=" * 60)
 log.info("Sentinel FastAPI v2 환경변수 상태:")
 log.info("  OPENAI_API_KEY: %s", "SET" if OPENAI_API_KEY else "NOT SET")
-log.info("  ASSISTANT_ID: %s", ASSISTANT_ID if ASSISTANT_ID else "NOT SET")
+log.info("  ASSISTANT_ID: %s", ASSISTANT_ID[:20] + "..." if ASSISTANT_ID else "NOT SET")
 log.info("  TELEGRAM: %s", "SET" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "NOT SET")
 log.info("  SENTINEL_KEY: %s", "SET" if SENTINEL_KEY else "NOT SET")
 log.info("  DEDUP_WINDOW_MIN: %d분", DEDUP_WINDOW_MIN)
+log.info("  ALERT_CAP: %d", ALERT_CAP)
+log.info("  원본 ENV 값 예시: %s", os.getenv("DEDUP_WINDOW_MIN", "NOT SET")[:50])  # 디버깅용
 log.info("=" * 60)
 
 # ── 중복 억제 및 링버퍼 ──────────────────────────────────────────────
