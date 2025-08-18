@@ -13,11 +13,24 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "")        # (선택) POST 보호용 공유키
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()
-DEDUP_WINDOW_MIN  = int(os.getenv("DEDUP_WINDOW_MIN", "30"))
+DEDUP_WINDOW_MIN  = int(os.getenv("DEDUP_WINDOW_MIN", "10"))  # 10분으로 줄임 (5분 주기 고려)
 ALERT_CAP         = int(os.getenv("ALERT_CAP", "2000"))  # 링버퍼 크기
 
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 log = logging.getLogger("sentinel-fastapi-v2")
+
+# 환경변수 상태 로깅
+log.info("=" * 60)
+log.info("Sentinel FastAPI v2 환경변수 상태:")
+log.info("  OPENAI_API_KEY: %s", "SET" if OPENAI_API_KEY else "NOT SET")
+log.info("  ASSISTANT_ID: %s", ASSISTANT_ID if ASSISTANT_ID else "NOT SET")
+log.info("  TELEGRAM: %s", "SET" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "NOT SET")
+log.info("  SENTINEL_KEY: %s", "SET" if SENTINEL_KEY else "NOT SET")
+log.info("  DEDUP_WINDOW_MIN: %d분", DEDUP_WINDOW_MIN)
+log.info("=" * 60)
 
 # ── 중복 억제 및 링버퍼 ──────────────────────────────────────────────
 _last_fired = {}                        # key=(index,level) -> epoch
@@ -198,31 +211,52 @@ async def sentinel_alert(
             raise HTTPException(status_code=400, detail=f"missing field {f}")
 
     lvl = str(data["level"]).upper()
-    if lvl not in {"LV1", "LV2", "LV3"}:
-        raise HTTPException(status_code=400, detail="level must be LV1/LV2/LV3")
+    # CLEARED나 볼린저 밴드 이벤트도 허용
+    valid_levels = {"LV1", "LV2", "LV3", "CLEARED", "BREACH", "RECOVER"}
+    if lvl not in valid_levels:
+        log.warning("예상치 않은 레벨: %s, LV2로 처리", lvl)
+        lvl = "LV2"  # 기본값으로 처리
 
     idx = str(data["index"])
 
-    # 중복 억제
-    if within_dedup(idx, lvl):
-        log.info("dedup: %s %s", idx, lvl)
-        # 중복이어도 inbox에는 적재(선택 가능). 여기선 억제: 미적재.
-        return {"status": "dedup_suppressed"}
+    # 중복 억제 (CLEARED는 항상 통과)
+    if lvl != "CLEARED" and within_dedup(idx, lvl):
+        log.info("중복 억제: %s %s (최근 %d분 내 중복)", idx, lvl, DEDUP_WINDOW_MIN)
+        # 중복이어도 inbox에는 적재
+        _append_inbox(data)
+        return {"status": "dedup_suppressed", "reason": f"same alert within {DEDUP_WINDOW_MIN} minutes"}
 
     # 메시지 생성
     data["level"] = lvl
     msg = _format_msg(data)
+    
+    log.info("알림 전송: %s %s %.2f%% - %s", 
+             idx, lvl, float(data.get("delta_pct", 0)), 
+             data.get("note", ""))
 
     # 텔레그램 우선 전송
     tg_ok = send_telegram(msg)
+    if tg_ok:
+        log.info("텔레그램 전송 성공")
+    else:
+        log.warning("텔레그램 전송 실패")
 
     # 카이아(Assistants v2) 전송 시도
     caia_ok = send_caia_v2(msg)
+    if caia_ok:
+        log.info("CAIA 전송 성공")
+    else:
+        log.warning("CAIA 전송 실패 또는 미설정")
 
     # inbox 적재(단기 보관)
     _append_inbox(data)
 
-    return {"status": "delivered", "telegram": tg_ok, "caia_thread": caia_ok}
+    return {
+        "status": "delivered", 
+        "telegram": tg_ok, 
+        "caia_thread": caia_ok,
+        "message": msg
+    }
 
 @app.get("/sentinel/inbox")
 def sentinel_inbox(

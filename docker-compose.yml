@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  worker:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: python market_watcher.py
+    restart: unless-stopped
+    depends_on:
+      - web
+
+  # 개발용 테스트 서비스
+  test:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    command: python test_system.py
+    profiles:
+      - test

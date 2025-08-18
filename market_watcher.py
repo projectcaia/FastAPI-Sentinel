@@ -22,8 +22,8 @@ log = logging.getLogger("market-watcher")
 
 SENTINEL_BASE_URL = os.getenv("SENTINEL_BASE_URL", "https://fastapi-sentinel-production.up.railway.app").rstrip("/")
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "").strip()
-WATCH_INTERVAL    = int(os.getenv("WATCH_INTERVAL_SEC", "1800"))  # 30분 기본
-STATE_PATH        = os.getenv("WATCHER_STATE_PATH", "/mnt/data/market_state.json")
+WATCH_INTERVAL    = int(os.getenv("WATCH_INTERVAL_SEC", "300"))  # 5분 기본 (기존 30분은 너무 김)
+STATE_PATH        = os.getenv("WATCHER_STATE_PATH", "./market_state.json")  # 로컬 디렉토리로 변경
 
 UA = {"User-Agent": "Mozilla/5.0 (FGPT-Caia MarketWatcher)"}
 
@@ -140,9 +140,17 @@ def grade_level(delta_pct: float) -> str | None:
 
 def post_alert(index_name: str, delta_pct: float, level: str | None, source_tag: str, note: str):
     # level이 None이면 '해제' 알림으로 처리(레벨 해제)
+    # 볼린저 밴드 이벤트는 별도 처리
+    if level in ["BREACH", "RECOVER", "CLEARED"]:
+        # 볼린저 밴드 이벤트는 LV2로 매핑
+        display_level = "LV2" if level != "CLEARED" else level
+        note = f"[BB {level}] " + note
+    else:
+        display_level = level if level else "CLEARED"
+    
     payload = {
         "index": index_name,
-        "level": level if level else "CLEARED",
+        "level": display_level,
         "delta_pct": round(delta_pct, 2) if delta_pct is not None else None,
         "triggered_at": _now_kst_iso(),
         "note": note + f" [{source_tag}]"
@@ -161,6 +169,12 @@ def current_session() -> str:
     """KST 기준 세션 구분: KR(주간 08:30~16:00), US(야간 그 외 전 시간)."""
     now = _now_kst()
     hhmm = now.hour * 100 + now.minute
+    weekday = now.weekday()  # 0=월, 6=일
+    
+    # 주말은 항상 US 세션으로 처리
+    if weekday >= 5:  # 토요일(5), 일요일(6)
+        return "US"
+    
     if 830 <= hhmm <= 1600:
         return "KR"
     return "US"
@@ -175,7 +189,7 @@ def current_session() -> str:
 
 import math
 
-K_SIGMA = float(os.getenv("BOLL_K_SIGMA", "2.0"))
+K_SIGMA = float(os.getenv("BOLL_K_SIGMA", "1.5"))  # 1.5 시그마로 민감도 상향
 BB_WINDOW = int(os.getenv("BOLL_WINDOW", "20"))
 
 def _yahoo_chart(symbol: str, rng: str, interval: str):
@@ -254,11 +268,13 @@ def check_and_alert_bb(state: dict, sess: str):
                 prev = state.get(idx_name)  # "BREACH" / "RECOVER" / None
                 if ev and ev != prev:
                     # 레벨 대신 상태 문자열 사용, index명은 별도로 구분
+                    # 볼린저 밴드 이벤트 알림
+                    bb_note = f"KR 세션: Bollinger ±{K_SIGMA}σ {'돌파' if ev == 'BREACH' else '회복'} (z={z:.2f})"
                     post_alert(index_name="ΔK200_VOL",
                                delta_pct=round(z, 2),
                                level=ev,  # "BREACH" or "RECOVER"
                                source_tag=used,
-                               note=f"[EXT] KR 세션: Bollinger ±{K_SIGMA}σ 이벤트")
+                               note=bb_note)
                     state[idx_name] = ev
                 elif ev is None and prev:  # 상태 유지 → 알림 없음
                     pass
@@ -275,11 +291,13 @@ def check_and_alert_bb(state: dict, sess: str):
                 ev, z, used = bb_event_for_symbol(sym)
                 prev = state.get(state_key)
                 if ev and ev != prev:
+                    # US 볼린저 밴드 이벤트 알림
+                    bb_note = f"{label}: Bollinger ±{K_SIGMA}σ {'돌파' if ev == 'BREACH' else '회복'} (z={z:.2f})"
                     post_alert(index_name=idx_name,
                                delta_pct=round(z, 2),
                                level=ev,
                                source_tag=used,
-                               note=f"[EXT] {label}: Bollinger ±{K_SIGMA}σ 이벤트")
+                               note=bb_note)
                     state[state_key] = ev
             except Exception as e:
                 log.debug("US BB 실패 %s: %s", sym, e)
@@ -341,7 +359,16 @@ def check_and_alert():
 
 def run_loop():
     log.info("시장감시 워커 시작: interval=%ss, base=%s", WATCH_INTERVAL, SENTINEL_BASE_URL)
-    log.info("정책: 30분 주기, 레벨 변경시에만 알림, KR/US 자동 전환, 사일런트 비활성")
+    log.info("정책: %d초 주기, 레벨 변경시에만 알림, KR/US 자동 전환", WATCH_INTERVAL)
+    log.info("볼린저 밴드: ±%.1fσ 기준, %d기간 이동평균", K_SIGMA, BB_WINDOW)
+    
+    # 초기 실행으로 즉시 체크
+    log.info("초기 시장 체크 실행...")
+    try:
+        check_and_alert()
+        log.info("초기 시장 체크 완료")
+    except Exception as e:
+        log.error("초기 체크 실패: %s", e)
     while True:
         try:
             check_and_alert()
