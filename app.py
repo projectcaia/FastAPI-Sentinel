@@ -1,4 +1,4 @@
-from app.app_routes_sentinel import router as fc_sentinel_router
+from app.sentinel_router import router as fc_sentinel_router
 
 if __name__ == "__main__":
     import uvicorn
