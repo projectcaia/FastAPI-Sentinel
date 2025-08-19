@@ -1,8 +1,9 @@
-# app/routes/sentinel.py
+# app_routes_sentinel.py
 # ------------------------------------------------------------
-# Sentinel → Caia Relay Router
-# - POST /sentinel/alert : receive an alert and relay it to Caia main chat
-# - Minimal, drop-in patch: add this router and include_router(...) in main.py
+# Sentinel → Caia Relay Router (SDK-free, uses OpenAI REST via httpx)
+# Exposes:
+#   POST /fc/sentinel/alert
+#   GET  /fc/sentinel/health
 # ------------------------------------------------------------
 from __future__ import annotations
 
@@ -15,9 +16,9 @@ from typing import Optional, Literal, Dict, Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-from openai import AsyncOpenAI
+import httpx
 
-router = APIRouter(prefix="/sentinel", tags=["sentinel"])
+router = APIRouter(prefix="/sentinel", tags=["sentinel-fc"])
 log = logging.getLogger("uvicorn.error")
 
 # -----------------------
@@ -53,7 +54,7 @@ def _mark(key: str) -> None:
     _DEDUP[key] = time.time()
 
 # -----------------------
-# Relay → Caia
+# Relay → Caia (Assistants v2 REST)
 # -----------------------
 TOOL_NAME = "sentinel.alert"
 
@@ -63,63 +64,81 @@ def _format_tool_call(tool_name: str, payload: Dict[str, Any]) -> str:
 
 async def relay_to_caia(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Strategy A (기본): Assistants Threads 사용
-      - 필요 ENV: OPENAI_API_KEY, CAIA_THREAD_ID, CAIA_ASSISTANT_ID
-      - 동작: thread에 user 메시지로 call_tool(...) 주입 → run 생성
-    Fallback B: Webhook (선택)
-      - 필요 ENV: CAIA_HOOK_URL (POST JSON 그대로)
+    Strategy A: Assistants Threads (권장)
+      - ENV:
+          OPENAI_API_KEY
+          CAIA_ASSISTANT_ID
+          CAIA_THREAD_ID
+    Fallback B: Raw webhook (선택)
+      - ENV:
+          CAIA_HOOK_URL
     """
-    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    thread_id = os.getenv("CAIA_THREAD_ID")
-    asst_id = os.getenv("CAIA_ASSISTANT_ID")  # 권장
-    hook_url = os.getenv("CAIA_HOOK_URL")     # 선택
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    asst_id = os.getenv("CAIA_ASSISTANT_ID", "").strip()
+    thread_id = os.getenv("CAIA_THREAD_ID", "").strip()
+    hook_url = os.getenv("CAIA_HOOK_URL", "").strip()
 
-    if thread_id and asst_id:
-        # Strategy A: Assistants Threads
+    if api_key and asst_id and thread_id:
+        base = "https://api.openai.com/v1"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "OpenAI-Beta": "assistants=v2",
+        }
         content = _format_tool_call(TOOL_NAME, payload)
         meta = {"origin": "sentinel", "tool": TOOL_NAME}
 
-        # 1) 메시지 주입
-        msg = await client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=content,
-            metadata=meta,
-        )
-        # 2) 실행 트리거
-        run = await client.beta.threads.runs.create(
-            thread_id=thread_id,
-            assistant_id=asst_id,
-            instructions="Process the tool-call message and update the main chat.",
-        )
-        return {"strategy": "assistants", "message_id": msg.id, "run_id": run.id}
+        async with httpx.AsyncClient(timeout=15) as http:
+            # 1) 메시지 주입
+            r1 = await http.post(
+                f"{base}/threads/{thread_id}/messages",
+                headers=headers,
+                json={"role": "user", "content": content, "metadata": meta},
+            )
+            if r1.status_code == 404:
+                raise RuntimeError("CAIA_THREAD_ID not found (404).")
+            if not r1.is_success:
+                raise RuntimeError(f"Message add failed: {r1.status_code} {r1.text}")
 
-    # Fallback B: Raw webhook (선택)
+            # 2) Run 실행
+            r2 = await http.post(
+                f"{base}/threads/{thread_id}/runs",
+                headers=headers,
+                json={"assistant_id": asst_id},
+            )
+            if not r2.is_success:
+                raise RuntimeError(f"Run create failed: {r2.status_code} {r2.text}")
+
+            return {
+                "strategy": "assistants",
+                "message_id": r1.json().get("id"),
+                "run_id": r2.json().get("id"),
+            }
+
+    # Fallback B: Raw webhook
     if hook_url:
-        import httpx
         async with httpx.AsyncClient(timeout=10) as http:
             r = await http.post(hook_url, json={"tool": TOOL_NAME, "payload": payload})
             r.raise_for_status()
             return {"strategy": "webhook", "status": r.status_code}
 
     raise RuntimeError(
-        "Relay configuration missing. Set CAIA_THREAD_ID and CAIA_ASSISTANT_ID or CAIA_HOOK_URL."
+        "Relay configuration missing. Set OPENAI_API_KEY, CAIA_ASSISTANT_ID, CAIA_THREAD_ID or CAIA_HOOK_URL."
     )
 
 # -----------------------
 # Routes
 # -----------------------
 @router.post("/alert")
-async def sentinel_alert(alert: AlertModel):
+async def fc_sentinel_alert(alert: AlertModel):
     try:
-        # Dedup (optional)
         window_min = int(os.getenv("DEDUP_WINDOW_MIN", "0"))
         key = _dedup_key(alert)
         if window_min > 0 and _in_window(key, window_min):
-            log.info(f"[Sentinel] dedup suppressed: {key}")
+            log.info(f"[Sentinel-FC] dedup suppressed: {key}")
             return {"status": "ok", "dedup": True}
 
-        log.info(f"[Sentinel] Alert recv: {alert.model_dump()}")
+        log.info(f"[Sentinel-FC] Alert recv: {alert.model_dump()}")
         result = await relay_to_caia(alert.model_dump())
         _mark(key)
         return {"status": "ok", "caia_result": result}
@@ -129,8 +148,7 @@ async def sentinel_alert(alert: AlertModel):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/health")
-async def health():
-    # Quick health for readiness/liveness probes
+async def fc_health():
     return {
         "status": "ok",
         "tool": TOOL_NAME,
