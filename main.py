@@ -1,11 +1,12 @@
-# main.py  (Assistants API v2, thread 고정 + inbox 지원)
-import os, time, logging, requests
-from typing import Optional
-from collections import deque
-from fastapi import FastAPI, Header, HTTPException, Request, Query
+import os
+from fastapi import FastAPI
+from app_routes_sentinel import router as fc_sentinel_router   # ← flat import
 
-# [PATCH] FunctionCalling 경로 라우터 추가 (기존 로직 변경 없음)
-from app_routes_sentinel import router as fc_sentinel_router
+APP_VERSION = "sentinel-fastapi-v2-1.2.0"
+app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
+
+# Sentinel 라우터 등록
+app.include_router(fc_sentinel_router, prefix="/sentinel")
 
 APP_VERSION = "sentinel-fastapi-v2-1.2.0"
 
