@@ -4,6 +4,9 @@ from typing import Optional
 from collections import deque
 from fastapi import FastAPI, Header, HTTPException, Request, Query
 
+# [PATCH] FunctionCalling 경로 라우터 추가 (기존 로직 변경 없음)
+from app.routes.sentinel import router as fc_sentinel_router
+
 APP_VERSION = "sentinel-fastapi-v2-1.2.0"
 
 # ── 환경변수 ──────────────────────────────────────────────────────────
@@ -166,6 +169,9 @@ def send_caia_v2(text: str) -> bool:
 
 # ── FastAPI ───────────────────────────────────────────────────────────
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
+
+# [PATCH] 신규 FunctionCalling 라우터 등록 (기존 엔드포인트와 충돌 없음)
+app.include_router(fc_sentinel_router, prefix="/fc", tags=["sentinel-fc"])
 
 @app.get("/health")
 def health():
