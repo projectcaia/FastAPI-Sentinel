@@ -4,3 +4,5 @@ pydantic==2.*
 requests==2.32.*
 python-dotenv==1.0.*   # (선택) 로컬 .env 사용 시
 yfinance>=0.2.40
+httpx
+pydantic
