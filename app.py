@@ -1,4 +1,4 @@
-from app import app   # ← 실제 FastAPI 인스턴스(app.py 안의 app)를 불러옴
+from app.app_routes_sentinel import router as fc_sentinel_router
 
 if __name__ == "__main__":
     import uvicorn
