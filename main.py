@@ -1,14 +1,23 @@
+# main.py  (Assistants API v2, thread 고정 + inbox 지원)
 import os
-from fastapi import FastAPI
-from app_routes_sentinel import router as fc_sentinel_router   # ← flat import
+import time
+import logging
+import requests
+from typing import Optional
+from collections import deque
+from fastapi import FastAPI, Header, HTTPException, Request, Query
+
+# flat 구조: 같은 디렉토리에 있는 라우터 파일 사용
+from app_routes_sentinel import router as fc_sentinel_router
 
 APP_VERSION = "sentinel-fastapi-v2-1.2.0"
+
+# ── FastAPI ───────────────────────────────────────────────────────────
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
 
-# Sentinel 라우터 등록
-app.include_router(fc_sentinel_router, prefix="/sentinel")
-
-APP_VERSION = "sentinel-fastapi-v2-1.2.0"
+# [PATCH] 신규 FunctionCalling 라우터 등록 (기존 엔드포인트와 충돌 없음)
+# 최종 경로: POST /fc/sentinel/alert, GET /fc/sentinel/health
+app.include_router(fc_sentinel_router, prefix="/fc", tags=["sentinel-fc"])
 
 # ── 환경변수 ──────────────────────────────────────────────────────────
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
@@ -17,7 +26,7 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "")        # (선택) POST 보호용 공유키
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()
-# 환경변수에서 숫자만 추출 (설명 텍스트 제거)
+
 def parse_int_env(key: str, default: int) -> int:
     """환경변수를 정수로 파싱 (설명 텍스트 자동 제거)"""
     value = os.getenv(key, str(default))
@@ -29,7 +38,7 @@ def parse_int_env(key: str, default: int) -> int:
     return default
 
 DEDUP_WINDOW_MIN  = parse_int_env("DEDUP_WINDOW_MIN", 30)  # 30분 기본값 (충분한 간격)
-ALERT_CAP         = parse_int_env("ALERT_CAP", 2000)  # 링버퍼 크기
+ALERT_CAP         = parse_int_env("ALERT_CAP", 2000)       # 링버퍼 크기
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -167,12 +176,6 @@ def send_caia_v2(text: str) -> bool:
     except Exception as e:
         log.exception("OpenAI 예외: %s", e)
         return False
-
-# ── FastAPI ───────────────────────────────────────────────────────────
-app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
-
-# [PATCH] 신규 FunctionCalling 라우터 등록 (기존 엔드포인트와 충돌 없음)
-app.include_router(fc_sentinel_router, prefix="/fc", tags=["sentinel-fc"])
 
 @app.get("/health")
 def health():
