@@ -5,7 +5,7 @@ from collections import deque
 from fastapi import FastAPI, Header, HTTPException, Request, Query
 
 # [PATCH] FunctionCalling 경로 라우터 추가 (기존 로직 변경 없음)
-from app.routes.sentinel import router as fc_sentinel_router
+from app.app_routes_sentinel import router as fc_sentinel_router
 
 APP_VERSION = "sentinel-fastapi-v2-1.2.0"
 
