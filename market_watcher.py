@@ -310,17 +310,15 @@ def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
     a = abs(delta_pct)
     
     if is_vix:
-        # VIX는 변동성 지표로 일반 지수보다 훨씬 더 크게 움직임
-        # 실질적으로 중요한 수준만 감지
-        if a >= 20.0: return "LV3"  # ±20% 이상 (심각한 변동성 급등)
-        if a >= 15.0: return "LV2"  # ±15% 이상 (중대한 변동성 증가)
-        if a >= 10.0: return "LV1"  # ±10% 이상 (주의 필요)
+        # VIX는 변동성이 크므로 더 높은 임계값 적용
+        if a >= 10.0: return "LV3"  # ±10% 이상
+        if a >= 7.0: return "LV2"   # ±7% 이상
+        if a >= 5.0: return "LV1"   # ±5% 이상
     else:
         # 일반 지수 (KOSPI, S&P500, NASDAQ)
-        # 현재 시장 상황에 맞춰 현실적인 수준으로 설정
-        if a >= 3.0: return "LV3"   # ±3.0% 이상 (매우 큰 변동)
-        if a >= 2.0: return "LV2"   # ±2.0% 이상 (중대한 변동)
-        if a >= 1.0: return "LV1"   # ±1.0% 이상 (주의 필요)
+        if a >= 2.5: return "LV3"   # ±2.5% 이상 (기존 1.5%에서 상향)
+        if a >= 1.5: return "LV2"   # ±1.5% 이상 (기존 1.0%에서 상향)
+        if a >= 0.8: return "LV1"   # ±0.8% 이상 (기존 0.4%에서 상향)
     return None
 
 # -------------------- 알림 --------------------
@@ -464,10 +462,10 @@ def check_and_alert():
                 
                 # VIX 스마트 필터링: 지수가 크게 움직이지 않았는데 VIX만 튀면 무시
                 if is_vix:
-                    # S&P500이나 NASDAQ이 1.5% 미만 변동인데 VIX가 알림 레벨이면 무시
+                    # S&P500이나 NASDAQ이 0.8% 미만 변동인데 VIX가 알림 레벨이면 무시
                     max_index_move = max(abs(spx_delta), abs(nasdaq_delta))
-                    if max_index_move < 1.5 and abs(delta) < 15.0:
-                        # 지수 변동이 작은데 VIX만 움직인 경우 건너뛰기
+                    if max_index_move < 0.8:
+                        # 지수 변동이 거의 없는데 VIX만 움직인 경우 건너뛰기
                         log.debug("VIX 스마트 필터: 지수 변동 %.2f%% 대비 VIX %.2f%% - 무시", max_index_move, delta)
                         state[idx_name] = None  # 상태 초기화
                         continue
@@ -500,8 +498,9 @@ def run_loop():
     log.info("시장감시 워커 시작: 간격=%ss, base=%s", WATCH_INTERVAL, SENTINEL_BASE_URL or "(unset)")
     log.info("정책: %d초 유지, 레벨 변경시에만 업데이트, 한/미 자동 전환", WATCH_INTERVAL)
     log.info("볼린저 밴드: 비활성화 (노이즈 방지)")
-    log.info("일반지수 임계값: LV1=±1.0%%, LV2=±2.0%%, LV3=±3.0%%")
-    log.info("VIX 임계값: LV1=±10%%, LV2=±15%%, LV3=±20%%")
+    log.info("일반지수 임계값: LV1=±0.8%%, LV2=±1.5%%, LV3=±2.5%%")
+    log.info("VIX 임계값: LV1=±5%%, LV2=±7%%, LV3=±10%%")
+    log.info("VIX 스마트 필터: 지수 변동 0.8% 미만 시 VIX 알림 무시")
     # 초기 즉시 체크
     try:
         log.info("초기 시장 체크 실행...")
