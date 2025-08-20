@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List
 from collections import deque
 from fastapi import FastAPI, Header, Request, Query
 
-APP_VERSION = "sentinel-fastapi-v2-1.3.2"
+APP_VERSION = "sentinel-fastapi-v2-1.3.3"
 
 # ── FastAPI ───────────────────────────────────────────────────────────
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
@@ -89,6 +89,20 @@ def _oai_headers() -> Dict[str, str]:
         "Content-Type": "application/json",
         "OpenAI-Beta": "assistants=v2",
     }
+
+def _parse_wait_seconds_from_message(msg: str, default_sec: float = 9.0) -> float:
+    """
+    오류 메시지 안의 'Please try again in X.XXXs'에서 X를 뽑아냄.
+    실패하면 default_sec 반환.
+    """
+    try:
+        import re
+        m = re.search(r"try again in ([0-9]+(?:\.[0-9]+)?)s", msg)
+        if m:
+            return float(m.group(1)) + 0.5  # 약간의 여유
+    except Exception:
+        pass
+    return default_sec
 
 def _fetch_latest_alerts(limit=10, level_min: Optional[str]=None,
                          index: Optional[str]=None, since: Optional[str]=None) -> Dict[str, Any]:
@@ -202,6 +216,7 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
     Assistants API v2
     - Run 생성 시 tools(definition) + tool_choice(getLatestAlerts) 동시 지정
     - requires_action 발생 시 /sentinel/inbox 직접 호출 → submit_tool_outputs
+    - 레이트리밋 자동 재시도 + 히스토리 절단(truncation)
     - 디버그 정보를 dict로 반환
     """
     if not (OPENAI_API_KEY and ASSISTANT_ID):
@@ -215,24 +230,14 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
         if not thread_id:
             return {"ok": False, "stage": "precheck", "reason": "CAIA_THREAD_ID not set"}
 
-        # 1) 메시지 추가 (v2 포맷: 배열형 content)
-        r1 = requests.post(
-            f"{base}/threads/{thread_id}/messages",
-            headers=headers,
-            json={
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": text}
-                ]
-            },
-            timeout=12,
-        )
-        if r1.status_code == 404:
-            return {"ok": False, "stage": "message", "status": 404, "resp": r1.text, "thread_id": thread_id}
-        if not r1.ok:
-            return {"ok": False, "stage": "message", "status": r1.status_code, "resp": r1.text, "thread_id": thread_id}
+        # v2 포맷: content 배열
+        msg_body = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text}
+            ]
+        }
 
-        # 2) Run 생성: 툴콜 강제 + tools 정의 포함
         tools_def = [{
             "type": "function",
             "function": {
@@ -257,27 +262,57 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
                 "type": "function",
                 "function": {"name": "getLatestAlerts"}
             },
+            # 히스토리 절단: 최근 8개 메시지만 모델에 공급 (입력 토큰 절감)
+            "truncation_strategy": {"type": "auto", "last_messages": 8},
+            # 출력 토큰 절제
+            "max_output_tokens": 512,
+            # 지시문은 짧고 명확하게
             "instructions": (
-                "센티넬/알람 키워드 감지. getLatestAlerts(limit=10 기본)을 호출해 최근 알림을 요약하라. "
-                "응답 형식: (지표, 레벨, Δ%, 시각, note) 한 줄 리스트. "
-                "전략 판단은 지금 하지 말고, 마지막에 '전략 판단 들어갈까요?'만 질문."
+                "센티넬/알람 키워드 감지. getLatestAlerts(limit=10) 호출로 최근 알림 요약. "
+                "형식: (지표, 레벨, Δ%, 시각, note) 리스트. 마지막에 '전략 판단 들어갈까요?' 질문."
             ),
+            # 복잡도/소비량 줄이기
+            "parallel_tool_calls": False,
         }
-        r2 = requests.post(
-            f"{base}/threads/{thread_id}/runs",
-            headers=headers,
-            json=run_body,
-            timeout=15,
-        )
-        if not r2.ok:
-            return {"ok": False, "stage": "run", "status": r2.status_code, "resp": r2.text, "thread_id": thread_id}
 
-        run_id = r2.json().get("id", "")
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            # 1) 메시지 추가
+            r1 = requests.post(f"{base}/threads/{thread_id}/messages", headers=headers, json=msg_body, timeout=12)
+            if r1.status_code == 404:
+                return {"ok": False, "stage": "message", "status": 404, "resp": r1.text, "thread_id": thread_id}
+            if not r1.ok:
+                if r1.status_code == 429 and attempt < attempts:
+                    wait = _parse_wait_seconds_from_message(r1.text)
+                    time.sleep(wait)
+                    continue
+                return {"ok": False, "stage": "message", "status": r1.status_code, "resp": r1.text, "thread_id": thread_id}
 
-        # 3) requires_action 처리 + 완료 대기
-        done = _poll_and_submit_tools(thread_id, run_id, max_wait_sec=25)
-        done["thread_id"] = thread_id
-        return done
+            # 2) Run 생성
+            r2 = requests.post(f"{base}/threads/{thread_id}/runs", headers=headers, json=run_body, timeout=15)
+            if not r2.ok:
+                if r2.status_code == 429 and attempt < attempts:
+                    wait = _parse_wait_seconds_from_message(r2.text)
+                    time.sleep(wait)
+                    continue
+                return {"ok": False, "stage": "run", "status": r2.status_code, "resp": r2.text, "thread_id": thread_id}
+
+            run_id = r2.json().get("id", "")
+
+            # 3) requires_action 처리 + 완료 대기
+            done = _poll_and_submit_tools(thread_id, run_id, max_wait_sec=30)
+
+            # 런 실패 사유가 rate_limit_exceeded면 재시도
+            diag_str = json.dumps(done.get("diag", {}), ensure_ascii=False)
+            if not done.get("ok") and "rate_limit_exceeded" in diag_str and attempt < attempts:
+                wait = _parse_wait_seconds_from_message(diag_str)
+                time.sleep(wait)
+                continue
+
+            done["thread_id"] = thread_id
+            return done
+
+        return {"ok": False, "stage": "retry_exhausted", "reason": "rate_limit_exceeded or 429"}
 
     except Exception as e:
         log.exception("OpenAI 예외: %s", e)
@@ -424,4 +459,3 @@ def sentinel_inbox(
 
 # Procfile:
 # web: uvicorn main:app --host 0.0.0.0 --port $PORT
- 
