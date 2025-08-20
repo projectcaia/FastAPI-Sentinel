@@ -310,15 +310,17 @@ def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
     a = abs(delta_pct)
     
     if is_vix:
-        # VIX는 변동성이 크므로 더 높은 임계값 적용
-        if a >= 10.0: return "LV3"  # ±10% 이상
-        if a >= 7.0: return "LV2"   # ±7% 이상  
-        if a >= 5.0: return "LV1"   # ±5% 이상
+        # VIX는 변동성 지표로 일반 지수보다 훨씬 더 크게 움직임
+        # 실질적으로 중요한 수준만 감지
+        if a >= 20.0: return "LV3"  # ±20% 이상 (심각한 변동성 급등)
+        if a >= 15.0: return "LV2"  # ±15% 이상 (중대한 변동성 증가)
+        if a >= 10.0: return "LV1"  # ±10% 이상 (주의 필요)
     else:
         # 일반 지수 (KOSPI, S&P500, NASDAQ)
-        if a >= 2.5: return "LV3"   # ±2.5% 이상 (기존 1.5%에서 상향)
-        if a >= 1.5: return "LV2"   # ±1.5% 이상 (기존 1.0%에서 상향)
-        if a >= 0.8: return "LV1"   # ±0.8% 이상 (기존 0.4%에서 상향)
+        # 현재 시장 상황에 맞춰 현실적인 수준으로 설정
+        if a >= 3.0: return "LV3"   # ±3.0% 이상 (매우 큰 변동)
+        if a >= 2.0: return "LV2"   # ±2.0% 이상 (중대한 변동)
+        if a >= 1.0: return "LV1"   # ±1.0% 이상 (주의 필요)
     return None
 
 # -------------------- 알림 --------------------
@@ -437,6 +439,20 @@ def check_and_alert():
         except Exception as e:
             log.warning("KR ΔK200 수집/판정 실패: %s", e)
     else:
+        # US 세션: 먼저 S&P500과 NASDAQ 데이터 수집
+        spx_delta = 0.0
+        nasdaq_delta = 0.0
+        
+        try:
+            spx_delta = get_delta(SYMBOL_SPX)
+        except:
+            pass
+        
+        try:
+            nasdaq_delta = get_delta(SYMBOL_NDX)
+        except:
+            pass
+        
         for idx_name, sym, label in [
             ("ΔSPX", SYMBOL_SPX,  "US 세션: S&P500"),
             ("ΔNASDAQ", SYMBOL_NDX, "US 세션: NASDAQ"),
@@ -444,31 +460,48 @@ def check_and_alert():
         ]:
             try:
                 delta = get_delta(sym)
-                lvl = grade_level(delta)
+                is_vix = (sym == SYMBOL_VIX)
+                
+                # VIX 스마트 필터링: 지수가 크게 움직이지 않았는데 VIX만 튀면 무시
+                if is_vix:
+                    # S&P500이나 NASDAQ이 1.5% 미만 변동인데 VIX가 알림 레벨이면 무시
+                    max_index_move = max(abs(spx_delta), abs(nasdaq_delta))
+                    if max_index_move < 1.5 and abs(delta) < 15.0:
+                        # 지수 변동이 작은데 VIX만 움직인 경우 건너뛰기
+                        log.debug("VIX 스마트 필터: 지수 변동 %.2f%% 대비 VIX %.2f%% - 무시", max_index_move, delta)
+                        state[idx_name] = None  # 상태 초기화
+                        continue
+                
+                lvl = grade_level(delta, is_vix=is_vix)
                 prev = state.get(idx_name)
                 if lvl != prev:
                     note = f"{label} 레벨 변경" if prev else f"{label} 레벨 진입"
                     if prev and not lvl: note = f"{label} 레벨 해제"
                     elif prev and lvl:   note = f"{label} 레벨 변화 {prev}→{lvl}"
+                    
+                    # VIX의 경우 지수 변동도 함께 표시
+                    if is_vix and lvl:
+                        note += f" (S&P {spx_delta:+.2f}%, NAS {nasdaq_delta:+.2f}%)"
+                    
                     post_alert(idx_name, delta, lvl, sym, note)
                     state[idx_name] = lvl
             except Exception as e:
                 log.warning("%s 수집/판정 실패: %s", label, e)
 
-    # Bollinger 이벤트 병행 감지
-    try:
-        state = check_and_alert_bb(state, sess)
-    except Exception as _bb_e:
-        log.debug("BB 이벤트 처리 실패: %s", _bb_e)
+    # Bollinger 이벤트 비활성화 (노이즈 방지)
+    # try:
+    #     state = check_and_alert_bb(state, sess)
+    # except Exception as _bb_e:
+    #     log.debug("BB 이벤트 처리 실패: %s", _bb_e)
 
     _save_state(state)
 
 def run_loop():
     log.info("시장감시 워커 시작: 간격=%ss, base=%s", WATCH_INTERVAL, SENTINEL_BASE_URL or "(unset)")
     log.info("정책: %d초 유지, 레벨 변경시에만 업데이트, 한/미 자동 전환", WATCH_INTERVAL)
-    log.info("볼린저 밴드: ±%.1fσ 기준, %d기간 이동평균 (현재 비활성화)", K_SIGMA, BB_WINDOW)
-    log.info("일반지수 임계값: LV1=±0.8%%, LV2=±1.5%%, LV3=±2.5%%")
-    log.info("VIX 임계값: LV1=±5%%, LV2=±7%%, LV3=±10%%")
+    log.info("볼린저 밴드: 비활성화 (노이즈 방지)")
+    log.info("일반지수 임계값: LV1=±1.0%%, LV2=±2.0%%, LV3=±3.0%%")
+    log.info("VIX 임계값: LV1=±10%%, LV2=±15%%, LV3=±20%%")
     # 초기 즉시 체크
     try:
         log.info("초기 시장 체크 실행...")
