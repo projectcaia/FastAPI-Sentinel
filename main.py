@@ -213,9 +213,9 @@ def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 20) 
 def send_caia_v2(text: str) -> Dict[str, Any]:
     """
     Assistants API v2
-    - Run 생성 시 tools(definition) + tool_choice(getLatestAlerts) 동시 지정
+    - Run 생성 시 additional_messages 로 유저 메시지 동시 전달 (messages 충돌 방지)
+    - tools(definition) + tool_choice(getLatestAlerts) 동시 지정
     - requires_action 발생 시 /sentinel/inbox 직접 호출 → submit_tool_outputs
-    - 디버그 정보를 dict로 반환
     """
     if not (OPENAI_API_KEY and ASSISTANT_ID):
         return {"ok": False, "stage": "precheck", "reason": "OPENAI/ASSISTANT env not set"}
@@ -228,24 +228,6 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
         if not thread_id:
             return {"ok": False, "stage": "precheck", "reason": "CAIA_THREAD_ID not set"}
 
-        # 1) 메시지 추가 (v2 포맷: 배열형 content)
-        r1 = requests.post(
-            f"{base}/threads/{thread_id}/messages",
-            headers=headers,
-            json={
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": text}
-                ]
-            },
-            timeout=12,
-        )
-        if r1.status_code == 404:
-            return {"ok": False, "stage": "message", "status": 404, "resp": r1.text, "thread_id": thread_id}
-        if not r1.ok:
-            return {"ok": False, "stage": "message", "status": r1.status_code, "resp": r1.text, "thread_id": thread_id}
-
-        # 2) Run 생성: 툴콜 강제 + tools 정의 포함
         tools_def = [{
             "type": "function",
             "function": {
@@ -270,7 +252,7 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
                 "type": "function",
                 "function": {"name": "getLatestAlerts"}
             },
-            # 히스토리 절단: 입력 토큰 절감
+            # 히스토리 절단: 입력 토큰 절감 + 긴 스레드 충돌 최소화
             "truncation_strategy": {"type": "last_messages", "last_messages": 8},
             "parallel_tool_calls": False,
             "instructions": (
@@ -278,19 +260,42 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
                 "응답 형식: (지표, 레벨, Δ%, 시각, note) 한 줄 리스트. "
                 "전략 판단은 지금 하지 말고, 마지막에 '전략 판단 들어갈까요?'만 질문."
             ),
+            # ★ 메시지는 여기 additional_messages 로 넣는다 (messages API 호출 금지)
+            "additional_messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": text}
+                    ]
+                }
+            ],
         }
+
+        # 바로 Run 생성 시도
         r2 = requests.post(
             f"{base}/threads/{thread_id}/runs",
             headers=headers,
             json=run_body,
             timeout=15,
         )
+
+        # 활성 Run 충돌 시 → 짧게 대기 후 1회 재시도
+        if not r2.ok and "활성화되어 있는 동안" in (r2.text or ""):
+            wait_ok = _wait_thread_free(thread_id, max_wait_sec=6.0)
+            if wait_ok:
+                r2 = requests.post(
+                    f"{base}/threads/{thread_id}/runs",
+                    headers=headers,
+                    json=run_body,
+                    timeout=15,
+                )
+
         if not r2.ok:
             return {"ok": False, "stage": "run", "status": r2.status_code, "resp": r2.text, "thread_id": thread_id}
 
         run_id = r2.json().get("id", "")
 
-        # 3) requires_action 처리 + 완료 대기 (백그라운드에서 실행됨)
+        # requires_action 처리 + 완료 대기
         done = _poll_and_submit_tools(thread_id, run_id, max_wait_sec=20)
         done["thread_id"] = thread_id
         return done
