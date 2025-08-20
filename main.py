@@ -255,7 +255,7 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
             }
         }]
 
-          run_body = {
+        run_body = {
             "assistant_id": ASSISTANT_ID,
             "tools": tools_def,
             "tool_choice": {
