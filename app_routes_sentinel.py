@@ -10,7 +10,7 @@ import os
 import time
 import json
 import logging
-from typing import Optional, Literal, Dict, Any
+from typing import Optional, Literal, Dict, Any, List
 
 import requests
 from fastapi import APIRouter, HTTPException
@@ -32,6 +32,13 @@ SENTINEL_ACTIONS_BASE = os.getenv(
     "SENTINEL_ACTIONS_BASE",
     "https://fastapi-sentinel-production.up.railway.app"
 ).strip()
+
+# 재시도 설정 (안정화)
+HTTP_MAX_RETRY = int(os.getenv("HTTP_MAX_RETRY", "3"))        # OpenAI/Actions 호출 재시도 횟수
+HTTP_RETRY_WAIT_BASE = float(os.getenv("HTTP_RETRY_WAIT_BASE", "0.6"))  # backoff 기본
+
+# Run 재생성 1회 허용(모델 일시 오류 방지)
+RUN_ALLOW_REPLAY = os.getenv("RUN_ALLOW_REPLAY", "1").strip() not in ("0", "false", "False")
 
 # =========================
 # 모델 / 스키마
@@ -66,11 +73,10 @@ def _mark(key: str) -> None:
     _DEDUP[key] = time.time()
 
 # =========================
-# OpenAI REST helpers
+# HTTP helpers (재시도 내장)
 # =========================
 def _headers() -> Dict[str, str]:
     if not OPENAI_API_KEY:
-        # 라우터에서 HTTPException으로 감싸므로 여기선 RuntimeError로 올림
         raise RuntimeError("OPENAI_API_KEY is missing")
     return {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -78,17 +84,46 @@ def _headers() -> Dict[str, str]:
         "OpenAI-Beta": "assistants=v2",
     }
 
+def _should_retry(status_code: int) -> bool:
+    return status_code in (429, 500, 502, 503, 504)
+
 def _post(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
-    r = requests.post(url, headers=_headers(), json=body, timeout=timeout)
-    if r.status_code >= 300:
-        raise RuntimeError(f"POST {url} failed: {r.status_code} {r.text}")
-    return r.json()
+    last_err = None
+    for i in range(HTTP_MAX_RETRY):
+        try:
+            r = requests.post(url, headers=_headers(), json=body, timeout=timeout)
+            if r.status_code < 300:
+                return r.json()
+            last_err = RuntimeError(f"POST {url} failed: {r.status_code} {r.text}")
+            if _should_retry(r.status_code) and i < HTTP_MAX_RETRY - 1:
+                time.sleep(HTTP_RETRY_WAIT_BASE * (i + 1))
+                continue
+            raise last_err
+        except Exception as e:
+            last_err = e
+            if i < HTTP_MAX_RETRY - 1:
+                time.sleep(HTTP_RETRY_WAIT_BASE * (i + 1))
+                continue
+            raise last_err
 
 def _get(url: str, timeout: int = 15) -> Dict[str, Any]:
-    r = requests.get(url, headers=_headers(), timeout=timeout)
-    if r.status_code >= 300:
-        raise RuntimeError(f"GET {url} failed: {r.status_code} {r.text}")
-    return r.json()
+    last_err = None
+    for i in range(HTTP_MAX_RETRY):
+        try:
+            r = requests.get(url, headers=_headers(), timeout=timeout)
+            if r.status_code < 300:
+                return r.json()
+            last_err = RuntimeError(f"GET {url} failed: {r.status_code} {r.text}")
+            if _should_retry(r.status_code) and i < HTTP_MAX_RETRY - 1:
+                time.sleep(HTTP_RETRY_WAIT_BASE * (i + 1))
+                continue
+            raise last_err
+        except Exception as e:
+            last_err = e
+            if i < HTTP_MAX_RETRY - 1:
+                time.sleep(HTTP_RETRY_WAIT_BASE * (i + 1))
+                continue
+            raise last_err
 
 # =========================
 # Sentinel Actions 호출
@@ -113,14 +148,52 @@ def _fetch_latest_alerts(
             timeout=8
         )
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        # 결과가 완전 비면 모델이 멈추는 걸 방지하는 최소 더미
+        if not isinstance(data, dict) or not data.get("items"):
+            data = {
+                "items": [{
+                    "index": "SYSTEM",
+                    "level": "LV1",
+                    "delta_pct": 0,
+                    "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+                    "note": "최근 알림 없음 (fallback)"
+                }]
+            }
+        return data
     except Exception as e:
         log.error("[Sentinel-FC] _fetch_latest_alerts failed: %s", e)
-        return {"items": []}
+        return {
+            "items": [{
+                "index": "SYSTEM",
+                "level": "LV1",
+                "delta_pct": 0,
+                "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+                "note": f"Actions 호출 실패: {e}"
+            }]
+        }
 
 # =========================
 # 핵심: Function Calling 정식 루프
 # =========================
+def _create_run_get_latest() -> str:
+    """getLatestAlerts 툴콜을 강제하는 run 생성 후 run_id 반환"""
+    run = _post(
+        f"{OPENAI_BASE}/threads/{CAIA_THREAD_ID}/runs",
+        {
+            "assistant_id": CAIA_ASSISTANT_ID,
+            "instructions": (
+                "센티넬/알람 키워드 감지. 규칙에 따라 getLatestAlerts를 호출해 최근 알림을 요약하라. "
+                "요약만 하고 전략 판단은 묻기 전 금지. 마지막에 '전략 판단 들어갈까요?'를 붙여라."
+            ),
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "getLatestAlerts"}  # operationId와 정확히 일치
+            }
+        }
+    )
+    return run["id"]
+
 def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     1) Thread에 사용자 메시지 추가 (컨텍스트 제공)
@@ -150,22 +223,9 @@ def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
         }
     )
 
-    # 2) run 생성: getLatestAlerts **강제 호출**
-    run = _post(
-        f"{OPENAI_BASE}/threads/{CAIA_THREAD_ID}/runs",
-        {
-            "assistant_id": CAIA_ASSISTANT_ID,
-            "instructions": (
-                "센티넬/알람 키워드 감지. 규칙에 따라 getLatestAlerts를 호출해 최근 알림을 요약하라. "
-                "요약만 하고 전략 판단은 묻기 전 금지."
-            ),
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": "getLatestAlerts"}  # operationId와 일치해야 함
-            }
-        }
-    )
-    run_id = run["id"]
+    # 2) run 생성 (필요 시 1회 재생성 허용)
+    run_id = _create_run_get_latest()
+    replayed = False
 
     # 3) requires_action 처리 루프
     while True:
@@ -178,8 +238,8 @@ def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
 
         if st == "requires_action":
             ra = cur.get("required_action", {}).get("submit_tool_outputs", {})
-            calls = ra.get("tool_calls", []) or []
-            outputs = []
+            calls: List[Dict[str, Any]] = ra.get("tool_calls", []) or []
+            outputs: List[Dict[str, str]] = []
 
             for call in calls:
                 fn = call.get("function", {}).get("name")
@@ -212,6 +272,14 @@ def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
             )
             # 다음 루프에서 상태 재확인
             time.sleep(0.4)
+            continue
+
+        if st == "failed" and RUN_ALLOW_REPLAY and not replayed:
+            # 모델 일시 오류/툴콜 누락 방지: 동일 조건으로 1회 재시도
+            log.warning("[Sentinel-FC] run failed -> replay once")
+            run_id = _create_run_get_latest()
+            replayed = True
+            time.sleep(0.6)
             continue
 
         # completed / failed / cancelled
