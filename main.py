@@ -1,4 +1,4 @@
-# main.py  (Assistants API v2, thread 고정 + inbox 지원, tool_choice+tools+requires_action 처리)
+# main.py  (Assistants API v2, thread 고정 + inbox 지원, tools+tool_choice+requires_action 처리)
 import os
 import time
 import json
@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List
 from collections import deque
 from fastapi import FastAPI, Header, Request, Query
 
-APP_VERSION = "sentinel-fastapi-v2-1.3.1"
+APP_VERSION = "sentinel-fastapi-v2-1.3.2"
 
 # ── FastAPI ───────────────────────────────────────────────────────────
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
@@ -52,7 +52,7 @@ log.info("  ALERT_CAP: %d", ALERT_CAP)
 log.info("=" * 60)
 
 # ── 중복 억제 및 링버퍼 ──────────────────────────────────────────────
-_last_fired = {}                        # key=(index,level) -> epoch
+_last_fired: Dict[tuple, float] = {}    # key=(index,level) -> epoch
 _alert_buf  = deque(maxlen=ALERT_CAP)   # 최신 알림이 좌측(0)에 오도록 appendleft
 
 def within_dedup(idx: str, lvl: str) -> bool:
@@ -82,7 +82,7 @@ def send_telegram(text: str) -> bool:
         log.exception("Telegram 예외: %s", e)
         return False
 
-# ── 외부 전송: Caia(Assistants v2) ───────────────────────────────────
+# ── Assistants v2 헬퍼 ───────────────────────────────────────────────
 def _oai_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -200,7 +200,7 @@ def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 25) 
 def send_caia_v2(text: str) -> Dict[str, Any]:
     """
     Assistants API v2
-    - Run 생성 시 tool_choice=function(getLatestAlerts) + tools에 함수 정의 포함 (필수)
+    - Run 생성 시 tools(definition) + tool_choice(getLatestAlerts) 동시 지정
     - requires_action 발생 시 /sentinel/inbox 직접 호출 → submit_tool_outputs
     - 디버그 정보를 dict로 반환
     """
@@ -215,11 +215,16 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
         if not thread_id:
             return {"ok": False, "stage": "precheck", "reason": "CAIA_THREAD_ID not set"}
 
-        # 1) 메시지 추가
+        # 1) 메시지 추가 (v2 포맷: 배열형 content)
         r1 = requests.post(
             f"{base}/threads/{thread_id}/messages",
             headers=headers,
-            json={"role": "user", "content": text},
+            json={
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text}
+                ]
+            },
             timeout=12,
         )
         if r1.status_code == 404:
@@ -247,10 +252,10 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
 
         run_body = {
             "assistant_id": ASSISTANT_ID,
-            "tools": tools_def,  # ← 중요
+            "tools": tools_def,
             "tool_choice": {
                 "type": "function",
-                "function": {"name": "getLatestAlerts"}  # operationId와 동일
+                "function": {"name": "getLatestAlerts"}
             },
             "instructions": (
                 "센티넬/알람 키워드 감지. getLatestAlerts(limit=10 기본)을 호출해 최근 알림을 요약하라. "
@@ -269,7 +274,7 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
 
         run_id = r2.json().get("id", "")
 
-        # 3) requires_action 처리 + 완료 대기 (짧게)
+        # 3) requires_action 처리 + 완료 대기
         done = _poll_and_submit_tools(thread_id, run_id, max_wait_sec=25)
         done["thread_id"] = thread_id
         return done
@@ -419,3 +424,4 @@ def sentinel_inbox(
 
 # Procfile:
 # web: uvicorn main:app --host 0.0.0.0 --port $PORT
+ 
