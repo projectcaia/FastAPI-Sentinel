@@ -1,7 +1,7 @@
 # app_routes_sentinel.py
 # ------------------------------------------------------------
-# Sentinel → Caia Relay (Assistants v2, FunctionCalling 정식 처리)
-# - POST /sentinel/alert : 센티넬 서버가 푸시
+# Sentinel → Caia Relay (Assistants v2, Function Calling 정식 처리)
+# - POST /sentinel/alert  : 센티넬 서버가 알람 푸시
 # - GET  /sentinel/health : 상태 점검
 # ------------------------------------------------------------
 from __future__ import annotations
@@ -27,7 +27,7 @@ OPENAI_BASE        = os.getenv("OPENAI_BASE", "https://api.openai.com/v1").strip
 CAIA_ASSISTANT_ID  = os.getenv("CAIA_ASSISTANT_ID", "").strip()
 CAIA_THREAD_ID     = os.getenv("CAIA_THREAD_ID", "").strip()
 
-# Sentinel Actions (동현이 준 스키마 서버)
+# Sentinel Actions (OpenAPI 스키마 서버)
 SENTINEL_ACTIONS_BASE = os.getenv(
     "SENTINEL_ACTIONS_BASE",
     "https://fastapi-sentinel-production.up.railway.app"
@@ -70,6 +70,7 @@ def _mark(key: str) -> None:
 # =========================
 def _headers() -> Dict[str, str]:
     if not OPENAI_API_KEY:
+        # 라우터에서 HTTPException으로 감싸므로 여기선 RuntimeError로 올림
         raise RuntimeError("OPENAI_API_KEY is missing")
     return {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -77,13 +78,13 @@ def _headers() -> Dict[str, str]:
         "OpenAI-Beta": "assistants=v2",
     }
 
-def _post(url: str, body: Dict[str, Any], timeout: int = 20):
+def _post(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
     r = requests.post(url, headers=_headers(), json=body, timeout=timeout)
     if r.status_code >= 300:
         raise RuntimeError(f"POST {url} failed: {r.status_code} {r.text}")
     return r.json()
 
-def _get(url: str, timeout: int = 15):
+def _get(url: str, timeout: int = 15) -> Dict[str, Any]:
     r = requests.get(url, headers=_headers(), timeout=timeout)
     if r.status_code >= 300:
         raise RuntimeError(f"GET {url} failed: {r.status_code} {r.text}")
@@ -92,14 +93,25 @@ def _get(url: str, timeout: int = 15):
 # =========================
 # Sentinel Actions 호출
 # =========================
-def _fetch_latest_alerts(limit=10, level_min: Optional[str] = None,
-                         index: Optional[str] = None, since: Optional[str] = None) -> Dict[str, Any]:
+def _fetch_latest_alerts(
+    limit: int = 10,
+    level_min: Optional[str] = None,
+    index: Optional[str] = None,
+    since: Optional[str] = None
+) -> Dict[str, Any]:
     params: Dict[str, Any] = {"limit": int(limit)}
-    if level_min: params["level_min"] = level_min
-    if index:     params["index"] = index
-    if since:     params["since"] = since
+    if level_min:
+        params["level_min"] = level_min
+    if index:
+        params["index"] = index
+    if since:
+        params["since"] = since
     try:
-        r = requests.get(f"{SENTINEL_ACTIONS_BASE}/sentinel/inbox", params=params, timeout=8)
+        r = requests.get(
+            f"{SENTINEL_ACTIONS_BASE}/sentinel/inbox",
+            params=params,
+            timeout=8
+        )
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -107,20 +119,20 @@ def _fetch_latest_alerts(limit=10, level_min: Optional[str] = None,
         return {"items": []}
 
 # =========================
-# 핵심: FunctionCalling 정식 루프
+# 핵심: Function Calling 정식 루프
 # =========================
 def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     1) Thread에 사용자 메시지 추가 (컨텍스트 제공)
     2) run 생성 시 tool_choice로 getLatestAlerts 강제 호출
-    3) requires_action 받으면 우리 서버가 Sentinel Actions를 직접 호출해 결과를 submit_tool_outputs
-    4) run 완료되면 상태 반환
+    3) requires_action 수신 시 → 우리 서버가 Sentinel Actions를 직접 호출해 결과를 submit_tool_outputs
+    4) run 완료/실패 상태를 반환
     """
-    if not (CAIA_ASSISTANT_ID and CAIA_THREAD_ID):
-        raise RuntimeError("CAIA_ASSISTANT_ID/CAIA_THREAD_ID is missing")
+    if not CAIA_ASSISTANT_ID or not CAIA_THREAD_ID:
+        raise RuntimeError("CAIA_ASSISTANT_ID or CAIA_THREAD_ID is missing")
 
     # 1) 컨텍스트 메시지(유저 역할) 추가
-    msg = _post(
+    _post(
         f"{OPENAI_BASE}/threads/{CAIA_THREAD_ID}/messages",
         {
             "role": "user",
@@ -138,7 +150,7 @@ def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
         }
     )
 
-    # 2) run 생성: getLatestAlerts를 **강제 호출**
+    # 2) run 생성: getLatestAlerts **강제 호출**
     run = _post(
         f"{OPENAI_BASE}/threads/{CAIA_THREAD_ID}/runs",
         {
@@ -147,9 +159,9 @@ def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
                 "센티넬/알람 키워드 감지. 규칙에 따라 getLatestAlerts를 호출해 최근 알림을 요약하라. "
                 "요약만 하고 전략 판단은 묻기 전 금지."
             ),
-            "tool_choice": {  # ← 중요: 툴콜 강제
+            "tool_choice": {
                 "type": "function",
-                "function": {"name": "getLatestAlerts"}
+                "function": {"name": "getLatestAlerts"}  # operationId와 일치해야 함
             }
         }
     )
@@ -159,18 +171,19 @@ def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
     while True:
         cur = _get(f"{OPENAI_BASE}/threads/{CAIA_THREAD_ID}/runs/{run_id}")
         st = cur.get("status")
+
         if st in ("queued", "in_progress", "cancelling"):
             time.sleep(0.7)
             continue
 
         if st == "requires_action":
-            ra = cur["required_action"]["submit_tool_outputs"]
-            calls = ra.get("tool_calls", [])
+            ra = cur.get("required_action", {}).get("submit_tool_outputs", {})
+            calls = ra.get("tool_calls", []) or []
             outputs = []
 
             for call in calls:
-                fn = call["function"]["name"]
-                args = call["function"].get("arguments") or "{}"
+                fn = call.get("function", {}).get("name")
+                args = call.get("function", {}).get("arguments") or "{}"
                 try:
                     parsed = json.loads(args)
                 except Exception:
@@ -220,10 +233,14 @@ def sentinel_alert_push(alert: AlertModel):
         log.info("[Sentinel-FC] Alert recv: %s", alert.model_dump())
         res = _relay_to_caia_with_tool(alert.model_dump())
         _mark(key)
-        return {"status": "ok", "run_status": res.get("status", "unknown"), "run_id": res.get("id")}
+        return {
+            "status": "ok",
+            "run_status": res.get("status", "unknown"),
+            "run_id": res.get("id")
+        }
 
     except Exception as e:
-        log.exception("relay error")
+        log.exception("[Sentinel-FC] relay error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/health")
