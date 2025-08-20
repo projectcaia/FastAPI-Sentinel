@@ -110,20 +110,35 @@ def _fetch_latest_alerts(limit=10, level_min: Optional[str]=None,
     if level_min: params["level_min"] = level_min
     if index:     params["index"]     = index
     if since:     params["since"]     = since
-    try:
-        r = requests.get(f"{SENTINEL_ACTIONS_BASE}/sentinel/inbox", params=params, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, dict) or not data.get("items"):
-            data = {"items":[{"index":"SYSTEM","level":"LV1","delta_pct":0,
-                              "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
-                              "note":"최근 알림 없음 (fallback)"}]}
-        return data
-    except Exception as e:
-        log.error("[CAIA] _fetch_latest_alerts failed: %s", e)
-        return {"items":[{"index":"SYSTEM","level":"LV1","delta_pct":0,
-                          "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
-                          "note": f"Actions 호출 실패: {e}"}]}
+
+    # 환경변수로 튜닝 가능
+    try_timeout = float(os.getenv("SENTINEL_ACTIONS_TIMEOUT", "15"))   # 기존 8s → 15s
+    max_retries = int(os.getenv("SENTINEL_ACTIONS_RETRIES", "2"))      # 2회 재시도
+    backoff_sec = float(os.getenv("SENTINEL_ACTIONS_BACKOFF", "0.8"))
+
+    url = f"{SENTINEL_ACTIONS_BASE}/sentinel/inbox"
+
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=try_timeout)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and data.get("items"):
+                return data
+            # 정상 200이지만 items가 없으면 한 번 더 시도
+            log.warning("[CAIA] inbox empty (attempt %d/%d)", attempt+1, max_retries)
+        except Exception as e:
+            log.error("[CAIA] inbox call failed (attempt %d/%d): %s", attempt+1, max_retries, e)
+        if attempt < max_retries:
+            time.sleep(backoff_sec * (attempt+1))
+
+    # 모든 시도 실패 → 최소 한 건 반환 (요약 포맷 유지)
+    return {"items":[{
+        "index":"SYSTEM","level":"LV1","delta_pct":0,
+        "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+        "note": f"Actions 호출 실패: timeout/retry exhausted (url={url})"
+    }]}
+
 
 def _get_run(base: str, headers: Dict[str,str], thread_id: str, run_id: str) -> Dict[str, Any]:
     r = requests.get(f"{base}/threads/{thread_id}/runs/{run_id}", headers=headers, timeout=12)
