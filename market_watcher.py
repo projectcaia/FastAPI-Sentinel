@@ -90,6 +90,10 @@ SYMBOL_SPX        = "^GSPC"
 SYMBOL_NDX        = "^IXIC"
 SYMBOL_VIX        = "^VIX"
 
+# 미국 선물 지수 (장 마감 시간 사용)
+SYMBOL_SPX_FUT = "ES=F"  # S&P 500 선물
+SYMBOL_NDX_FUT = "NQ=F"  # NASDAQ 선물
+
 def _now_kst():
     return datetime.now(timezone(timedelta(hours=9)))
 def _now_kst_iso():
@@ -356,6 +360,37 @@ def current_session() -> str:
         return "US"
     return "KR" if 830 <= hhmm <= 1600 else "US"
 
+def is_us_market_open() -> bool:
+    """미국 시장 개장 시간 체크 (KST 기준)
+    미국 시장: 22:30 ~ 05:00 (KST, 일광절약시간 기준)
+    겨울철: 23:30 ~ 06:00 (KST)
+    """
+    now = _now_kst()
+    hour = now.hour
+    minute = now.minute
+    
+    # 간단히 여름/겨울 구분 (대략적)
+    # 3월~11월: 일광절약시간
+    month = now.month
+    is_dst = 3 <= month <= 11
+    
+    if is_dst:
+        # 일광절약시간: 22:30 ~ 05:00 (KST)
+        if hour == 22 and minute >= 30:
+            return True
+        elif hour >= 23 or hour < 5:
+            return True
+    else:
+        # 표준시간: 23:30 ~ 06:00 (KST)
+        if hour == 23 and minute >= 30:
+            return True
+        elif hour >= 0 and hour < 6:
+            return True
+        elif hour == 23:
+            return False
+    
+    return False
+
 # -------------------- Bollinger(±2σ) --------------------
 def _zscore_latest(closes: list[float], window: int) -> tuple[float, float]:
     if len(closes) < window + 1:
@@ -451,11 +486,44 @@ def check_and_alert():
         except:
             pass
         
-        for idx_name, sym, label in [
-            ("ΔSPX", SYMBOL_SPX,  "US 세션: S&P500"),
-            ("ΔNASDAQ", SYMBOL_NDX, "US 세션: NASDAQ"),
-            ("ΔVIX", SYMBOL_VIX,  "US 세션: VIX")
-        ]:
+        # 시장 개장 상태 확인
+        us_market_open = is_us_market_open()
+        
+        # 시장 마감 시간에는 선물 지수 사용
+        if not us_market_open:
+            log.info("미국 시장 마감 - 선물 지수 사용")
+            symbols = [
+                ("ΔSPX_FUT", SYMBOL_SPX_FUT, "US 선물: S&P500"),
+                ("ΔNDX_FUT", SYMBOL_NDX_FUT, "US 선물: NASDAQ")
+                # VIX는 장 마감 시간에 제외
+            ]
+            # 선물 지수 데이터 수집
+            try:
+                spx_delta = get_delta(SYMBOL_SPX_FUT)
+            except:
+                spx_delta = 0.0
+            try:
+                nasdaq_delta = get_delta(SYMBOL_NDX_FUT)
+            except:
+                nasdaq_delta = 0.0
+        else:
+            log.debug("미국 시장 개장 중 - 현물 지수 사용")
+            symbols = [
+                ("ΔSPX", SYMBOL_SPX, "US 세션: S&P500"),
+                ("ΔNASDAQ", SYMBOL_NDX, "US 세션: NASDAQ"),
+                ("ΔVIX", SYMBOL_VIX, "US 세션: VIX")
+            ]
+            # 현물 지수 데이터 수집
+            try:
+                spx_delta = get_delta(SYMBOL_SPX)
+            except:
+                spx_delta = 0.0
+            try:
+                nasdaq_delta = get_delta(SYMBOL_NDX)
+            except:
+                nasdaq_delta = 0.0
+        
+        for idx_name, sym, label in symbols:
             try:
                 delta = get_delta(sym)
                 is_vix = (sym == SYMBOL_VIX)
