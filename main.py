@@ -263,7 +263,7 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
                 "function": {"name": "getLatestAlerts"}
             },
             # 히스토리 절단: 최근 8개 메시지만 모델에 공급 (입력 토큰 절감)
-            "truncation_strategy": {"type": "auto", "last_messages": 8},
+            "truncation_strategy": {"type": "last_messages", "last_messages": 8},
             # 지시문은 짧고 명확하게
             "instructions": (
                 "센티넬/알람 키워드 감지. getLatestAlerts(limit=10) 호출로 최근 알림 요약. "
