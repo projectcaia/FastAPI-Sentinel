@@ -1,4 +1,4 @@
-# main.py  (Assistants API v2, thread 고정 + inbox 지원, tools+tool_choice+requires_action 처리, async 고정)
+# main.py  (Assistants API v2 · Caia 연동 안정판 / async 고정)
 import os
 import time
 import json
@@ -9,52 +9,46 @@ from typing import Optional, Dict, Any, List
 from collections import deque
 from fastapi import FastAPI, Header, Request, Query
 
-APP_VERSION = "sentinel-fastapi-v2-1.3.3"
+APP_VERSION = "sentinel-fastapi-v2-1.3.4"
 
 # ── FastAPI ───────────────────────────────────────────────────────────
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
 
-# ── 환경변수 ──────────────────────────────────────────────────────────
+# ── ENV ───────────────────────────────────────────────────────────────
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
-ASSISTANT_ID      = os.getenv("CAIA_ASSISTANT_ID", "")     # v2 Assistant ID
+ASSISTANT_ID      = os.getenv("CAIA_ASSISTANT_ID", "")
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "")
-SENTINEL_ACTIONS_BASE = os.getenv(
-    "SENTINEL_ACTIONS_BASE",
-    "https://fastapi-sentinel-production.up.railway.app"
-).strip()
-LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()
+SENTINEL_ACTIONS_BASE = (os.getenv("SENTINEL_ACTIONS_BASE", "https://fastapi-sentinel-production.up.railway.app") or "").strip()
+LOG_LEVEL         = (os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
 
-def parse_int_env(key: str, default: int) -> int:
+def _env_int(key: str, default: int) -> int:
     import re
-    value = os.getenv(key, str(default)) or ""
-    m = re.search(r'\d+', value)
+    v = os.getenv(key, str(default)) or ""
+    m = re.search(r"\d+", v)
     return int(m.group()) if m else default
 
-DEDUP_WINDOW_MIN  = parse_int_env("DEDUP_WINDOW_MIN", 30)
-ALERT_CAP         = parse_int_env("ALERT_CAP", 2000)
+DEDUP_WINDOW_MIN  = _env_int("DEDUP_WINDOW_MIN", 30)
+ALERT_CAP         = _env_int("ALERT_CAP", 2000)
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 log = logging.getLogger("sentinel-fastapi-v2")
 
 log.info("=" * 60)
-log.info("Sentinel FastAPI v2 ENV:")
-log.info("  OPENAI_API_KEY: %s", "SET" if OPENAI_API_KEY else "NOT SET")
-log.info("  ASSISTANT_ID: %s", ASSISTANT_ID[:20] + "..." if ASSISTANT_ID else "NOT SET")
-log.info("  TELEGRAM: %s", "SET" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "NOT SET")
-log.info("  SENTINEL_KEY: %s", "SET" if SENTINEL_KEY else "NOT SET")
-log.info("  SENTINEL_ACTIONS_BASE: %s", SENTINEL_ACTIONS_BASE)
-log.info("  DEDUP_WINDOW_MIN: %d", DEDUP_WINDOW_MIN)
-log.info("  ALERT_CAP: %d", ALERT_CAP)
+log.info("ENV: OAI_KEY=%s, ASSISTANT=%s, TG=%s, S_KEY=%s, ACTIONS_BASE=%s",
+         "SET" if OPENAI_API_KEY else "NOT", ASSISTANT_ID[:16] + "..." if ASSISTANT_ID else "NOT",
+         "SET" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "NOT",
+         "SET" if SENTINEL_KEY else "NOT", SENTINEL_ACTIONS_BASE)
+log.info("DEDUP=%d min, ALERT_CAP=%d", DEDUP_WINDOW_MIN, ALERT_CAP)
 log.info("=" * 60)
 
-# ── 중복 억제 및 링버퍼 ──────────────────────────────────────────────
-_last_fired: Dict[tuple, float] = {}    # key=(index,level) -> epoch
-_alert_buf  = deque(maxlen=ALERT_CAP)   # 최신 알림이 좌측(0)에 오도록 appendleft
+# ── Ring buffer & dedup ───────────────────────────────────────────────
+_last_fired: Dict[tuple, float] = {}             # key=(index,level) -> epoch
+_alert_buf: deque = deque(maxlen=ALERT_CAP)      # newest first (appendleft)
 
 def within_dedup(idx: str, lvl: str) -> bool:
     now = time.time()
@@ -65,10 +59,10 @@ def within_dedup(idx: str, lvl: str) -> bool:
     _last_fired[k] = now
     return False
 
-# ── 외부 전송: 텔레그램 ──────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────
 def send_telegram(text: str) -> bool:
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
-        log.warning("Telegram env 미설정 → 스킵")
+        log.warning("Telegram env not set → skip")
         return False
     try:
         r = requests.post(
@@ -77,13 +71,13 @@ def send_telegram(text: str) -> bool:
             timeout=10,
         )
         if not r.ok:
-            log.error("Telegram 실패 %s %s", r.status_code, r.text)
+            log.error("Telegram fail %s %s", r.status_code, r.text)
         return r.ok
     except Exception as e:
-        log.exception("Telegram 예외: %s", e)
+        log.exception("Telegram exception: %s", e)
         return False
 
-# ── Assistants v2 헬퍼 ───────────────────────────────────────────────
+# ── Assistants v2 helpers ────────────────────────────────────────────
 def _oai_headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -91,7 +85,7 @@ def _oai_headers() -> Dict[str, str]:
         "OpenAI-Beta": "assistants=v2",
     }
 
-# 호출 안정화(환경변수 추가 없이 상수로 운영)
+# 안정화 상수(ENV 추가 없이 고정)
 ACTIONS_TIMEOUT_SEC = 15.0
 ACTIONS_RETRIES     = 2
 ACTIONS_BACKOFF_SEC = 0.8
@@ -112,14 +106,15 @@ def _fetch_latest_alerts(limit=10, level_min: Optional[str]=None,
             data = r.json()
             if isinstance(data, dict) and data.get("items"):
                 return data
-            log.warning("[CAIA] inbox empty (attempt %d/%d)", attempt+1, ACTIONS_RETRIES)
+            log.warning("[CAIA] inbox empty (try %d/%d)", attempt+1, ACTIONS_RETRIES)
         except Exception as e:
-            log.error("[CAIA] inbox call failed (attempt %d/%d): %s", attempt+1, ACTIONS_RETRIES, e)
+            log.error("[CAIA] inbox call failed (try %d/%d): %s", attempt+1, ACTIONS_RETRIES, e)
         if attempt < ACTIONS_RETRIES:
             time.sleep(ACTIONS_BACKOFF_SEC * (attempt+1))
 
-    return {"items":[{
-        "index":"SYSTEM","level":"LV1","delta_pct":0,
+    # fallback 한 건이라도 반환
+    return {"items": [{
+        "index": "SYSTEM", "level": "LV1", "delta_pct": 0,
         "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
         "note": f"Actions 호출 실패: timeout/retry exhausted (url={url})"
     }]}
@@ -137,7 +132,7 @@ def _get_run_steps(base: str, headers: Dict[str,str], thread_id: str, run_id: st
 def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 20) -> Dict[str, Any]:
     """
     requires_action 처리: getLatestAlerts 호출 → submit_tool_outputs → 완료까지 단기 폴링
-    (이 함수는 백그라운드 스레드에서 실행되므로 HTTP 502와 무관)
+    (백그라운드 스레드에서 실행됨: HTTP 502와 분리)
     """
     base = "https://api.openai.com/v1"
     headers = _oai_headers()
@@ -199,7 +194,7 @@ def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 20) 
             time.sleep(0.5)
             continue
 
-        # completed / failed / cancelled → 진단 포함하여 반환
+        # completed / failed / cancelled → 진단 포함
         steps = _get_run_steps(base, headers, thread_id, run_id)
         diag = {
             "status": st,
@@ -213,7 +208,7 @@ def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 20) 
 def send_caia_v2(text: str) -> Dict[str, Any]:
     """
     Assistants API v2
-    - Run 생성 시 additional_messages 로 유저 메시지 동시 전달 (messages 충돌 방지)
+    - Run 생성 시 additional_messages 로 유저 메시지 동시 전달(활성 Run/메시지 충돌 회피)
     - tools(definition) + tool_choice(getLatestAlerts) 동시 지정
     - requires_action 발생 시 /sentinel/inbox 직접 호출 → submit_tool_outputs
     """
@@ -224,7 +219,7 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
     headers = _oai_headers()
 
     try:
-        thread_id = os.getenv("CAIA_THREAD_ID", "").strip()
+        thread_id = (os.getenv("CAIA_THREAD_ID", "") or "").strip()
         if not thread_id:
             return {"ok": False, "stage": "precheck", "reason": "CAIA_THREAD_ID not set"}
 
@@ -248,11 +243,7 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
         run_body = {
             "assistant_id": ASSISTANT_ID,
             "tools": tools_def,
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": "getLatestAlerts"}
-            },
-            # 히스토리 절단: 입력 토큰 절감 + 긴 스레드 충돌 최소화
+            "tool_choice": {"type": "function", "function": {"name": "getLatestAlerts"}},
             "truncation_strategy": {"type": "last_messages", "last_messages": 8},
             "parallel_tool_calls": False,
             "instructions": (
@@ -260,51 +251,25 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
                 "응답 형식: (지표, 레벨, Δ%, 시각, note) 한 줄 리스트. "
                 "전략 판단은 지금 하지 말고, 마지막에 '전략 판단 들어갈까요?'만 질문."
             ),
-            # ★ 메시지는 여기 additional_messages 로 넣는다 (messages API 호출 금지)
             "additional_messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": text}
-                    ]
-                }
+                {"role": "user", "content": [{"type": "text", "text": text}]}
             ],
         }
 
-        # 바로 Run 생성 시도
-        r2 = requests.post(
-            f"{base}/threads/{thread_id}/runs",
-            headers=headers,
-            json=run_body,
-            timeout=15,
-        )
-
-        # 활성 Run 충돌 시 → 짧게 대기 후 1회 재시도
-        if not r2.ok and "활성화되어 있는 동안" in (r2.text or ""):
-            wait_ok = _wait_thread_free(thread_id, max_wait_sec=6.0)
-            if wait_ok:
-                r2 = requests.post(
-                    f"{base}/threads/{thread_id}/runs",
-                    headers=headers,
-                    json=run_body,
-                    timeout=15,
-                )
-
+        r2 = requests.post(f"{base}/threads/{thread_id}/runs", headers=headers, json=run_body, timeout=15)
         if not r2.ok:
             return {"ok": False, "stage": "run", "status": r2.status_code, "resp": r2.text, "thread_id": thread_id}
 
         run_id = r2.json().get("id", "")
-
-        # requires_action 처리 + 완료 대기
         done = _poll_and_submit_tools(thread_id, run_id, max_wait_sec=20)
         done["thread_id"] = thread_id
         return done
 
     except Exception as e:
-        log.exception("OpenAI 예외: %s", e)
+        log.exception("OpenAI exception: %s", e)
         return {"ok": False, "stage": "exception", "reason": str(e)}
 
-# ── 유틸 ─────────────────────────────────────────────────────────────
+# ── Utils ─────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {
@@ -312,7 +277,7 @@ def health():
         "version": APP_VERSION,
         "assistant_set": bool(ASSISTANT_ID),
         "tg_set": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
-        "thread_fixed": bool(os.getenv("CAIA_THREAD_ID", "").strip()),
+        "thread_fixed": bool((os.getenv("CAIA_THREAD_ID", "") or "").strip()),
         "dedup_min": DEDUP_WINDOW_MIN,
         "alert_buf_len": len(_alert_buf),
         "alert_cap": ALERT_CAP,
@@ -346,7 +311,7 @@ def _append_inbox(data: dict) -> None:
     }
     _alert_buf.appendleft(item)
 
-# ── 카이아 호출: 항상 비동기(환경변수 추가 없이 고정) ─────────────────────
+# ── Caia 호출: 항상 비동기(HTTP 즉시 응답) ───────────────────────────
 def _run_caia_job(text: str) -> None:
     try:
         info = send_caia_v2(text)
@@ -358,25 +323,24 @@ def trigger_caia_async(text: str) -> None:
     th = threading.Thread(target=_run_caia_job, args=(text,), daemon=True)
     th.start()
 
-# ── 엔드포인트 ───────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────
 @app.post("/sentinel/alert")
 async def sentinel_alert(
     request: Request,
     x_sentinel_key: Optional[str] = Header(default=None)
 ):
     """
-    - 실패해도 200 JSON으로 원인 반환 (server 500 방지)
-    - 카이아 툴콜은 백그라운드에서 실행 (HTTP 502 방지)
+    - 즉시 200 응답(accepted) 후, 카이아 연동은 내부 스레드에서 비동기 처리 → 502 원천 차단
+    - Caia는 Run 생성 시 tools + tool_choice로 getLatestAlerts를 강제 호출, requires_action은 서버가 처리
     """
     try:
-        # 본문 안전 파싱(UTF-8 아닌 경우도 대체문자 허용)
         raw = await request.body()
         try:
             data = json.loads(raw.decode("utf-8"))
         except UnicodeDecodeError:
             data = json.loads(raw.decode("utf-8", errors="replace"))
 
-        # (선택) 공유키 검증
+        # 공유키 검증(옵션)
         if SENTINEL_KEY and x_sentinel_key != SENTINEL_KEY:
             return {"status": "error", "where": "auth", "detail": "invalid sentinel key"}
 
@@ -386,49 +350,40 @@ async def sentinel_alert(
                 return {"status": "error", "where": "payload", "detail": f"missing field {f}"}
 
         lvl = str(data["level"]).upper()
-        valid_levels = {"LV1", "LV2", "LV3", "CLEARED", "BREACH", "RECOVER"}
-        if lvl not in valid_levels:
-            log.warning("예상치 않은 레벨: %s, LV2로 처리", lvl)
+        valid = {"LV1", "LV2", "LV3", "CLEARED", "BREACH", "RECOVER"}
+        if lvl not in valid:
+            log.warning("Unknown level: %s → LV2", lvl)
             lvl = "LV2"
 
         idx = str(data["index"])
 
-        # 중복 억제 (CLEARED는 항상 통과)
+        # dedup (CLEARED는 통과)
         if lvl != "CLEARED" and within_dedup(idx, lvl):
             _append_inbox(data)
             return {"status": "dedup_suppressed", "reason": f"same alert within {DEDUP_WINDOW_MIN} minutes"}
 
-        # 메시지 생성
         data["level"] = lvl
         msg = _format_msg(data)
 
-        log.info("알림 전송: %s %s %.2f%% - %s",
-                 idx, lvl, float(data.get("delta_pct", 0)),
-                 data.get("note", ""))
+        log.info("알림 전송: %s %s %.2f%% - %s", idx, lvl, float(data.get("delta_pct", 0)), data.get("note", ""))
 
-        # 텔레그램 (짧은 타임아웃 유지)
+        # Telegram (non-blocking)
         tg_ok = send_telegram(msg)
 
-        # 카이아(Assistants v2) — 비동기 실행 (HTTP 즉시 응답)
+        # Caia 연동은 비동기
         trigger_caia_async(msg)
-        caia_info = {"ok": True, "queued": True, "mode": "async"}
 
-        # inbox 적재
+        # inbox 저장
         _append_inbox({
             "index": idx, "level": lvl, "delta_pct": float(data["delta_pct"]),
             "covix": data.get("covix"), "triggered_at": data["triggered_at"],
             "note": data.get("note")
         })
 
-        return {
-            "status": "delivered",
-            "telegram": tg_ok,
-            "caia": caia_info,   # async 큐잉 표기
-            "message": msg
-        }
+        return {"status": "delivered", "telegram": tg_ok, "caia": {"ok": True, "queued": True, "mode": "async"}, "message": msg}
 
     except Exception as e:
-        log.exception("sentinel_alert 예외: %s", e)
+        log.exception("sentinel_alert exception: %s", e)
         return {"status": "error", "where": "server", "detail": str(e)}
 
 @app.get("/sentinel/inbox")
@@ -438,11 +393,13 @@ def sentinel_inbox(
     index: Optional[str] = None,
     since: Optional[str] = None,
 ):
-    """커스텀 GPT Action이 호출하는 읽기 전용 API (단기 메모리)."""
+    """
+    커스텀 GPT Action(getLatestAlerts)이 호출하는 읽기 전용 API (단기 메모리)
+    """
     def lv_rank(lv: str) -> int:
         return {"LV1": 1, "LV2": 2, "LV3": 3}.get(lv, 0)
 
-    items = list(_alert_buf)  # 최신순(appendleft)
+    items = list(_alert_buf)  # newest first
 
     if level_min:
         minv = lv_rank(level_min.upper())
@@ -456,5 +413,5 @@ def sentinel_inbox(
 
     return {"items": items[:limit]}
 
-# Procfile:
+# Procfile (참고):
 # web: uvicorn main:app --host 0.0.0.0 --port $PORT
