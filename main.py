@@ -1,23 +1,28 @@
-# main.py  (Assistants API v2, thread 고정 + inbox 지원, debug 강화)
+# main.py  (Assistants API v2, thread 고정 + inbox 지원, tool_choice+tools+requires_action 처리)
 import os
 import time
+import json
 import logging
 import requests
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from collections import deque
 from fastapi import FastAPI, Header, HTTPException, Request, Query
 
-APP_VERSION = "sentinel-fastapi-v2-1.2.3"
+APP_VERSION = "sentinel-fastapi-v2-1.3.0"
 
 # ── FastAPI ───────────────────────────────────────────────────────────
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
 
 # ── 환경변수 ──────────────────────────────────────────────────────────
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
-ASSISTANT_ID      = os.getenv("CAIA_ASSISTANT_ID", "")   # v2 Assistant ID
+ASSISTANT_ID      = os.getenv("CAIA_ASSISTANT_ID", "")     # v2 Assistant ID
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "")
+SENTINEL_ACTIONS_BASE = os.getenv(
+    "SENTINEL_ACTIONS_BASE",
+    "https://fastapi-sentinel-production.up.railway.app"
+).strip()
 LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()
 
 def parse_int_env(key: str, default: int) -> int:
@@ -41,6 +46,7 @@ log.info("  OPENAI_API_KEY: %s", "SET" if OPENAI_API_KEY else "NOT SET")
 log.info("  ASSISTANT_ID: %s", ASSISTANT_ID[:20] + "..." if ASSISTANT_ID else "NOT SET")
 log.info("  TELEGRAM: %s", "SET" if (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID) else "NOT SET")
 log.info("  SENTINEL_KEY: %s", "SET" if SENTINEL_KEY else "NOT SET")
+log.info("  SENTINEL_ACTIONS_BASE: %s", SENTINEL_ACTIONS_BASE)
 log.info("  DEDUP_WINDOW_MIN: %d", DEDUP_WINDOW_MIN)
 log.info("  ALERT_CAP: %d", ALERT_CAP)
 log.info("=" * 60)
@@ -84,11 +90,93 @@ def _oai_headers() -> Dict[str, str]:
         "OpenAI-Beta": "assistants=v2",
     }
 
+def _fetch_latest_alerts(limit=10, level_min: Optional[str]=None,
+                         index: Optional[str]=None, since: Optional[str]=None) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"limit": int(limit)}
+    if level_min: params["level_min"] = level_min
+    if index:     params["index"]     = index
+    if since:     params["since"]     = since
+    try:
+        r = requests.get(f"{SENTINEL_ACTIONS_BASE}/sentinel/inbox", params=params, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        # 빈 결과 방지용 최소 한 건
+        if not isinstance(data, dict) or not data.get("items"):
+            data = {"items":[{"index":"SYSTEM","level":"LV1","delta_pct":0,
+                              "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+                              "note":"최근 알림 없음 (fallback)"}]}
+        return data
+    except Exception as e:
+        log.error("[CAIA] _fetch_latest_alerts failed: %s", e)
+        return {"items":[{"index":"SYSTEM","level":"LV1","delta_pct":0,
+                          "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
+                          "note": f"Actions 호출 실패: {e}"}]}
+
+def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 20) -> Dict[str, Any]:
+    """requires_action 처리: getLatestAlerts 호출 → submit_tool_outputs → 완료까지 단기 폴링"""
+    base = "https://api.openai.com/v1"
+    headers = _oai_headers()
+    start = time.time()
+
+    while True:
+        r = requests.get(f"{base}/threads/{thread_id}/runs/{run_id}", headers=headers, timeout=12)
+        if not r.ok:
+            return {"ok": False, "stage": "get_run", "status": r.status_code, "resp": r.text, "run_id": run_id}
+
+        cur = r.json()
+        st = cur.get("status")
+        if st in ("queued", "in_progress", "cancelling"):
+            if time.time() - start > max_wait_sec:
+                return {"ok": False, "stage": "timeout", "status": st, "run_id": run_id}
+            time.sleep(0.7)
+            continue
+
+        if st == "requires_action":
+            ra = cur.get("required_action", {}).get("submit_tool_outputs", {})
+            calls: List[Dict[str, Any]] = ra.get("tool_calls", []) or []
+            outs: List[Dict[str, str]] = []
+
+            for c in calls:
+                fn   = c.get("function", {}).get("name")
+                args = c.get("function", {}).get("arguments") or "{}"
+                try:
+                    parsed = json.loads(args)
+                except Exception:
+                    parsed = {}
+
+                if fn == "getLatestAlerts":
+                    data = _fetch_latest_alerts(
+                        limit     = int(parsed.get("limit", 10)),
+                        level_min = parsed.get("level_min"),
+                        index     = parsed.get("index"),
+                        since     = parsed.get("since"),
+                    )
+                    outs.append({"tool_call_id": c["id"], "output": json.dumps(data, ensure_ascii=False)})
+                else:
+                    outs.append({"tool_call_id": c["id"],
+                                 "output": json.dumps({"error": f"unknown function {fn}"}, ensure_ascii=False)})
+
+            r2 = requests.post(
+                f"{base}/threads/{thread_id}/runs/{run_id}/submit_tool_outputs",
+                headers=headers,
+                json={"tool_outputs": outs},
+                timeout=15,
+            )
+            if not r2.ok:
+                return {"ok": False, "stage": "submit_tool_outputs", "status": r2.status_code, "resp": r2.text, "run_id": run_id}
+            # 다음 루프로 상태 재확인
+            time.sleep(0.5)
+            continue
+
+        # completed / failed / cancelled
+        return {"ok": (st == "completed"), "status": st, "run_id": run_id}
+
 def send_caia_v2(text: str) -> Dict[str, Any]:
     """
     Assistants API v2
-    - Run 생성 시 tool_choice=function(getLatestAlerts) **강제**
-    - 실패/예외도 dict로 반환 (서버는 500으로 올리지 않음)
+    - Run 생성 시 tool_choice=function(getLatestAlerts) + tools에 함수 정의 포함 (필수)
+    - requires_action 발생 시 /sentinel/inbox 직접 호출 → submit_tool_outputs
+    - 디버그 정보를 dict로 반환
     """
     if not (OPENAI_API_KEY and ASSISTANT_ID):
         return {"ok": False, "stage": "precheck", "reason": "OPENAI/ASSISTANT env not set"}
@@ -113,12 +201,30 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
         if not r1.ok:
             return {"ok": False, "stage": "message", "status": r1.status_code, "resp": r1.text, "thread_id": thread_id}
 
-        # 2) Run 생성: 툴콜 강제
+        # 2) Run 생성: 툴콜 강제 + tools 정의 포함
+        tools_def = [{
+            "type": "function",
+            "function": {
+                "name": "getLatestAlerts",
+                "description": "최근 센티넬 알림 조회",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "limit":     {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                        "level_min": {"type": "string", "enum": ["LV1", "LV2", "LV3"]},
+                        "index":     {"type": "string"},
+                        "since":     {"type": "string"}
+                    }
+                }
+            }
+        }]
+
         run_body = {
             "assistant_id": ASSISTANT_ID,
+            "tools": tools_def,  # ←←← 중요: tools에 함수 정의 포함
             "tool_choice": {
                 "type": "function",
-                "function": {"name": "getLatestAlerts"}  # operationId와 정확히 일치
+                "function": {"name": "getLatestAlerts"}  # ← operationId와 동일
             },
             "instructions": (
                 "센티넬/알람 키워드 감지. getLatestAlerts(limit=10 기본)을 호출해 최근 알림을 요약하라. "
@@ -136,7 +242,11 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
             return {"ok": False, "stage": "run", "status": r2.status_code, "resp": r2.text, "thread_id": thread_id}
 
         run_id = r2.json().get("id", "")
-        return {"ok": True, "thread_id": thread_id, "run_id": run_id}
+
+        # 3) requires_action 처리 + 완료 대기 (짧게)
+        done = _poll_and_submit_tools(thread_id, run_id, max_wait_sec=25)
+        done["thread_id"] = thread_id
+        return done
 
     except Exception as e:
         log.exception("OpenAI 예외: %s", e)
@@ -191,15 +301,19 @@ async def sentinel_alert(
     x_sentinel_key: Optional[str] = Header(default=None)
 ):
     """
-    - 절대 예외로 500 올리지 않음 (항상 200 JSON 반환)
-    - 실패해도 stage/status/resp(reason) 등 디테일 제공
+    - 실패해도 200 JSON으로 원인 반환 (server 500 방지)
     """
     try:
+        # 본문 안전 파싱(UTF-8 아닌 경우도 대체문자 허용)
+        raw = await request.body()
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            data = json.loads(raw.decode("utf-8", errors="replace"))
+
         # (선택) 공유키 검증
         if SENTINEL_KEY and x_sentinel_key != SENTINEL_KEY:
             return {"status": "error", "where": "auth", "detail": "invalid sentinel key"}
-
-        data = await request.json()
 
         # 필수 필드 검증
         for f in ("index", "level", "delta_pct", "triggered_at"):
@@ -217,10 +331,7 @@ async def sentinel_alert(
         # 중복 억제 (CLEARED는 항상 통과)
         if lvl != "CLEARED" and within_dedup(idx, lvl):
             _append_inbox(data)
-            return {
-                "status": "dedup_suppressed",
-                "reason": f"same alert within {DEDUP_WINDOW_MIN} minutes"
-            }
+            return {"status": "dedup_suppressed", "reason": f"same alert within {DEDUP_WINDOW_MIN} minutes"}
 
         # 메시지 생성
         data["level"] = lvl
@@ -233,21 +344,24 @@ async def sentinel_alert(
         # 텔레그램
         tg_ok = send_telegram(msg)
 
-        # 카이아(Assistants v2) — 툴콜 강제 + 디버그
+        # 카이아(Assistants v2) — 툴콜 강제 + tools 정의 + requires_action 처리
         caia_info = send_caia_v2(msg)
 
         # inbox 적재
-        _append_inbox(data)
+        _alert_buf.appendleft({
+            "index": idx, "level": lvl, "delta_pct": float(data["delta_pct"]),
+            "covix": data.get("covix"), "triggered_at": data["triggered_at"],
+            "note": data.get("note")
+        })
 
         return {
             "status": "delivered",
             "telegram": tg_ok,
-            "caia": caia_info,   # ← 여기서 성공/실패/사유가 바로 보임
+            "caia": caia_info,   # 성공/실패/사유/단계 모두 확인 가능
             "message": msg
         }
 
     except Exception as e:
-        # 마지막 방어: 그래도 200으로 에러 정보만 반환
         log.exception("sentinel_alert 예외: %s", e)
         return {"status": "error", "where": "server", "detail": str(e)}
 
@@ -272,7 +386,6 @@ def sentinel_inbox(
         items = [x for x in items if x["index"] == index]
 
     if since:
-        # ISO8601 형식 동일 가정하에 문자열 비교
         items = [x for x in items if x["triggered_at"] >= since]
 
     return {"items": items[:limit]}
