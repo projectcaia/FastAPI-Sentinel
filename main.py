@@ -6,9 +6,9 @@ import logging
 import requests
 from typing import Optional, Dict, Any, List
 from collections import deque
-from fastapi import FastAPI, Header, HTTPException, Request, Query
+from fastapi import FastAPI, Header, Request, Query
 
-APP_VERSION = "sentinel-fastapi-v2-1.3.0"
+APP_VERSION = "sentinel-fastapi-v2-1.3.1"
 
 # ── FastAPI ───────────────────────────────────────────────────────────
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
@@ -100,7 +100,6 @@ def _fetch_latest_alerts(limit=10, level_min: Optional[str]=None,
         r = requests.get(f"{SENTINEL_ACTIONS_BASE}/sentinel/inbox", params=params, timeout=8)
         r.raise_for_status()
         data = r.json()
-        # 빈 결과 방지용 최소 한 건
         if not isinstance(data, dict) or not data.get("items"):
             data = {"items":[{"index":"SYSTEM","level":"LV1","delta_pct":0,
                               "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
@@ -112,29 +111,44 @@ def _fetch_latest_alerts(limit=10, level_min: Optional[str]=None,
                           "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
                           "note": f"Actions 호출 실패: {e}"}]}
 
-def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 20) -> Dict[str, Any]:
-    """requires_action 처리: getLatestAlerts 호출 → submit_tool_outputs → 완료까지 단기 폴링"""
+def _get_run(base: str, headers: Dict[str,str], thread_id: str, run_id: str) -> Dict[str, Any]:
+    r = requests.get(f"{base}/threads/{thread_id}/runs/{run_id}", headers=headers, timeout=12)
+    ok = r.ok
+    return {"ok": ok, "status_code": r.status_code, "json": (r.json() if ok else None), "text": (r.text if not ok else None)}
+
+def _get_run_steps(base: str, headers: Dict[str,str], thread_id: str, run_id: str) -> Dict[str, Any]:
+    r = requests.get(f"{base}/threads/{thread_id}/runs/{run_id}/steps", headers=headers, timeout=12)
+    ok = r.ok
+    return {"ok": ok, "status_code": r.status_code, "json": (r.json() if ok else None), "text": (r.text if not ok else None)}
+
+def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 25) -> Dict[str, Any]:
+    """
+    requires_action 처리: getLatestAlerts 호출 → submit_tool_outputs → 완료까지 단기 폴링
+    실패 시 last_error/steps 등 진단(diag) 포함해서 반환.
+    """
     base = "https://api.openai.com/v1"
     headers = _oai_headers()
     start = time.time()
 
     while True:
-        r = requests.get(f"{base}/threads/{thread_id}/runs/{run_id}", headers=headers, timeout=12)
-        if not r.ok:
-            return {"ok": False, "stage": "get_run", "status": r.status_code, "resp": r.text, "run_id": run_id}
+        info = _get_run(base, headers, thread_id, run_id)
+        if not info["ok"]:
+            return {"ok": False, "stage": "get_run", "status": info["status_code"], "resp": info["text"], "run_id": run_id}
 
-        cur = r.json()
-        st = cur.get("status")
+        cur = info["json"]
+        st  = cur.get("status")
+
         if st in ("queued", "in_progress", "cancelling"):
             if time.time() - start > max_wait_sec:
-                return {"ok": False, "stage": "timeout", "status": st, "run_id": run_id}
+                diag = {"status": st, "last_error": cur.get("last_error"), "incomplete_details": cur.get("incomplete_details")}
+                return {"ok": False, "stage": "timeout", "run_id": run_id, "diag": diag}
             time.sleep(0.7)
             continue
 
         if st == "requires_action":
             ra = cur.get("required_action", {}).get("submit_tool_outputs", {})
             calls: List[Dict[str, Any]] = ra.get("tool_calls", []) or []
-            outs: List[Dict[str, str]] = []
+            outs: List[Dict[str, str]]  = []
 
             for c in calls:
                 fn   = c.get("function", {}).get("name")
@@ -145,8 +159,13 @@ def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 20) 
                     parsed = {}
 
                 if fn == "getLatestAlerts":
+                    limit_val = parsed.get("limit", 10)
+                    try:
+                        limit_val = int(limit_val)
+                    except Exception:
+                        limit_val = 10
                     data = _fetch_latest_alerts(
-                        limit     = int(parsed.get("limit", 10)),
+                        limit     = limit_val,
                         level_min = parsed.get("level_min"),
                         index     = parsed.get("index"),
                         since     = parsed.get("since"),
@@ -164,12 +183,19 @@ def _poll_and_submit_tools(thread_id: str, run_id: str, max_wait_sec: int = 20) 
             )
             if not r2.ok:
                 return {"ok": False, "stage": "submit_tool_outputs", "status": r2.status_code, "resp": r2.text, "run_id": run_id}
-            # 다음 루프로 상태 재확인
             time.sleep(0.5)
             continue
 
-        # completed / failed / cancelled
-        return {"ok": (st == "completed"), "status": st, "run_id": run_id}
+        # completed / failed / cancelled → 진단 포함하여 반환
+        steps = _get_run_steps(base, headers, thread_id, run_id)
+        diag = {
+            "status": st,
+            "last_error": cur.get("last_error"),
+            "incomplete_details": cur.get("incomplete_details"),
+            "step_status": steps.get("status_code"),
+            "steps": (steps.get("json") or steps.get("text"))
+        }
+        return {"ok": (st == "completed"), "status": st, "run_id": run_id, "diag": diag}
 
 def send_caia_v2(text: str) -> Dict[str, Any]:
     """
@@ -221,10 +247,10 @@ def send_caia_v2(text: str) -> Dict[str, Any]:
 
         run_body = {
             "assistant_id": ASSISTANT_ID,
-            "tools": tools_def,  # ←←← 중요: tools에 함수 정의 포함
+            "tools": tools_def,  # ← 중요
             "tool_choice": {
                 "type": "function",
-                "function": {"name": "getLatestAlerts"}  # ← operationId와 동일
+                "function": {"name": "getLatestAlerts"}  # operationId와 동일
             },
             "instructions": (
                 "센티넬/알람 키워드 감지. getLatestAlerts(limit=10 기본)을 호출해 최근 알림을 요약하라. "
@@ -302,6 +328,7 @@ async def sentinel_alert(
 ):
     """
     - 실패해도 200 JSON으로 원인 반환 (server 500 방지)
+    - 카이아 툴콜은 tools+tool_choice로 강제, requires_action은 서버가 처리
     """
     try:
         # 본문 안전 파싱(UTF-8 아닌 경우도 대체문자 허용)
@@ -348,7 +375,7 @@ async def sentinel_alert(
         caia_info = send_caia_v2(msg)
 
         # inbox 적재
-        _alert_buf.appendleft({
+        _append_inbox({
             "index": idx, "level": lvl, "delta_pct": float(data["delta_pct"]),
             "covix": data.get("covix"), "triggered_at": data["triggered_at"],
             "note": data.get("note")
@@ -357,7 +384,7 @@ async def sentinel_alert(
         return {
             "status": "delivered",
             "telegram": tg_ok,
-            "caia": caia_info,   # 성공/실패/사유/단계 모두 확인 가능
+            "caia": caia_info,   # 성공/실패/사유/단계/steps 모두 확인 가능
             "message": msg
         }
 
