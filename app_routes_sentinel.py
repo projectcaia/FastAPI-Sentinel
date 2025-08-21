@@ -1,4 +1,4 @@
-# app_routes_sentinel.py
+# app_routes_sentinel.py (patched 2025-08-21)
 # ------------------------------------------------------------
 # Caia Relay (Assistants v2, Function Calling)
 # - POST /caia/alert  : 외부(또는 내부)에서 알람 푸시 → 카이아 툴콜 강제
@@ -13,10 +13,11 @@ import requests
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
-# 🔁 여기만 바꿈: prefix="/caia"
+# 🔁 prefix 유지
 router = APIRouter(prefix="/caia", tags=["caia-fc"])
 log = logging.getLogger("uvicorn.error")
 
+# ── ENV ──────────────────────────────────────────────────────────────
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE        = os.getenv("OPENAI_BASE", "https://api.openai.com/v1").strip()
 CAIA_ASSISTANT_ID  = os.getenv("CAIA_ASSISTANT_ID", "").strip()
@@ -27,9 +28,15 @@ SENTINEL_ACTIONS_BASE = os.getenv(
     "https://fastapi-sentinel-production.up.railway.app"
 ).strip()
 
-HTTP_MAX_RETRY = int(os.getenv("HTTP_MAX_RETRY", "3"))
-HTTP_RETRY_WAIT_BASE = float(os.getenv("HTTP_RETRY_WAIT_BASE", "0.6"))
-RUN_ALLOW_REPLAY = os.getenv("RUN_ALLOW_REPLAY", "1").strip() not in ("0", "false", "False")
+# Sentinel security header (x-sentinel-key)
+SENTINEL_KEY = os.getenv("SENTINEL_KEY", "").strip()
+
+# HTTP / Retry / Timeout
+HTTP_MAX_RETRY = int(os.getenv("HTTP_MAX_RETRY", "4"))
+HTTP_RETRY_WAIT_BASE = float(os.getenv("HTTP_RETRY_WAIT_BASE", "0.8"))
+CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "10"))
+READ_TIMEOUT = float(os.getenv("READ_TIMEOUT", "60"))  # 핵심: read 60s
+RUN_POLL_MAX_WAIT = int(os.getenv("RUN_POLL_MAX_WAIT", "90"))
 
 class AlertModel(BaseModel):
     symbol: str = Field(..., description="지표명 (ΔK200, COVIX, VIX 등)")
@@ -54,6 +61,8 @@ def _in_window(key: str, window_min: int) -> bool:
 def _mark(key: str) -> None:
     _DEDUP[key] = time.time()
 
+# ── HTTP helpers ─────────────────────────────────────────────────────
+
 def _headers() -> Dict[str, str]:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
@@ -61,15 +70,20 @@ def _headers() -> Dict[str, str]:
             "Content-Type": "application/json",
             "OpenAI-Beta": "assistants=v2"}
 
+
 def _should_retry(status: int) -> bool:
     return status in (429, 500, 502, 503, 504)
 
-def _post(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
+
+def _post(url: str, body: Dict[str, Any], timeout_read: float = None) -> Dict[str, Any]:
+    if timeout_read is None:
+        timeout_read = READ_TIMEOUT
     last_err = None
     for i in range(HTTP_MAX_RETRY):
         try:
-            r = requests.post(url, headers=_headers(), json=body, timeout=timeout)
-            if r.status_code < 300: return r.json()
+            r = requests.post(url, headers=_headers(), json=body, timeout=(CONNECT_TIMEOUT, timeout_read))
+            if r.status_code < 300:
+                return r.json()
             last_err = RuntimeError(f"POST {url} failed: {r.status_code} {r.text}")
             if _should_retry(r.status_code) and i < HTTP_MAX_RETRY-1:
                 time.sleep(HTTP_RETRY_WAIT_BASE*(i+1)); continue
@@ -80,12 +94,16 @@ def _post(url: str, body: Dict[str, Any], timeout: int = 20) -> Dict[str, Any]:
                 time.sleep(HTTP_RETRY_WAIT_BASE*(i+1)); continue
             raise last_err
 
-def _get(url: str, timeout: int = 15) -> Dict[str, Any]:
+
+def _get(url: str, timeout_read: float = None) -> Dict[str, Any]:
+    if timeout_read is None:
+        timeout_read = READ_TIMEOUT
     last_err = None
     for i in range(HTTP_MAX_RETRY):
         try:
-            r = requests.get(url, headers=_headers(), timeout=timeout)
-            if r.status_code < 300: return r.json()
+            r = requests.get(url, headers=_headers(), timeout=(CONNECT_TIMEOUT, timeout_read))
+            if r.status_code < 300:
+                return r.json()
             last_err = RuntimeError(f"GET {url} failed: {r.status_code} {r.text}")
             if _should_retry(r.status_code) and i < HTTP_MAX_RETRY-1:
                 time.sleep(HTTP_RETRY_WAIT_BASE*(i+1)); continue
@@ -96,17 +114,26 @@ def _get(url: str, timeout: int = 15) -> Dict[str, Any]:
                 time.sleep(HTTP_RETRY_WAIT_BASE*(i+1)); continue
             raise last_err
 
+# ── Sentinel Actions client ──────────────────────────────────────────
+
 def _fetch_latest_alerts(limit=10, level_min: Optional[str]=None,
                          index: Optional[str]=None, since: Optional[str]=None) -> Dict[str, Any]:
     params: Dict[str, Any] = {"limit": int(limit)}
     if level_min: params["level_min"] = level_min
     if index:     params["index"] = index
-    if since:     params["since"] = since
+    if since:     params["since"] = since  # 상위에서 +09:00 ISO 보장 권장
+
+    url = f"{SENTINEL_ACTIONS_BASE}/sentinel/inbox"
+
+    headers: Dict[str, str] = {}
+    if SENTINEL_KEY:
+        headers["x-sentinel-key"] = SENTINEL_KEY
+
     try:
-        r = requests.get(f"{SENTINEL_ACTIONS_BASE}/sentinel/inbox", params=params, timeout=8)
+        r = requests.get(url, headers=headers, params=params, timeout=(CONNECT_TIMEOUT, 30))
         r.raise_for_status()
         data = r.json()
-        if not isinstance(data, dict) or not data.get("items"):
+        if not isinstance(data, dict) or data.get("items") is None:
             data = {"items": [{
                 "index":"SYSTEM","level":"LV1","delta_pct":0,
                 "triggered_at": time.strftime("%Y-%m-%dT%H:%M:%S+09:00"),
@@ -121,6 +148,8 @@ def _fetch_latest_alerts(limit=10, level_min: Optional[str]=None,
             "note": f"Actions 호출 실패: {e}"
         }]}
 
+# ── Assistants v2 Run orchestration ─────────────────────────────────
+
 def _create_run_get_latest() -> str:
     run = _post(f"{OPENAI_BASE}/threads/{CAIA_THREAD_ID}/runs", {
         "assistant_id": CAIA_ASSISTANT_ID,
@@ -131,6 +160,7 @@ def _create_run_get_latest() -> str:
         "tool_choice": {"type":"function","function":{"name":"getLatestAlerts"}}
     })
     return run["id"]
+
 
 def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
     if not CAIA_ASSISTANT_ID or not CAIA_THREAD_ID:
@@ -148,13 +178,16 @@ def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
 
     run_id = _create_run_get_latest()
     replayed = False
+    start = time.time()
 
     while True:
         cur = _get(f"{OPENAI_BASE}/threads/{CAIA_THREAD_ID}/runs/{run_id}")
         st = cur.get("status")
 
         if st in ("queued","in_progress","cancelling"):
-            time.sleep(0.7); continue
+            if time.time() - start > RUN_POLL_MAX_WAIT:
+                return {"status":"timeout","id": run_id}
+            time.sleep(0.8); continue
 
         if st == "requires_action":
             ra = cur.get("required_action", {}).get("submit_tool_outputs", {})
@@ -182,15 +215,18 @@ def _relay_to_caia_with_tool(push_payload: Dict[str, Any]) -> Dict[str, Any]:
 
             _post(f"{OPENAI_BASE}/threads/{CAIA_THREAD_ID}/runs/{run_id}/submit_tool_outputs",
                   {"tool_outputs": outputs})
-            time.sleep(0.4); continue
-
-        if st == "failed" and RUN_ALLOW_REPLAY and not replayed:
-            log.warning("[Caia-FC] run failed -> replay once")
-            run_id = _create_run_get_latest()
-            replayed = True
             time.sleep(0.6); continue
 
-        return cur  # completed / failed / cancelled
+        if st == "failed" and (os.getenv("RUN_ALLOW_REPLAY", "1").strip() not in ("0","false","False")) and not replayed:
+            log.warning("[Caia-FC] run failed -> replay once")
+            run_id = _create_run_get_latest()
+            start = time.time()
+            replayed = True
+            time.sleep(0.8); continue
+
+        return cur  # completed / failed / cancelled / timeout
+
+# ── Routes ──────────────────────────────────────────────────────────
 
 @router.post("/alert")
 def caia_alert_push(alert: AlertModel):
@@ -209,10 +245,14 @@ def caia_alert_push(alert: AlertModel):
         log.exception("[Caia-FC] relay error")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.get("/health")
 def caia_health():
     return {"status":"ok",
             "assistant_id": bool(CAIA_ASSISTANT_ID),
             "thread_id": bool(CAIA_THREAD_ID),
             "openai_base": OPENAI_BASE,
-            "sentinel_actions_base": SENTINEL_ACTIONS_BASE}
+            "sentinel_actions_base": SENTINEL_ACTIONS_BASE,
+            "timeouts": {"connect": CONNECT_TIMEOUT, "read": READ_TIMEOUT},
+            "retries": {"max": HTTP_MAX_RETRY, "backoff_base": HTTP_RETRY_WAIT_BASE},
+            "run_poll_max_wait": RUN_POLL_MAX_WAIT}
