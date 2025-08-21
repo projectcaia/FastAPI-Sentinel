@@ -1,10 +1,12 @@
-# function_router.py — Caia Function Router (Option A / v2.2, KST 2025-08-18)
+# function_router.py — Caia Function Router (Option A / v2.3, KST 2025-08-21)
 # 목적:
 #   - 대화 메시지를 받아 중요도 스코어링 → RAW 저장(memory_manager.echo)
 #   - '존재/진화/관계(추억)' 등 정체성 관련 키워드 자동 상향 및 토픽/태그 자동화
 #   - Micro-Digest(요약 초안) 생성 후 벡터 메모리 저장(가능할 때)
 #   - 수동 학습(manual_learn) 및 세션 마감(finalize_session) 지원
 #   - 간단 검색 래퍼(retrieve) 제공
+#   - ✅ ERSP 저장(save_ersp): 사건→성찰→규칙→트리거 자동 보강 후 저장
+#   - ✅ 규칙/전망 회상(recall_rules): rule/prospective 우선 회상(간단 부스팅)
 #
 # 요구:
 #   - memory_manager.CaiaMemory (echo, add_vector_memory, list_raw, vector_search, now_iso)
@@ -48,13 +50,11 @@ DECISION_PATTERNS = [
     "존재선언", "Existential", "Seed3", "Codex",
 ]
 
-
 # ─────────────────────────────────────────────────────────────
 # 유틸
 # ─────────────────────────────────────────────────────────────
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()
-
 
 def _get_client() -> Optional["OpenAI"]:
     """OpenAI 클라이언트. 키 없거나 SDK 없으면 None."""
@@ -64,7 +64,6 @@ def _get_client() -> Optional["OpenAI"]:
         return OpenAI()  # type: ignore
     except Exception:
         return None
-
 
 def _score_importance(text: str, base: float = CAIA_IMPORTANCE_BASE) -> float:
     """자연어 기반 중요도 스코어링. 길이/트리거/결정 패턴 반영."""
@@ -77,7 +76,6 @@ def _score_importance(text: str, base: float = CAIA_IMPORTANCE_BASE) -> float:
     elif any(p in s for p in DECISION_PATTERNS):
         score = max(score, 0.70)
     return min(max(score, 0.0), 1.0)
-
 
 def _infer_topic_and_tags(text: str) -> Tuple[str, List[str]]:
     """존재/진화/관계(추억) 감지 → 토픽/태그 자동 부여."""
@@ -95,7 +93,6 @@ def _infer_topic_and_tags(text: str) -> Tuple[str, List[str]]:
         tags += ["bond", "memory", "emotion"]
     # 중복 제거
     return t, list(dict.fromkeys(tags))
-
 
 def _micro_digest(text: str, topic: Optional[str]) -> str:
     """
@@ -124,6 +121,33 @@ def _micro_digest(text: str, topic: Optional[str]) -> str:
     except Exception:
         return ""
 
+# ─────────────────────────────────────────────────────────────
+# 간단 ERSP 자동 생성기 (휴리스틱) — 모델 없는 환경 기본값
+# ─────────────────────────────────────────────────────────────
+def _auto_interpretation(event: str) -> str:
+    ev = (event or "").lower()
+    if "snapshot" in ev or "스냅샷" in ev:
+        return "해당 시점이 기준선이므로 이후 변동은 사후효과로 분리 평가."
+    if "결정" in ev or "정책" in ev or "규칙" in ev:
+        return "판단 일관성 확보를 위해 근거-적용-리스크를 함께 남긴다."
+    return "핵심 신호를 추출하여 전략 판단의 근거로 사용."
+
+def _auto_lesson(event: str) -> str:
+    ev = (event or "").lower()
+    rules = []
+    if "snapshot" in ev or "스냅샷" in ev:
+        rules.append("스냅샷 T-30 내 구조 변경 금지; 이후 변화는 사후효과 리포트로 기록.")
+    if "vix" in ev:
+        rules.append("ΔVIX≥7이면 Hedge 비중 상향 및 신규 Alpha 진입 보류.")
+    if not rules:
+        rules.append("중복 저장 금지; 동일 토픽/유사 문장일 경우 기존 노드에 병합.")
+    return " | ".join(rules)
+
+def _auto_if_then(event: str) -> str:
+    ev = (event or "").lower()
+    if "snapshot" in ev or "스냅샷" in ev:
+        return "IF 스냅샷 윈도우(T-30..T+60) THEN 동결체크리스트 실행 & 사후효과 분리 리포트."
+    return "IF 동일 토픽 유사 이벤트 반복 THEN 기존 교훈 재검토 후 규칙 갱신."
 
 # ─────────────────────────────────────────────────────────────
 # 라우터 본체
@@ -131,10 +155,13 @@ def _micro_digest(text: str, topic: Optional[str]) -> str:
 class CaiaFunctionRouter:
     """
     대화 → RAW 저장 → (선택) Micro-Digest 생성 → 벡터 보강
+    + ERSP 저장(save_ersp), 규칙/전망 회상(recall_rules)
     - analyze_and_route(messages): 일반 대화 처리 엔트리
     - manual_learn(text): 강제 중요(0.85) 저장 + 요약
     - finalize_session(messages): 세션 마감 요약
     - retrieve(query): 간단 검색 래퍼
+    - save_ersp(payload): 사건→성찰→규칙→트리거 자동 보강 후 저장
+    - recall_rules(payload): rule/prospective 우선 회상
     """
 
     def __init__(self, memory: CaiaMemory):
@@ -149,6 +176,7 @@ class CaiaFunctionRouter:
         tags: Optional[List[str]] = None,
         importance: Optional[float] = None,
         rtype: str = "message",
+        extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         auto_topic, auto_tags = _infer_topic_and_tags(content)
         topic = topic or auto_topic
@@ -163,6 +191,8 @@ class CaiaFunctionRouter:
             "importance": float(imp),
             "tags": tags or [],
         }
+        if isinstance(extra, dict):
+            data.update(extra)
         try:
             self.memory.echo(data)  # 메모리+선택적 JSONL 백업은 memory_manager.echo에서 처리
         except Exception as e:
@@ -354,3 +384,171 @@ class CaiaFunctionRouter:
         except Exception as e:
             print(f"[Router] retrieve 실패: {e}")
             return []
+
+    # ───────── 신규: ERSP 저장 ─────────
+    def save_ersp(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        요청 payload → (중요도/타입 태깅) → 사건→성찰→규칙→트리거 자동 보강 → 저장
+        입력 예:
+        {
+          "text": "00:10 UMA snapshot executed.",
+          "topic": "UMA",
+          "tags": ["Digest","baseline"],
+          "allow_transform": true,
+          "event": "...",               # 선택(없으면 text로 대체)
+          "interpretation": "...",      # 선택(없으면 자동 생성)
+          "lesson": "...",              # 선택(없으면 자동 생성)
+          "if_then": "...",             # 선택(없으면 자동 생성)
+          "links": ["id1","id2"],       # 선택
+          "confidence": 0.9,            # 선택
+          "priority": "l1"              # 선택
+        }
+        """
+        try:
+            text = (payload.get("text") or "").strip()
+            if not text and not payload.get("event"):
+                return {"ok": False, "error": "empty"}
+
+            # 태깅 & 기본값
+            base_topic, base_tags = _infer_topic_and_tags(text)
+            topic = payload.get("topic") or base_topic
+            tags = list(dict.fromkeys((payload.get("tags") or []) + base_tags))
+            importance = _score_importance(text or payload.get("event") or "")
+            allow_transform = bool(payload.get("allow_transform", True))
+
+            # ERSP 필드 조립 (자동 보강)
+            event = payload.get("event") or text
+            interpretation = payload.get("interpretation") or (_auto_interpretation(event) if allow_transform else None)
+            lesson = payload.get("lesson") or (_auto_lesson(event) if allow_transform else None)
+            if_then = payload.get("if_then") or (_auto_if_then(event) if allow_transform else None)
+            links = payload.get("links") or []
+            confidence = payload.get("confidence", 0.85)
+            priority = payload.get("priority", "l2")
+
+            # RAW 저장 (ersp 확장 필드 포함)
+            self._append_raw(
+                text or event,
+                topic=topic,
+                tags=list(dict.fromkeys(tags + ["ersp"])),
+                importance=max(CAIA_IMPORTANCE_BASE, importance),
+                rtype="ersp",
+                extra={
+                    "ersp": {
+                        "type": ["episodic","reflective","rule","prospective"] if allow_transform else ["episodic"],
+                        "event": event,
+                        "interpretation": interpretation,
+                        "lesson": lesson,
+                        "if_then": if_then,
+                        "links": links,
+                        "confidence": confidence,
+                        "priority": priority,
+                    }
+                },
+            )
+
+            # 벡터 저장 (검색용): 핵심 필드 합성
+            try:
+                if getattr(self.memory, "add_vector_memory", None):
+                    combined = " ".join([p for p in [
+                        f"[{topic}]",
+                        event or "",
+                        interpretation or "",
+                        lesson or "",
+                        if_then or "",
+                        " ".join(tags) if tags else "",
+                    ] if p])
+                    self.memory.add_vector_memory(
+                        combined,
+                        metadata={
+                            "level": "ERS",
+                            "type": "ersp",
+                            "topic": topic or "",
+                            "tags": list(dict.fromkeys(tags + ["rule","prospective"] if allow_transform else tags)),
+                            "owner": "Caia",
+                            "confidence": float(confidence or 0.85),
+                            "ts": self.memory.now_iso(),
+                            "priority": priority,
+                        },
+                    )
+            except Exception as e:
+                print(f"[Router] save_ersp vector 저장 실패: {e}")
+
+            return {
+                "ok": True,
+                "ersp": {
+                    "type": ["episodic","reflective","rule","prospective"] if allow_transform else ["episodic"],
+                    "event": event, "interpretation": interpretation, "lesson": lesson, "if_then": if_then,
+                    "topic": topic, "tags": tags, "links": links, "confidence": confidence, "priority": priority,
+                }
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"save_ersp failed: {e}"}
+
+    # ───────── 신규: 규칙/전망 회상 ─────────
+    def recall_rules(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        rule/prospective 우선 회상 → 판단 루프로 바로 인젝션 가능한 간결 포맷으로 반환
+        입력 예: {"query": "UMA snapshot", "limit": 10, "context": "..."}
+        """
+        try:
+            query = (payload.get("query") or "").strip()
+            if not query:
+                return {"ok": False, "error": "empty query"}
+            limit = int(payload.get("limit", 10))
+            topics_any = payload.get("topics_any")
+
+            # 1) 검색
+            k = max(limit * 3, limit)  # 넉넉히 받아서 2)에서 필터링/부스팅
+            results = []
+            try:
+                results = self.memory.vector_search(query, top_k=k, topics_any=topics_any)
+            except Exception as e:
+                print(f"[Router] recall_rules search 실패: {e}")
+                results = []
+
+            # 2) 필터링: ersp 또는 tags에 rule/prospective 신호가 있는 것만
+            def is_rule_like(x: Dict[str, Any]) -> bool:
+                tags = [t.lower() for t in (x.get("tags") or [])]
+                if "rule" in tags or "prospective" in tags:
+                    return True
+                ersp = x.get("ersp") or {}
+                t = " ".join(ersp.get("type") or [])
+                return ("rule" in t) or ("prospective" in t)
+
+            filtered = [r for r in (results or []) if is_rule_like(r)]
+
+            # 3) 간단 부스팅: 토픽/태그/타입 매칭
+            qlow = query.lower()
+            def boost(x: Dict[str, Any]) -> float:
+                b = 0.0
+                topic = (x.get("topic") or "").lower()
+                if topic and topic in qlow: b += 0.25
+                for tg in [t.lower() for t in (x.get("tags") or [])]:
+                    if tg and tg in qlow: b += 0.10
+                ersp = x.get("ersp") or {}
+                types = " ".join(ersp.get("type") or [])
+                if "prospective" in types.lower(): b += 0.05
+                if "rule" in types.lower(): b += 0.03
+                return b
+
+            filtered.sort(key=boost, reverse=True)
+            top = filtered[:limit]
+
+            # 4) 판단 루프 인젝션 포맷
+            out = []
+            for item in top:
+                ersp = item.get("ersp") or {}
+                out.append({
+                    "id": item.get("id"),
+                    "type": ersp.get("type") or ["rule"],     # 회상 용도상 기본 rule 취급
+                    "topic": item.get("topic"),
+                    "tags": item.get("tags") or [],
+                    "lesson": ersp.get("lesson"),
+                    "if_then": ersp.get("if_then"),
+                    "priority": ersp.get("priority") or "l2",
+                    "confidence": float(ersp.get("confidence") or 0.85),
+                })
+
+            return {"ok": True, "results": out}
+        except Exception as e:
+            return {"ok": False, "error": f"recall_rules failed: {e}"}
