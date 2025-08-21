@@ -151,13 +151,31 @@ def _fetch_latest_alerts(limit=10, level_min: Optional[str]=None,
 # ── Assistants v2 Run orchestration ─────────────────────────────────
 
 def _create_run_get_latest() -> str:
+    tools_def = [{
+        "type": "function",
+        "function": {
+            "name": "getLatestAlerts",
+            "description": "최근 센티넬 알림 조회",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit":     {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                    "level_min": {"type": "string", "enum": ["LV1","LV2","LV3"]},
+                    "index":     {"type": "string"},
+                    "since":     {"type": "string"}  # ISO8601(+09:00) 권장
+                }
+            }
+        }
+    }]
+
     run = _post(f"{OPENAI_BASE}/threads/{CAIA_THREAD_ID}/runs", {
         "assistant_id": CAIA_ASSISTANT_ID,
+        "tools": tools_def,  # ← 인라인 툴 스키마 주입
+        "tool_choice": {"type":"function","function":{"name":"getLatestAlerts"}},
         "instructions": (
             "센티넬/알람 키워드 감지. 규칙에 따라 getLatestAlerts를 호출해 최근 알림을 요약하라. "
             "요약만 하고 전략 판단은 묻기 전 금지. 마지막에 '전략 판단 들어갈까요?'를 붙여라."
-        ),
-        "tool_choice": {"type":"function","function":{"name":"getLatestAlerts"}}
+        )
     })
     return run["id"]
 
