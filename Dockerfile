@@ -1,27 +1,23 @@
 # Dockerfile
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Seoul
+
 WORKDIR /app
 
-# 필요한 시스템 패키지 설치
-RUN apt-get update && apt-get install -y \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# 의존성
-COPY requirements.txt .
+COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 앱 소스
-COPY . .
+COPY . /app
 
-# 상태 파일을 위한 디렉토리 생성
-RUN mkdir -p /app/data && chmod 777 /app/data
+# 기본 포트 (Railway가 PORT를 넣어주면 server.py가 그걸 읽어서 사용)
+ENV PORT=8080
+EXPOSE 8080
 
-# 런타임 포트(로컬 기본값 8000)
-ENV PORT=8000
-ENV WATCHER_STATE_PATH=/app/data/market_state.json
-
-# 컨테이너 "시작" 시에만 서버 실행 (빌드 시 아님)
-# env 변수 확장을 위해 sh -c 사용 + PORT 폴백
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["python", "server.py"]
