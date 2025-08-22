@@ -489,15 +489,15 @@ def check_and_alert():
         # 시장 개장 상태 확인
         us_market_open = is_us_market_open()
         
-        # 시장 마감 시간에는 선물 지수 사용
+        # 시장 마감 시간에는 선물 지수 사용 (VIX 제외)
         if not us_market_open:
             log.info("미국 시장 마감 - 선물 지수 사용")
             symbols = [
-                ("ΔSPX_FUT", SYMBOL_SPX_FUT, "US 선물: S&P500"),
-                ("ΔNDX_FUT", SYMBOL_NDX_FUT, "US 선물: NASDAQ")
+                ("ΔES", SYMBOL_SPX_FUT, "US 선물: S&P500"),
+                ("ΔNQ", SYMBOL_NDX_FUT, "US 선물: NASDAQ"),
                 # VIX는 장 마감 시간에 제외
             ]
-            # 선물 지수 데이터 수집
+            # 선물 지수 데이터(지수 동반 변동 표시용) 갱신 시도
             try:
                 spx_delta = get_delta(SYMBOL_SPX_FUT)
             except:
