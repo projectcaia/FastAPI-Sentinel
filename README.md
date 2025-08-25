@@ -1,9 +1,8 @@
-# Connector Hub (Threadless) — Hotfix
-- 점검표 v1 정합 + DB_PATH ImportError 수정 포함.
-- /ready → { ok, version, utc_now }
-- /bridge/ingest → { ok, status, queued, dispatched, summary_sent, ... }
-- 429 시뮬: 헤더 X-Debug-TG429:1 또는 env PUSH_SIMULATE_429=1
+# Worker Stabilized Bundle (2025-08-25)
 
+- Drop-in market watcher with resilient provider chain (AlphaVantage → yfinance → Yahoo).
+- Headers/backoff for Yahoo 401/429.
+- ENV: SENTINEL_BASE_URL (must be https URL), DATA_PROVIDERS, YF_ENABLED, ALPHAVANTAGE_API_KEY, WATCH_INTERVAL_SEC.
 
-### Worker recovery
-- Adds `yfinance` and a resilient watcher `market_watcher.py` with headers/backoff and HMAC push to the Hub.
+## Usage
+Replace your worker file with `market_watcher.py` and add `requests`/`yfinance` to the image.

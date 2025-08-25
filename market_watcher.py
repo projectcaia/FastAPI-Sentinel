@@ -1,139 +1,203 @@
 #!/usr/bin/env python3
-import os, time, json, logging, math, hmac, hashlib, sys
-from typing import Optional, Dict, Any
+import os, time, json, logging, requests, math, hmac, hashlib
+from datetime import datetime, timezone, timedelta
 
-YF_ENABLED = os.getenv("YF_ENABLED", "true").lower() in ("1","true","yes")
-HUB_URL = os.getenv("HUB_URL") or (os.getenv("BASE_URL", "http://localhost:8080").rstrip("/") + "/bridge/ingest")
-CONNECTOR_SECRET = os.getenv("CONNECTOR_SECRET", "")
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "1800"))
+# -------- Config (ENV) --------
+LOG_LEVEL   = os.getenv("LOG_LEVEL", "INFO").upper()
+WATCH_SECS  = int(os.getenv("WATCH_INTERVAL_SEC", "1800"))
+DATA_PROVIDERS = [s.strip().lower() for s in os.getenv("DATA_PROVIDERS","alphavantage,yfinance,yahoo").split(",") if s.strip()]
+YF_ENABLED  = os.getenv("YF_ENABLED","true").lower() in ("1","true","yes")
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY","").strip()
+SENTINEL_BASE_URL = os.getenv("SENTINEL_BASE_URL","").strip().rstrip("/")
+if SENTINEL_BASE_URL and not SENTINEL_BASE_URL.startswith(("http://","https://")):
+    SENTINEL_BASE_URL = "https://" + SENTINEL_BASE_URL
 
-LOG_LEVEL = os.getenv("WATCHER_LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(levelname)s:market-watcher:%(message)s")
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("market-watcher")
 
-def hmac_sig(body: str) -> str:
-    return hmac.new(CONNECTOR_SECRET.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).hexdigest()
+COMMON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://finance.yahoo.com/",
+}
 
-def http_post(url: str, data: str, headers: Dict[str,str]) -> tuple[int, str]:
-    import requests
-    r = requests.post(url, data=data, headers=headers, timeout=15)
-    return r.status_code, r.text
-
-def yahoo_rest_quote(symbol: str) -> Optional[float]:
-    import requests
-    url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
-    hdr = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://finance.yahoo.com/",
-        "Connection": "close",
-    }
-    r = requests.get(url, headers=hdr, timeout=15)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-    j = r.json()
-    res = j.get("quoteResponse", {}).get("result", [])
-    if not res:
-        return None
-    price = res[0].get("regularMarketPrice") or res[0].get("postMarketPrice") or res[0].get("preMarketPrice")
-    return float(price) if price is not None else None
-
-def yf_quote(symbol: str) -> Optional[float]:
-    import yfinance as yf
-    t = yf.Ticker(symbol)
-    try:
-        info = t.fast_info
-        price = getattr(info, "last_price", None) or (info.get("lastPrice") if hasattr(info, "get") else None)
-        if not price:
-            # fallback to .info (slower)
-            price = t.info.get("regularMarketPrice")
-        return float(price) if price is not None else None
-    except Exception as e:
-        raise
-
-def get_price(symbol: str) -> Optional[float]:
-    if YF_ENABLED:
+def _http_get(url, params=None, timeout=12, max_retry=3):
+    last = None
+    for i in range(max_retry):
         try:
-            return yf_quote(symbol)
+            r = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except requests.HTTPError as e:
+            sc = getattr(e.response, "status_code", None)
+            if sc in (401,429) or (sc and sc >= 500):
+                time.sleep(2 ** i)
+                last = e
+                continue
+            raise
         except Exception as e:
-            log.warning(f"yfinance 실패({symbol}): {e}")
+            last = e
+            time.sleep(1 + i)
+            continue
+    if last: raise last
+    raise RuntimeError("http get failed")
+
+# -------- Providers --------
+_YF_READY = False
+if YF_ENABLED:
     try:
-        return yahoo_rest_quote(symbol)
+        import yfinance as yf  # type: ignore
+        _YF_READY = True
     except Exception as e:
-        log.warning(f"Yahoo REST 실패({symbol}): {e}")
-        return None
+        log.warning("yfinance import failed (disabled): %s", e)
 
-def compute_pct(cur: Optional[float], base: Optional[float]) -> float:
-    if cur is None or base is None or base == 0:
-        return 0.0
-    return (cur / base - 1.0) * 100.0
+def _yf_change_percent(symbol: str) -> float:
+    if not _YF_READY:
+        raise RuntimeError("yfinance not ready")
+    t = yf.Ticker(symbol)  # type: ignore
+    # try fast_info
+    try:
+        fi = getattr(t, "fast_info", None)
+        if fi and getattr(fi, "last_price", None) is not None and getattr(fi, "previous_close", None) not in (None, 0):
+            last = float(fi.last_price)
+            prev = float(fi.previous_close)
+            return (last - prev) / prev * 100.0
+    except Exception:
+        pass
+    # fallback: 2d history
+    hist = t.history(period="2d", interval="1d")
+    if hist is not None and len(hist) >= 2:
+        prev = float(hist["Close"].iloc[-2])
+        last = float(hist["Close"].iloc[-1])
+        if prev != 0:
+            return (last - prev) / prev * 100.0
+    raise RuntimeError("yfinance insufficient data")
 
-def decide_level(pct: float) -> str:
-    ab = abs(pct)
-    if ab >= 2.5: return "LV3"
-    if ab >= 1.5: return "LV2"
-    if ab >= 0.8: return "LV1"
-    return "LV0"
+def _av_change_percent(symbol: str) -> float:
+    if not ALPHAVANTAGE_API_KEY:
+        raise RuntimeError("ALPHAVANTAGE_API_KEY not set")
+    proxies = {"^GSPC":"SPY","^IXIC":"QQQ","^VIX":"VIXY","^KS200":"069500.KS"}
+    sym = proxies.get(symbol, symbol)
+    url = "https://www.alphavantage.co/query"
+    params = {"function":"GLOBAL_QUOTE","symbol":sym,"apikey":ALPHAVANTAGE_API_KEY}
+    r = _http_get(url, params=params, timeout=12, max_retry=2)
+    data = r.json() if r.headers.get("content-type","").startswith("application/json") else {}
+    q = data.get("Global Quote") or data.get("globalQuote") or {}
+    cp = q.get("10. change percent") or q.get("changePercent")
+    if cp:
+        return float(str(cp).strip().rstrip("%"))
+    price = q.get("05. price") or q.get("price")
+    prev  = q.get("08. previous close") or q.get("previousClose")
+    if price is not None and prev not in (None, "0", 0):
+        price_f = float(price); prev_f = float(prev)
+        if prev_f != 0:
+            return (price_f - price_f) / prev_f * 100.0
+    raise RuntimeError(f"alphavantage invalid quote for {sym}: {q}")
 
-def build_payload(index: str, rule: str, level: str, dK200: float, dVIX: float) -> dict:
-    # timestamp in local with offset if available
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    return {
-        "idempotency_key": f"MW-{int(time.time())}-{index}",
-        "source": "sentinel",
-        "type": "alert.market",
-        "priority": "high" if level in ("LV2","LV3") else "normal",
-        "timestamp": ts,
-        "payload": {
-            "rule": rule,
-            "index": index,
-            "level": level,
-            "metrics": {"dK200": round(dK200, 2), "dVIX": round(dVIX, 2)}
-        }
+def _yahoo_change_percent(symbol: str) -> float:
+    url = "https://query2.finance.yahoo.com/v7/finance/quote"
+    j = _http_get(url, params={"symbols":symbol}).json()
+    items = j.get("quoteResponse",{}).get("result",[])
+    if not items: raise RuntimeError("yahoo empty")
+    it = items[0]
+    cp = it.get("regularMarketChangePercent")
+    if cp is not None: return float(cp)
+    price = it.get("regularMarketPrice"); prev = it.get("regularMarketPreviousClose")
+    if price is not None and prev not in (None,0):
+        return (float(price) - float(prev)) / float(prev) * 100.0
+    raise RuntimeError("yahoo cp none")
+
+def _chain_change_percent(symbol: str) -> float:
+    last_err = None
+    for p in DATA_PROVIDERS:
+        try:
+            if p == "alphavantage": return _av_change_percent(symbol)
+            if p == "yfinance":     return _yf_change_percent(symbol)
+            if p == "yahoo":        return _yahoo_change_percent(symbol)
+            raise RuntimeError(f"unknown provider {p}")
+        except Exception as e:
+            last_err = e
+            log.debug("provider %s failed for %s: %s", p, symbol, e)
+            continue
+    if last_err: raise last_err
+    raise RuntimeError("no provider worked")
+
+def _grade(delta: float, is_vix=False) -> str | None:
+    a = abs(delta)
+    if is_vix:
+        if a >= 10: return "LV3"
+        if a >= 7:  return "LV2"
+        if a >= 5:  return "LV1"
+    else:
+        if a >= 2.5: return "LV3"
+        if a >= 1.5: return "LV2"
+        if a >= 0.8: return "LV1"
+    return None
+
+def _post_alert(index_name: str, delta: float | None, level: str | None, source_tag: str, note: str):
+    if not SENTINEL_BASE_URL:
+        raise RuntimeError("SENTINEL_BASE_URL not set")
+    url = f"{SENTINEL_BASE_URL}/sentinel/alert"
+    payload = {
+        "index": index_name,
+        "level": level if level else "CLEARED",
+        "delta_pct": round(delta,2) if delta is not None else None,
+        "triggered_at": datetime.now(timezone(timedelta(hours=9))).isoformat(timespec="seconds"),
+        "note": f"{note} [{source_tag}]",
     }
+    r = requests.post(url, json=payload, timeout=15)
+    if not r.ok:
+        log.error("alert post fail %s %s", r.status_code, r.text[:200])
+    else:
+        log.info("알람 전송: %s %s %.2f%% (%s)", index_name, payload["level"], payload["delta_pct"] or 0.0, note)
 
-def push(body: dict) -> None:
-    raw = json.dumps(body, ensure_ascii=False)
-    sig = hmac_sig(raw)
-    headers = {
-        "Content-Type": "application/json",
-        "X-Signature": sig,
-        "Idempotency-Key": body["idempotency_key"],
-    }
-    code, text = http_post(HUB_URL, raw, headers)
-    if code != 200:
-        raise RuntimeError(f"push fail {code}: {text[:200]}")
-    log.info(f"허브 전송 완료: {body['idempotency_key']}")
+def _is_us_market_open() -> bool:
+    now = datetime.now(timezone(timedelta(hours=9)))
+    m = now.month
+    is_dst = 3 <= m <= 11
+    h, mi = now.hour, now.minute
+    if is_dst:
+        return (h > 22 or (h == 22 and mi >= 30)) or (h < 5)
+    else:
+        return (h > 23 or (h == 23 and mi >= 30)) or (0 <= h < 6)
 
 def run_once():
-    # Symbols: ES=F (S&P500 fut), NQ=F (NASDAQ fut), ^VIX
-    es = get_price("ES=F")
-    nq = get_price("NQ=F")
-    vix = get_price("^VIX")
+    # Decide session KST
+    now = datetime.now(timezone(timedelta(hours=9)))
+    sess = "KR" if (now.weekday() < 5 and (830 <= now.hour*100 + now.minute <= 1600)) else "US"
+    symbols = []
+    if sess == "KR":
+        symbols = [("^KS200", "KR")]
+    else:
+        if _is_us_market_open():
+            symbols = [("^GSPC", "US"),("^IXIC","US"),("^VIX","VIX")]
+        else:
+            symbols = [("ES=F","FUT"),("NQ=F","FUT")]  # VIX 제외
 
-    # Placeholder deltas (snapshot → 0.0). Replace with your own baseline if needed.
-    k200_pct = 0.0
-    vix_pct = 0.0
-
-    level = decide_level(k200_pct)
-    body = build_payload(index="KOSPI200", rule="iv_spike", level=level, dK200=k200_pct, dVIX=vix_pct)
-    push(body)
+    # Collect and post
+    for sym, tag in symbols:
+        is_vix = (sym == "^VIX")
+        try:
+            delta = _chain_change_percent(sym)
+            # VIX 스마트 필터(옵션): 지수변동이 작으면 VIX 알림 억제 — 간단판은 생략/보류 가능
+            lvl = _grade(delta, is_vix=is_vix)
+            _post_alert(sym, delta, lvl, tag, f"{'세션' if sess=='KR' else 'US'}: 레벨 판정")
+        except Exception as e:
+            log.warning("수집 실패 %s: %s", sym, e)
 
 def main():
-    log.info(f"시장감시 작업 시작: 주기={POLL_SECONDS}s, base={HUB_URL}")
-    if not CONNECTOR_SECRET:
-        log.error("CONNECTOR_SECRET 누락 — 종료")
-        sys.exit(2)
+    log.info("시장감시 시작: 주기=%ss providers=%s base=%s", WATCH_SECS, ",".join(DATA_PROVIDERS), SENTINEL_BASE_URL or "(unset)")
     backoff = 5
     while True:
         try:
             run_once()
-            time.sleep(POLL_SECONDS)
+            time.sleep(WATCH_SECS)
             backoff = 5
         except Exception as e:
-            log.warning(f"수집/전송 실패: {e}")
+            log.warning("주기 오류: %s", e)
             time.sleep(backoff)
-            backoff = min(backoff * 2, 600)
+            backoff = min(backoff*2, 600)
 
 if __name__ == "__main__":
     main()
