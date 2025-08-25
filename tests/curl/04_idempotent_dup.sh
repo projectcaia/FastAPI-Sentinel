@@ -14,13 +14,11 @@ BODY=$(cat <<JSON
 JSON
 )
 SIG=$(python - <<'PY'
-import hmac,hashlib,os
-body=open(0).read()
+import hmac,hashlib,os,sys
+body=sys.stdin.read()
 secret=os.getenv('CONNECTOR_SECRET','sentinel_20250818_abcd1234')
 print(hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest())
 PY
 <<<"$BODY")
-# First
 curl -sS -X POST "$URL/bridge/ingest" -H 'Content-Type: application/json' -H "Idempotency-Key: $IDK" -H "X-Signature: $SIG" -d "$BODY" | jq .
-# Second (dedup)
 curl -sS -X POST "$URL/bridge/ingest" -H 'Content-Type: application/json' -H "Idempotency-Key: $IDK" -H "X-Signature: $SIG" -d "$BODY" | jq .

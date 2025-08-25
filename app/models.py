@@ -1,19 +1,15 @@
 from typing import Literal, Optional, Dict, Any
 from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
-
 Priority = Literal["normal", "high", "urgent"]
-
 class PayloadMetrics(BaseModel):
     dK200: float
     dVIX: float
-
 class IngestPayload(BaseModel):
     rule: str
     index: str
     level: str
     metrics: PayloadMetrics
-
 class IngestModel(BaseModel):
     idempotency_key: str = Field(..., min_length=1)
     source: Literal["sentinel"]
@@ -21,7 +17,6 @@ class IngestModel(BaseModel):
     priority: Priority
     timestamp: str
     payload: IngestPayload
-
     @field_validator("timestamp")
     @classmethod
     def ts_is_iso(cls, v: str) -> str:
@@ -30,7 +25,6 @@ class IngestModel(BaseModel):
         except Exception as e:
             raise ValueError("timestamp must be ISO-8601") from e
         return v
-
 class JobRecord(BaseModel):
     id: Optional[int] = None
     idempotency_key: str

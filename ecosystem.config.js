@@ -9,9 +9,7 @@ module.exports = {
       autorestart: true,
       watch: false,
       max_memory_restart: "300M",
-      env: {
-        LOG_LEVEL: process.env.LOG_LEVEL || "INFO"
-      }
+      env: { LOG_LEVEL: process.env.LOG_LEVEL || "INFO" }
     }
   ]
 }

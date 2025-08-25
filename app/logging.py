@@ -1,6 +1,5 @@
 import json, logging, sys
 from .config import LOG_LEVEL
-
 def _json_formatter(record: logging.LogRecord) -> str:
     payload = {
         "level": record.levelname,
@@ -18,7 +17,6 @@ def _json_formatter(record: logging.LogRecord) -> str:
             "message": str(record.exc_info[1]),
         }
     return json.dumps({k:v for k,v in payload.items() if v is not None}, ensure_ascii=False)
-
 class JsonLogHandler(logging.StreamHandler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -27,7 +25,6 @@ class JsonLogHandler(logging.StreamHandler):
             self.flush()
         except Exception:
             super().emit(record)
-
 def setup_logger():
     root = logging.getLogger()
     for h in list(root.handlers):
