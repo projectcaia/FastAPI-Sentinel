@@ -1,8 +1,4 @@
-fastapi==0.110.*
-uvicorn[standard]==0.29.*
-pydantic==2.*
-requests==2.32.*
-python-dotenv==1.0.*   # (선택) 로컬 .env 사용 시
-yfinance>=0.2.40
-httpx
-pydantic
+fastapi==0.111.0
+pydantic==2.7.1
+uvicorn==0.30.0
+httpx==0.27.0

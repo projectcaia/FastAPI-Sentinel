@@ -1,35 +1,45 @@
-# OpenAI → Caia 메인 대화창 Thread로 메시지 푸시
-OPENAI_API_KEY=sk-...
-CAIA_THREAD_ID=thread_xxxxxxxxxxxxxxxxx
+# Connector Hub (Threadless) — Patched
 
-# Telegram → 동현 개인 알림
-TELEGRAM_BOT_TOKEN=123456789:AA...
-TELEGRAM_CHAT_ID=123456789
+FastAPI 기반 **센티넬 알람 허브** — `/bridge/ingest`로 알람 수신 → **HMAC 검증** → **멱등성(SQLite)** → **텔레그램 푸시**.
+- **배포 점검표 v1 정합성 패치 포함**: `/ready`는 `utc_now`(UTC ISO), `/bridge/ingest` 응답에 `queued/dispatched/summary_sent` 추가, 환경변수 `PUSH_SIMULATE_429` 지원.
 
-# 보안/운영
-SENTINEL_KEY=use-a-long-random-string
-DEDUP_WINDOW_MIN=30
-LOG_LEVEL=INFO
-
-## 🚀 Market Watcher Worker (자동 시장감시)
-
-- 파일: `market_watcher.py`
-- 역할: ^KS200 → (069500.KS, 102110.KS) → ^KS11 순서로 ΔK200(%) 추정, LV 등급 판정 후 `/sentinel/alert` 자동 호출
-- 실행: Railway `worker` 프로세스로 실행 (`Procfile`에 추가됨)
-
-### 환경변수(.env)
-```
-SENTINEL_BASE_URL=https://fastapi-sentinel-production.up.railway.app
-SENTINEL_KEY=change_this_to_a_long_random_string   # (선택) main.py와 동일하면 됨
-WATCH_INTERVAL_SEC=30
-LOG_LEVEL=INFO
+## Quickstart
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # 토큰/시크릿 설정
+./run_local.sh
 ```
 
-### 배포 체크리스트
-1) `requirements.txt`에 추가 설치 불필요(기존 requests 사용)
-2) `Procfile`에 `worker: python market_watcher.py` 라인 확인
-3) Railway에서 Processes에 `worker`가 뜨는지 확인, 로그 확인
-4) `/sentinel/alert` 응답이 `delivered`로 나오면 성공
+### Health
+- `GET /ready` → 200 OK + `{ ok, version, utc_now }`
+- `GET /health` → DB/오류 카운트
+- `GET /jobs?hours=24&limit=50` → 최근 작업
+
+## HMAC
+- 헤더 `X-Signature = HMAC_SHA256(raw_body, CONNECTOR_SECRET)`
+- 불일치 → 401
+
+## 멱등성
+- 헤더 `Idempotency-Key` 또는 JSON `idempotency_key`
+- 동일 키 2회째 `{ "dedup": true }`
+
+## 푸시 포맷
+```
+[Sentinel/LV2] KOSPI200 iv_spike
+rule=iv_spike index=KOSPI200 level=LV2 priority=high
+metrics: ΔK200 1.6%, ΔVIX 7.2%
+job: https://hub/jobs/<idempotency_key>
+ACK: SNT-20250825-0929-AB12
+Copy for Caia: 센티넬 반영 SNT-20250825-0929-AB12
 ```
 
+## 429 시뮬레이션
+- 요청 헤더 `X-Debug-TG429: 1` **또는** 환경변수 `PUSH_SIMULATE_429=1`
 
+## 배포
+- Docker: `docker build -t hub . && docker run -p 8080:8080 --env-file .env hub`
+- PM2: `pm2 start ecosystem.config.js`
+
+## 트러블슈팅
+- 401/422/429/500 케이스는 `events` 테이블과 서버 로그(JSON) 확인
