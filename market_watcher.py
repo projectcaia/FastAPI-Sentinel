@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 LOG_LEVEL   = os.getenv("LOG_LEVEL", "INFO").upper()
 WATCH_SECS  = int(os.getenv("WATCH_INTERVAL_SEC", "1800"))
 DATA_PROVIDERS = [s.strip().lower() for s in os.getenv("DATA_PROVIDERS","alphavantage,yfinance,yahoo").split(",") if s.strip()]
+USE_PROXY_TICKERS = os.getenv("USE_PROXY_TICKERS","true").lower() in ("1","true","yes")
 YF_ENABLED  = os.getenv("YF_ENABLED","true").lower() in ("1","true","yes")
 ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY","").strip()
 SENTINEL_BASE_URL = os.getenv("SENTINEL_BASE_URL","").strip().rstrip("/")
@@ -173,7 +174,7 @@ def run_once():
         if _is_us_market_open():
             symbols = [("^GSPC", "US"),("^IXIC","US"),("^VIX","VIX")]
         else:
-            symbols = [("ES=F","FUT"),("NQ=F","FUT")]  # VIX 제외
+            symbols = [("SPY","ETF"),("QQQ","ETF")] if USE_PROXY_TICKERS else [("ES=F","FUT"),("NQ=F","FUT")]  # VIX 제외/대체
 
     # Collect and post
     for sym, tag in symbols:

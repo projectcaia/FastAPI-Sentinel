@@ -6,3 +6,5 @@
 
 ## Usage
 Replace your worker file with `market_watcher.py` and add `requests`/`yfinance` to the image.
+
+- Adds USE_PROXY_TICKERS env (default true): ES=F→SPY, NQ=F→QQQ when US market is closed.
