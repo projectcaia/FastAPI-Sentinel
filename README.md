@@ -1,10 +1,35 @@
-# Worker Stabilized Bundle (2025-08-25)
+# OpenAI → Caia 메인 대화창 Thread로 메시지 푸시
+OPENAI_API_KEY=sk-...
+CAIA_THREAD_ID=thread_xxxxxxxxxxxxxxxxx
 
-- Drop-in market watcher with resilient provider chain (AlphaVantage → yfinance → Yahoo).
-- Headers/backoff for Yahoo 401/429.
-- ENV: SENTINEL_BASE_URL (must be https URL), DATA_PROVIDERS, YF_ENABLED, ALPHAVANTAGE_API_KEY, WATCH_INTERVAL_SEC.
+# Telegram → 동현 개인 알림
+TELEGRAM_BOT_TOKEN=123456789:AA...
+TELEGRAM_CHAT_ID=123456789
 
-## Usage
-Replace your worker file with `market_watcher.py` and add `requests`/`yfinance` to the image.
+# 보안/운영
+SENTINEL_KEY=use-a-long-random-string
+DEDUP_WINDOW_MIN=30
+LOG_LEVEL=INFO
 
-- Adds USE_PROXY_TICKERS env (default true): ES=F→SPY, NQ=F→QQQ when US market is closed.
+## 🚀 Market Watcher Worker (자동 시장감시)
+
+- 파일: `market_watcher.py`
+- 역할: ^KS200 → (069500.KS, 102110.KS) → ^KS11 순서로 ΔK200(%) 추정, LV 등급 판정 후 `/sentinel/alert` 자동 호출
+- 실행: Railway `worker` 프로세스로 실행 (`Procfile`에 추가됨)
+
+### 환경변수(.env)
+```
+SENTINEL_BASE_URL=https://fastapi-sentinel-production.up.railway.app
+SENTINEL_KEY=change_this_to_a_long_random_string   # (선택) main.py와 동일하면 됨
+WATCH_INTERVAL_SEC=30
+LOG_LEVEL=INFO
+```
+
+### 배포 체크리스트
+1) `requirements.txt`에 추가 설치 불필요(기존 requests 사용)
+2) `Procfile`에 `worker: python market_watcher.py` 라인 확인
+3) Railway에서 Processes에 `worker`가 뜨는지 확인, 로그 확인
+4) `/sentinel/alert` 응답이 `delivered`로 나오면 성공
+```
+
+
