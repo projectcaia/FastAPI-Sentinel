@@ -2,7 +2,6 @@
 import os, time, json, logging, math, hmac, hashlib, sys
 from typing import Optional, Dict, Any
 
-# Optional deps
 YF_ENABLED = os.getenv("YF_ENABLED", "true").lower() in ("1","true","yes")
 HUB_URL = os.getenv("HUB_URL") or (os.getenv("BASE_URL", "http://localhost:8080").rstrip("/") + "/bridge/ingest")
 CONNECTOR_SECRET = os.getenv("CONNECTOR_SECRET", "")
@@ -21,7 +20,6 @@ def http_post(url: str, data: str, headers: Dict[str,str]) -> tuple[int, str]:
     return r.status_code, r.text
 
 def yahoo_rest_quote(symbol: str) -> Optional[float]:
-    # REST fallback with headers to avoid 401
     import requests
     url = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
     hdr = {
@@ -35,24 +33,25 @@ def yahoo_rest_quote(symbol: str) -> Optional[float]:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
     j = r.json()
     res = j.get("quoteResponse", {}).get("result", [])
-    if not res: return None
+    if not res:
+        return None
     price = res[0].get("regularMarketPrice") or res[0].get("postMarketPrice") or res[0].get("preMarketPrice")
     return float(price) if price is not None else None
 
 def yf_quote(symbol: str) -> Optional[float]:
     import yfinance as yf
+    t = yf.Ticker(symbol)
     try:
-        t = yf.Ticker(symbol)
-        info = t.fast_info  # fast path
-        price = getattr(info, "last_price", None) or info.get("lastPrice") if hasattr(info, "get") else None
+        info = t.fast_info
+        price = getattr(info, "last_price", None) or (info.get("lastPrice") if hasattr(info, "get") else None)
         if not price:
+            # fallback to .info (slower)
             price = t.info.get("regularMarketPrice")
         return float(price) if price is not None else None
     except Exception as e:
         raise
 
 def get_price(symbol: str) -> Optional[float]:
-    # priority: yfinance -> REST
     if YF_ENABLED:
         try:
             return yf_quote(symbol)
@@ -64,8 +63,12 @@ def get_price(symbol: str) -> Optional[float]:
         log.warning(f"Yahoo REST 실패({symbol}): {e}")
         return None
 
+def compute_pct(cur: Optional[float], base: Optional[float]) -> float:
+    if cur is None or base is None or base == 0:
+        return 0.0
+    return (cur / base - 1.0) * 100.0
+
 def decide_level(pct: float) -> str:
-    # Simple thresholds; adjust as needed
     ab = abs(pct)
     if ab >= 2.5: return "LV3"
     if ab >= 1.5: return "LV2"
@@ -73,12 +76,14 @@ def decide_level(pct: float) -> str:
     return "LV0"
 
 def build_payload(index: str, rule: str, level: str, dK200: float, dVIX: float) -> dict:
+    # timestamp in local with offset if available
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     return {
         "idempotency_key": f"MW-{int(time.time())}-{index}",
         "source": "sentinel",
         "type": "alert.market",
         "priority": "high" if level in ("LV2","LV3") else "normal",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "timestamp": ts,
         "payload": {
             "rule": rule,
             "index": index,
@@ -100,20 +105,16 @@ def push(body: dict) -> None:
         raise RuntimeError(f"push fail {code}: {text[:200]}")
     log.info(f"허브 전송 완료: {body['idempotency_key']}")
 
-def compute_pct(cur: Optional[float], base: Optional[float]) -> float:
-    if cur is None or base is None or base == 0: return 0.0
-    return (cur / base - 1.0) * 100.0
-
 def run_once():
-    # Example: ES=F (S&P500 fut), NQ=F (NASDAQ fut), ^VIX
+    # Symbols: ES=F (S&P500 fut), NQ=F (NASDAQ fut), ^VIX
     es = get_price("ES=F")
     nq = get_price("NQ=F")
     vix = get_price("^VIX")
-    # Derive a pseudo K200 %move from S&P/Nasdaq mix (placeholder)
-    k200_pct = 0.6 * compute_pct(es, es) + 0.4 * compute_pct(nq, nq) if es and nq else 0.0
-    vix_pct = compute_pct(vix, vix)  # 0 by definition if only snapshot — placeholder
 
-    # Use absolute values if deltas unavailable; this keeps alerts calm
+    # Placeholder deltas (snapshot → 0.0). Replace with your own baseline if needed.
+    k200_pct = 0.0
+    vix_pct = 0.0
+
     level = decide_level(k200_pct)
     body = build_payload(index="KOSPI200", rule="iv_spike", level=level, dK200=k200_pct, dVIX=vix_pct)
     push(body)
@@ -130,7 +131,7 @@ def main():
             time.sleep(POLL_SECONDS)
             backoff = 5
         except Exception as e:
-            log.warning(f\"수집/전송 실패: {e}\")
+            log.warning(f"수집/전송 실패: {e}")
             time.sleep(backoff)
             backoff = min(backoff * 2, 600)
 
