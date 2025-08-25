@@ -1,10 +1,5 @@
 from fastapi import FastAPI
-from .logging import setup_logger
-from . import db
-from .router import router
-setup_logger()
-app = FastAPI(title="Connector Hub (Threadless) — Hotfix")
-@app.on_event("startup")
-def on_startup():
-    con = db.connect(); db.migrate(con)
-app.include_router(router)
+from app.sentinel_router import router as sentinel_router
+
+app = FastAPI()
+app.include_router(sentinel_router)
