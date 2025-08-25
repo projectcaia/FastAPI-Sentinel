@@ -5,5 +5,5 @@
 - 429 시뮬: 헤더 X-Debug-TG429:1 또는 env PUSH_SIMULATE_429=1
 
 
-### Worker dependency
-If a separate worker like `market_watcher.py` runs on the same image, this build includes `requests` to satisfy that import.
+### Worker recovery
+- Adds `yfinance` and a resilient watcher `market_watcher.py` with headers/backoff and HMAC push to the Hub.
