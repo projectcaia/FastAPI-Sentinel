@@ -1,13 +1,14 @@
-# market_watcher.py — FGPT Sentinel 시장감시 워커 (한국시장 안정화)
-# 한국 시장: KOSPI(^KS11) 우선, KOSPI200 ETF 보조
-# 미국 시장: 기존과 동일
+# market_watcher.py — FGPT Sentinel 시장감시 워커 (수정 버전)
 
 import os, time, json, logging, requests, math
 from datetime import datetime, timezone, timedelta
 
 # -------------------- 설정/로그 --------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 log = logging.getLogger("market-watcher")
 
 def _normalize_base(url: str) -> str:
@@ -43,6 +44,15 @@ STATE_PATH     = os.getenv("WATCHER_STATE_PATH", "./market_state.json")
 YF_ENABLED     = os.getenv("YF_ENABLED", "false").lower() in ("1", "true", "yes")
 DATA_PROVIDERS = [s.strip().lower() for s in os.getenv("DATA_PROVIDERS", "yahoo,yfinance,alphavantage").split(",") if s.strip()]
 ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+
+# yfinance 초기화 (한 번만)
+_YF_READY = False
+if YF_ENABLED:
+    try:
+        import yfinance as yf
+        _YF_READY = True
+    except Exception as e:
+        log.warning("yfinance 로드 실패: %s", e)
 
 # 한국 지수 심볼 (우선순위 순)
 KR_SYMBOLS = {
@@ -130,7 +140,7 @@ def _yahoo_quote(symbols):
         data = r.json()
         return data.get("quoteResponse", {}).get("result", [])
     except Exception as e:
-        log.debug("Yahoo quote 실패: %s", e)
+        log.debug("Yahoo quote 실패 %s: %s", symbols_str, e)
         raise
 
 def _extract_change_percent(quote: dict) -> float:
@@ -149,15 +159,6 @@ def _extract_change_percent(quote: dict) -> float:
     return None
 
 # -------------------- yfinance --------------------
-_YF_READY = False
-if YF_ENABLED:
-    try:
-        import yfinance as yf
-        _YF_READY = True
-        log.info("yfinance 활성화됨")
-    except:
-        log.warning("yfinance 비활성화")
-
 def _yf_change_percent(symbol: str) -> float:
     if not _YF_READY:
         raise RuntimeError("yfinance not available")
@@ -171,7 +172,42 @@ def _yf_change_percent(symbol: str) -> float:
         if prev != 0:
             return ((last - prev) / prev) * 100.0
     
+    # fast_info 폴백
+    info = ticker.fast_info
+    if hasattr(info, 'last_price') and hasattr(info, 'previous_close'):
+        if info.previous_close and info.previous_close != 0:
+            return ((info.last_price - info.previous_close) / info.previous_close) * 100.0
+    
     raise RuntimeError(f"yfinance data insufficient for {symbol}")
+
+# -------------------- Alpha Vantage --------------------
+def _alphavantage_change_percent(symbol: str) -> float:
+    if not ALPHAVANTAGE_API_KEY:
+        raise RuntimeError("ALPHAVANTAGE_API_KEY not set")
+    
+    proxy = AV_PROXY_MAP.get(symbol, symbol)
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "GLOBAL_QUOTE",
+        "symbol": proxy,
+        "apikey": ALPHAVANTAGE_API_KEY
+    }
+    
+    r = _http_get(url, params=params, timeout=15)
+    data = r.json()
+    
+    if "Note" in data or "Information" in data:
+        raise RuntimeError(f"AV rate limit: {data}")
+    
+    quote = data.get("Global Quote", {})
+    if not quote:
+        raise RuntimeError(f"AV empty for {proxy}")
+    
+    cp_str = quote.get("10. change percent", "")
+    if cp_str:
+        return float(cp_str.strip().rstrip("%"))
+    
+    raise RuntimeError(f"AV no change percent for {proxy}")
 
 # -------------------- 한국 지수 수집 (안정화) --------------------
 def get_kr_delta() -> tuple[float, str]:
@@ -185,12 +221,14 @@ def get_kr_delta() -> tuple[float, str]:
                 if quotes:
                     cp = _extract_change_percent(quotes[0])
                     if cp is not None:
-                        log.debug("KOSPI(^KS11) Yahoo 성공: %.2f%%", cp)
                         return float(cp), "KOSPI"
                         
             elif provider == "yfinance" and _YF_READY:
                 cp = _yf_change_percent(KR_SYMBOLS["KOSPI"])
-                log.debug("KOSPI(^KS11) yfinance 성공: %.2f%%", cp)
+                return float(cp), "KOSPI"
+                
+            elif provider == "alphavantage" and ALPHAVANTAGE_API_KEY:
+                cp = _alphavantage_change_percent(KR_SYMBOLS["KOSPI"])
                 return float(cp), "KOSPI"
                 
         except Exception as e:
@@ -211,7 +249,6 @@ def get_kr_delta() -> tuple[float, str]:
                 
                 if changes:
                     avg = sum(changes) / len(changes)
-                    log.debug("K200 ETF 평균 Yahoo 성공: %.2f%%", avg)
                     return float(avg), "K200_ETF"
                     
             elif provider == "yfinance" and _YF_READY:
@@ -225,7 +262,6 @@ def get_kr_delta() -> tuple[float, str]:
                 
                 if changes:
                     avg = sum(changes) / len(changes)
-                    log.debug("K200 ETF 평균 yfinance 성공: %.2f%%", avg)
                     return float(avg), "K200_ETF"
                     
         except Exception as e:
@@ -240,14 +276,13 @@ def get_kr_delta() -> tuple[float, str]:
                 if quotes:
                     cp = _extract_change_percent(quotes[0])
                     if cp is not None:
-                        log.debug("KOSDAQ(^KQ11) 성공: %.2f%%", cp)
                         return float(cp), "KOSDAQ"
                         
         except Exception as e:
             log.debug("KOSDAQ %s 실패: %s", provider, e)
             continue
     
-    raise RuntimeError("한국 지수 수집 실패 (KOSPI/ETF/KOSDAQ 모두 실패)")
+    raise RuntimeError("한국 지수 수집 실패")
 
 # -------------------- 미국 지수 수집 --------------------
 def get_us_delta(symbol: str) -> float:
@@ -265,8 +300,7 @@ def get_us_delta(symbol: str) -> float:
                 return _yf_change_percent(symbol)
                 
             elif provider == "alphavantage" and ALPHAVANTAGE_API_KEY:
-                proxy = AV_PROXY_MAP.get(symbol, symbol)
-                # Alpha Vantage 구현 (기존 코드 활용)
+                return _alphavantage_change_percent(symbol)
                 
         except Exception as e:
             log.debug("%s %s 실패: %s", symbol, provider, e)
@@ -345,12 +379,17 @@ def check_and_alert():
     state = _load_state()
     sess = current_session()
     
+    log.info("===== 시장 체크 시작 (%s 세션) =====", sess)
+    
     if sess == "KR":
         # 한국 시장 감시
         try:
             delta, source = get_kr_delta()
             level = grade_level(delta)
             prev_level = state.get("KR_LEVEL")
+            
+            log.info("한국 시장: %s %.2f%% (현재: %s, 이전: %s)", 
+                     source, delta, level or "정상", prev_level or "정상")
             
             if level != prev_level:
                 if not prev_level:
@@ -363,14 +402,13 @@ def check_and_alert():
                 post_alert("ΔKOSPI", delta, level, source, note)
                 state["KR_LEVEL"] = level
                 
-            log.info("KR 체크: %s %.2f%% (레벨: %s)", source, delta, level or "정상")
-            
         except Exception as e:
             log.error("한국 시장 감시 실패: %s", e)
     
     else:
         # 미국 시장 감시
         market_open = is_us_market_open()
+        log.info("미국 시장: %s", "개장" if market_open else "마감(선물)")
         
         if market_open:
             symbols = [
@@ -390,6 +428,9 @@ def check_and_alert():
                 level = grade_level(delta, is_vix=is_vix)
                 prev_level = state.get(idx_name)
                 
+                log.info("미국 %s: %.2f%% (현재: %s, 이전: %s)", 
+                         label, delta, level or "정상", prev_level or "정상")
+                
                 if level != prev_level:
                     if not prev_level:
                         note = f"미국 {label}: 레벨 진입"
@@ -401,9 +442,34 @@ def check_and_alert():
                     post_alert(idx_name, delta, level, symbol, note)
                     state[idx_name] = level
                     
-                log.info("US 체크: %s %.2f%% (레벨: %s)", label, delta, level or "정상")
-                
             except Exception as e:
                 log.warning("미국 %s 감시 실패: %s", label, e)
     
     _save_state(state)
+    log.info("===== 시장 체크 완료 =====")
+
+def run_loop():
+    log.info("=== Sentinel 시장 감시 시작 ===")
+    log.info("간격: %d초", WATCH_INTERVAL)
+    log.info("한국: KOSPI(^KS11) 우선, ETF 보조")
+    log.info("미국: S&P500, NASDAQ, VIX")
+    log.info("임계값: LV1=±0.8%, LV2=±1.5%, LV3=±2.5%")
+    log.info("yfinance: %s", "활성화" if _YF_READY else "비활성화")
+    log.info("데이터 소스: %s", ", ".join(DATA_PROVIDERS))
+    
+    # 초기 체크
+    try:
+        check_and_alert()
+    except Exception as e:
+        log.error("초기 체크 실패: %s", e)
+    
+    # 주기적 체크
+    while True:
+        time.sleep(WATCH_INTERVAL)
+        try:
+            check_and_alert()
+        except Exception as e:
+            log.error("주기 체크 오류: %s", e)
+
+if __name__ == "__main__":
+    run_loop()
