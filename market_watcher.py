@@ -63,6 +63,7 @@ BB_WINDOW      = parse_int_env("BOLL_WINDOW", 20)
 # 멀티소스 설정
 YF_ENABLED     = os.getenv("YF_ENABLED", "false").lower() in ("1", "true", "yes")
 DATA_PROVIDERS = [s.strip().lower() for s in os.getenv("DATA_PROVIDERS", "yfinance,alphavantage,yahoo").split(",") if s.strip()]
+KR_FUT_SYMBOLS = [s.strip() for s in os.getenv("KR_FUT_SYMBOLS", "").split(",") if s.strip()]
 ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
 
 # 지수 → ETF 프록시 (Alpha Vantage는 지수 직접 조회 제약. ETF로 Δ% 대체)
@@ -288,6 +289,13 @@ def get_delta(symbol) -> float:
     return float(_provider_chain_get_change([symbol]))
 
 def get_delta_k200() -> tuple[float, str]:
+    # 0) KR 선물 (환경변수 제공 시 우선)
+    if KR_FUT_SYMBOLS:
+        try:
+            cp = _provider_chain_get_change(KR_FUT_SYMBOLS)
+            return float(cp), f"FUT_AVG({','.join(KR_FUT_SYMBOLS)})"
+        except Exception as e:
+            log.warning("futures Δ 실패: %s", e)
     # 1) ^KS200
     try:
         cp = _provider_chain_get_change([SYMBOL_PRIMARY])
