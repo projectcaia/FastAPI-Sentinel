@@ -12,13 +12,39 @@ CONNECTOR_SECRET = os.getenv("CONNECTOR_SECRET", "").strip()
 async def _forward_to_hub(raw: bytes, idem_key: str | None = None) -> None:
     if not HUB_URL or not CONNECTOR_SECRET or httpx is None:
         return
-    sig = hmac.new(CONNECTOR_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-    headers = {"Content-Type": "application/json", "X-Signature": sig}
-    if idem_key:
-        headers["Idempotency-Key"] = idem_key
+    
     try:
+        # Parse original data
+        original_data = json.loads(raw.decode("utf-8"))
+        
+        # Create hub-compatible wrapper
+        from datetime import datetime, timezone
+        if not idem_key:
+            # Generate idempotency key from data
+            ts = original_data.get("triggered_at", datetime.now(timezone.utc).isoformat())
+            idx = original_data.get("index", "unknown")
+            idem_key = f"SN-{idx}-{ts.replace(':', '').replace('-', '').replace('.', '')[:14]}"
+        
+        hub_payload = {
+            "idempotency_key": idem_key,
+            "source": "sentinel",
+            "type": "alert.market",
+            "priority": "medium",
+            "timestamp": original_data.get("triggered_at", datetime.now(timezone.utc).isoformat()),
+            "payload": original_data  # Original data as nested payload
+        }
+        
+        # Serialize wrapped data
+        wrapped_raw = json.dumps(hub_payload, ensure_ascii=False).encode()
+        
+        # Sign the wrapped data
+        sig = hmac.new(CONNECTOR_SECRET.encode(), wrapped_raw, hashlib.sha256).hexdigest()
+        headers = {"Content-Type": "application/json", "X-Signature": sig}
+        if idem_key:
+            headers["Idempotency-Key"] = idem_key
+        
         async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(HUB_URL, content=raw, headers=headers)
+            await client.post(HUB_URL, content=wrapped_raw, headers=headers)
     except Exception:
         # swallow to avoid impacting main flow
         pass
