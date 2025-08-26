@@ -14,39 +14,58 @@ async def _forward_to_hub(raw: bytes, idem_key: str | None = None) -> None:
         return
     
     try:
-        # Parse original data
+        from datetime import datetime, timezone
+        
+        # Parse original sentinel data
         original_data = json.loads(raw.decode("utf-8"))
         
-        # Create hub-compatible wrapper
-        from datetime import datetime, timezone
+        # Generate idempotency_key if not provided
         if not idem_key:
-            # Generate idempotency key from data
             ts = original_data.get("triggered_at", datetime.now(timezone.utc).isoformat())
             idx = original_data.get("index", "unknown")
-            idem_key = f"SN-{idx}-{ts.replace(':', '').replace('-', '').replace('.', '')[:14]}"
+            # Create unique key from index and timestamp
+            ts_clean = ts.replace(":", "").replace("-", "").replace(".", "").replace("+", "")[:14]
+            idem_key = f"SN-{idx}-{ts_clean}"
         
+        # Create Hub-compatible payload structure
         hub_payload = {
-            "idempotency_key": idem_key,
+            "idempotency_key": idem_key,  # REQUIRED!
             "source": "sentinel",
             "type": "alert.market",
             "priority": "medium",
             "timestamp": original_data.get("triggered_at", datetime.now(timezone.utc).isoformat()),
-            "payload": original_data  # Original data as nested payload
+            "payload": {
+                "index": original_data.get("index"),
+                "level": original_data.get("level"),
+                "delta_pct": original_data.get("delta_pct"),
+                "note": original_data.get("note"),
+                "original_ts": original_data.get("triggered_at")
+            }
         }
         
-        # Serialize wrapped data
-        wrapped_raw = json.dumps(hub_payload, ensure_ascii=False).encode()
+        # Serialize the Hub-formatted data
+        hub_body = json.dumps(hub_payload, ensure_ascii=False).encode("utf-8")
         
-        # Sign the wrapped data
-        sig = hmac.new(CONNECTOR_SECRET.encode(), wrapped_raw, hashlib.sha256).hexdigest()
-        headers = {"Content-Type": "application/json", "X-Signature": sig}
-        if idem_key:
-            headers["Idempotency-Key"] = idem_key
+        # Calculate HMAC signature for the Hub-formatted body
+        sig = hmac.new(CONNECTOR_SECRET.encode(), hub_body, hashlib.sha256).hexdigest()
+        
+        # Headers with both signature and idempotency key
+        headers = {
+            "Content-Type": "application/json",
+            "X-Signature": sig,
+            "Idempotency-Key": idem_key  # Hub checks both header and body
+        }
         
         async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(HUB_URL, content=wrapped_raw, headers=headers)
-    except Exception:
-        # swallow to avoid impacting main flow
+            response = await client.post(HUB_URL, content=hub_body, headers=headers)
+            # Optional: log success for debugging
+            if response.status_code == 200:
+                log.debug("Hub forward success: %s", idem_key)
+            elif response.status_code == 422:
+                log.warning("Hub validation error: %s", response.text)
+    except Exception as e:
+        # Log but don't impact main flow
+        log.debug("Hub forward error: %s", str(e))
         pass
 # --- END HUB FORWARDER ---
 
