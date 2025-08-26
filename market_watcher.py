@@ -1,27 +1,13 @@
-# market_watcher.py — FGPT Sentinel 시장감시 워커 (안정화 멀티소스 버전)
-# - 주기: 기본 30분 (WATCH_INTERVAL_SEC=1800)
+# market_watcher.py — FGPT Sentinel 시장감시 워커 (KOSPI 우선, 정규장 안정화)
+# - 한국시장(KR): **KOSPI(^KS11) 1순위** → K200 ETF 평균(069500.KS, 102110.KS) → KOSPI200(^KS200)
+#   · Alpha Vantage는 KR 세션과 거래시간이 어긋나는 자산(EWY 등)이라 **KR 세션에서는 사용하지 않음**(지연/괴리 방지)
+#   · yfinance는 intraday 실시간성 확보를 위해 **fast_info 우선** 사용 (history 1d는 당일 반영 지연)
+# - 미국시장(US): 기존 동일 (S&P500, NASDAQ, VIX / 장마감 시 선물 ES=F, NQ=F)
 # - 알림 정책: 레벨이 "진입/변경/해제" 때만 전송
-# - 세션: KST 주간(KR: ΔK200) / 야간(US: S&P500, NASDAQ, VIX) 자동 전환
-# - 데이터 소스: yfinance → alphavantage → yahoo (체인 폴백)
-# - Yahoo 401 회피: 헤더 보강 + query2 + 재시도/백오프
-# - URL 보정: SENTINEL_BASE_URL에 스킴 미입력 시 https:// 자동 보정
-#
-# 필요 ENV
-#   SENTINEL_BASE_URL=fastapi-sentinel-production.up.railway.app  # 스킴 없어도 됨(코드가 보정)
-#   SENTINEL_KEY=sentinel_...
-#   WATCH_INTERVAL_SEC=1800
-#   LOG_LEVEL=INFO
-#   BOLL_K_SIGMA=2.0
-#   BOLL_WINDOW=20
-#   WATCHER_STATE_PATH=./market_state.json
-#   YF_ENABLED=true
-#   DATA_PROVIDERS=yfinance,alphavantage,yahoo
-#   ALPHAVANTAGE_API_KEY=YOUR_KEY
-#   ALERT_CAP=2000
-#
-# 권장: SENTINEL_BASE_URL은 가능하면 https://포함 형태로 넣기
+# - watch 주기: 기본 30분(WATCH_INTERVAL_SEC)
+# - 전송 페이로드는 triggered_at(ISO 8601) 포함
 
-import os, time, json, logging, requests, math
+import os, time, json, logging, requests
 from datetime import datetime, timezone, timedelta
 
 # -------------------- 설정/로그 --------------------
@@ -40,60 +26,46 @@ def _normalize_base(url: str) -> str:
 SENTINEL_BASE_URL = _normalize_base(os.getenv("SENTINEL_BASE_URL", ""))
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "").strip()
 
-def parse_int_env(key: str, default: int) -> int:
-    value = os.getenv(key, str(default))
+def _env_int(key: str, default: int) -> int:
     import re
-    m = re.search(r'\d+', value)
+    v = os.getenv(key, str(default))
+    m = re.search(r"\d+", v)
     return int(m.group()) if m else default
 
-def parse_float_env(key: str, default: float) -> float:
-    value = os.getenv(key, str(default))
-    import re
-    m = re.search(r'[\d.]+', value)
-    try:
-        return float(m.group()) if m else default
-    except Exception:
-        return default
-
-WATCH_INTERVAL = parse_int_env("WATCH_INTERVAL_SEC", 1800)  # 30분 기본
+WATCH_INTERVAL = _env_int("WATCH_INTERVAL_SEC", 1800)
 STATE_PATH     = os.getenv("WATCHER_STATE_PATH", "./market_state.json")
-K_SIGMA        = parse_float_env("BOLL_K_SIGMA", 2.5)  # 2.5 시그마로 상향 (노이즈 감소)
-BB_WINDOW      = parse_int_env("BOLL_WINDOW", 20)
 
-# 멀티소스 설정
+# 데이터 소스 설정
 YF_ENABLED     = os.getenv("YF_ENABLED", "false").lower() in ("1", "true", "yes")
-DATA_PROVIDERS = [s.strip().lower() for s in os.getenv("DATA_PROVIDERS", "yfinance,alphavantage,yahoo").split(",") if s.strip()]
-KR_FUT_SYMBOLS = [s.strip() for s in os.getenv("KR_FUT_SYMBOLS", "").split(",") if s.strip()]
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+DATA_PROVIDERS = [s.strip().lower() for s in os.getenv("DATA_PROVIDERS", "yahoo,yfinance").split(",") if s.strip()]
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()  # KR 세션에는 사용 안 함
 
-# 지수 → ETF 프록시 (Alpha Vantage는 지수 직접 조회 제약. ETF로 Δ% 대체)
-AV_PROXY_MAP = {
-    "^GSPC": "SPY",       # S&P500
-    "^IXIC": "QQQ",       # NASDAQ100
-    "^VIX":  "VIXY",      # VIX
-    "^KS200": "069500.KS" # 필요 시 사용(국내는 yfinance/네이버 권장)
+# KR 심볼 (우선순위 체인)
+KR_SYMBOLS = {
+    "KOSPI": "^KS11",            # 1순위: 본지수(가장 안정)
+    "K200_ETF1": "069500.KS",    # 2순위(평균1)
+    "K200_ETF2": "102110.KS",    # 2순위(평균2)
+    "K200": "^KS200",            # 3순위: KOSPI200 지수(추가 안전망)
 }
 
-# 공통 헤더 (Yahoo 401 회피)
+# US 심볼
+US = {
+    "SPX": "^GSPC",
+    "NDX": "^IXIC",
+    "VIX": "^VIX",
+    "ES":  "ES=F",
+    "NQ":  "NQ=F",
+}
+
 COMMON_HEADERS = {
-    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125 Safari/537.36",
     "Accept":          "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer":         "https://finance.yahoo.com/",
-    "Origin":          "https://finance.yahoo.com",
-    "Connection":      "keep-alive",
+    "Cache-Control":   "no-cache",
 }
 
-# 심볼 정의
-SYMBOL_PRIMARY    = "^KS200"
-SYMBOL_FALLBACKS  = ["069500.KS", "102110.KS", "^KS11"]
-SYMBOL_SPX        = "^GSPC"
-SYMBOL_NDX        = "^IXIC"
-SYMBOL_VIX        = "^VIX"
-
-# 미국 선물 지수 (장 마감 시간 사용)
-SYMBOL_SPX_FUT = "ES=F"  # S&P 500 선물
-SYMBOL_NDX_FUT = "NQ=F"  # NASDAQ 선물
+# -------------------- 시간 유틸 --------------------
 
 def _now_kst():
     return datetime.now(timezone(timedelta(hours=9)))
@@ -101,7 +73,7 @@ def _now_kst():
 def _now_kst_iso():
     return _now_kst().isoformat(timespec="seconds")
 
-# -------------------- 상태 저장 --------------------
+# -------------------- 상태 --------------------
 
 def _save_state(state: dict):
     try:
@@ -119,9 +91,9 @@ def _load_state() -> dict:
     except Exception:
         return {}
 
-# -------------------- HTTP 유틸 (재시도/백오프) --------------------
+# -------------------- HTTP --------------------
 
-def _http_get(url: str, params=None, timeout=10, max_retry=3):
+def _http_get(url: str, params=None, timeout=12, max_retry=3):
     last = None
     for i in range(max_retry):
         try:
@@ -129,482 +101,275 @@ def _http_get(url: str, params=None, timeout=10, max_retry=3):
             r.raise_for_status()
             return r
         except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            # 401/429/5xx → 지수적 백오프 재시도
-            if status in (401, 429) or (status and status >= 500):
-                time.sleep(2 ** i)
+            sc = getattr(e.response, "status_code", None)
+            if sc in (401, 429, 500, 502, 503):
                 last = e
+                time.sleep(2 ** i)
                 continue
             raise
         except Exception as e:
-            time.sleep(1.0 + i)
             last = e
+            time.sleep(1 + i)
             continue
     if last:
         raise last
-    raise RuntimeError("HTTP 요청 실패(원인 미상)")
+    raise RuntimeError("HTTP 요청 실패")
 
-# -------------------- 데이터 소스: Yahoo --------------------
+# -------------------- Yahoo --------------------
 
 def _yahoo_quote(symbols):
-    symbols_param = ",".join(symbols) if isinstance(symbols, (list, tuple)) else symbols
-    # query2로 전환
+    syms = ",".join(symbols) if isinstance(symbols, (list, tuple)) else symbols
     url = "https://query2.finance.yahoo.com/v7/finance/quote"
-    r = _http_get(url, params={"symbols": symbols_param}, timeout=12, max_retry=3)
-    return r.json()
+    r = _http_get(url, params={"symbols": syms})
+    return r.json().get("quoteResponse", {}).get("result", [])
 
-def _yahoo_chart(symbol: str, rng: str, interval: str):
-    url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"range": rng, "interval": interval}
-    r = _http_get(url, params=params, timeout=12, max_retry=3)
-    data = r.json()
-    res = data.get("chart", {}).get("result", [])
-    if not res:
-        raise RuntimeError(f"chart API no result for {symbol}")
-    res0 = res[0]
-    closes = res0.get("indicators", {}).get("quote", [{}])[0].get("close", [])
-    ts = res0.get("timestamp", [])
-    series = [(t, c) for t, c in zip(ts, closes) if c is not None]
-    if len(series) < BB_WINDOW + 2:
-        raise RuntimeError(f"not enough points for {symbol} ({len(series)})")
-    return [t for t, _ in series], [c for _, c in series]
-
-def _extract_change_percent(q: dict):
-    cp = q.get("regularMarketChangePercent")
-    if cp is not None:
-        return float(cp)
-    price = q.get("regularMarketPrice")
-    prev  = q.get("regularMarketPreviousClose")
-    if price is not None and prev not in (None, 0):
-        return (float(price) - float(prev)) / float(prev) * 100.0
+def _extract_cp(q: dict):
+    for k in ("regularMarketChangePercent", "changePercent"):
+        if q.get(k) is not None:
+            return float(q[k])
+    p = q.get("regularMarketPrice") or q.get("price")
+    prev = q.get("regularMarketPreviousClose") or q.get("previousClose")
+    if p not in (None, 0) and prev not in (None, 0):
+        return (float(p) - float(prev)) / float(prev) * 100.0
     return None
 
-# -------------------- 데이터 소스: yfinance (옵션) --------------------
-
+# -------------------- yfinance (intraday 우선) --------------------
 _YF_READY = False
 if YF_ENABLED:
     try:
-        import yfinance as yf  # requirements.txt: yfinance>=0.2.40 필요
+        import yfinance as yf
         _YF_READY = True
+        log.info("yfinance 활성화")
     except Exception as e:
-        log.warning("yfinance import 실패(YF_ENABLED=true): %s", e)
+        log.warning("yfinance 로드 실패: %s", e)
 
-def _yf_change_percent(symbol: str):
+def _yf_cp(symbol: str) -> float:
     if not _YF_READY:
         raise RuntimeError("yfinance not ready")
     t = yf.Ticker(symbol)
-    info = getattr(t, "fast_info", None)
-    if info and getattr(info, "last_price", None) is not None and getattr(info, "previous_close", None) not in (None, 0):
-        last = float(info.last_price)
-        prev = float(info.previous_close)
-        return (last - prev) / prev * 100.0
-    # fallback: history
+    # fast_info를 최우선 사용 (intraday)
+    fi = getattr(t, "fast_info", None)
+    last = getattr(fi, "last_price", None) if fi else None
+    prev = getattr(fi, "previous_close", None) if fi else None
+    if last is not None and prev not in (None, 0):
+        return (float(last) - float(prev)) / float(prev) * 100.0
+    # 보조: 1분 캔들 시도 → 실패 시 일간
+    try:
+        hist = t.history(period="1d", interval="1m")
+        if len(hist) >= 1 and "Close" in hist and fi and prev not in (None, 0):
+            last = float(hist["Close"].iloc[-1])
+            return (last - float(prev)) / float(prev) * 100.0
+    except Exception:
+        pass
     hist = t.history(period="2d", interval="1d")
-    if hist is not None and len(hist) >= 2:
+    if len(hist) >= 2:
         prev = float(hist["Close"].iloc[-2])
         last = float(hist["Close"].iloc[-1])
-        return (last - prev) / prev * 100.0
-    raise RuntimeError("yfinance insufficient data")
+        if prev != 0:
+            return (last - prev) / prev * 100.0
+    raise RuntimeError("yfinance insufficient")
 
-# -------------------- 데이터 소스: Alpha Vantage (ETF 프록시) --------------------
+# -------------------- KR Δ 수집 (KOSPI 우선) --------------------
 
-def _alphavantage_change_percent(symbol: str) -> float:
-    if not ALPHAVANTAGE_API_KEY:
-        raise RuntimeError("ALPHAVANTAGE_API_KEY not set")
-    sym = AV_PROXY_MAP.get(symbol, symbol)
-    url = "https://www.alphavantage.co/query"
-    params = {"function": "GLOBAL_QUOTE", "symbol": sym, "apikey": ALPHAVANTAGE_API_KEY}
-    r = _http_get(url, params=params, timeout=12, max_retry=2)
-    data = r.json()
-    # 레이트리밋/오류 메시지 대응
-    if not isinstance(data, dict) or "Note" in data or "Information" in data:
-        raise RuntimeError(f"AV rate/info: {data}")
-    q = data.get("Global Quote") or data.get("globalQuote") or data
-    if not isinstance(q, dict) or not q:
-        raise RuntimeError(f"AV empty for {sym}")
-    cp = q.get("10. change percent") or q.get("changePercent")
-    if cp:
+def get_kr_delta() -> tuple[float, str]:
+    # 1) KOSPI (^KS11)
+    for prov in DATA_PROVIDERS:
         try:
-            return float(str(cp).strip().rstrip("%"))
-        except Exception:
-            pass
-    price = q.get("05. price") or q.get("price")
-    prev  = q.get("08. previous close") or q.get("previousClose")
-    if price is not None and prev not in (None, "0", 0):
-        price_f = float(price); prev_f = float(prev)
-        if prev_f != 0:
-            return (price_f - prev_f) / prev_f * 100.0
-    raise RuntimeError(f"AV invalid quote for {sym}: {q}")
-
-# -------------------- 프로바이더 체인 --------------------
-
-def _provider_chain_get_change(symbols):
-    last_err = None
-    for provider in DATA_PROVIDERS:
-        try:
-            if provider == "yfinance":
-                if not _YF_READY:
-                    raise RuntimeError("yfinance disabled/not ready")
-                if isinstance(symbols, (list, tuple)):
-                    vals = [_yf_change_percent(s) for s in symbols]
-                    if vals:
-                        return sum(vals) / len(vals)
-                    raise RuntimeError("yfinance empty")
-                else:
-                    return _yf_change_percent(symbols)
-
-            elif provider == "alphavantage":
-                if isinstance(symbols, (list, tuple)):
-                    vals = [_alphavantage_change_percent(s) for s in symbols]
-                    if vals:
-                        return sum(vals) / len(vals)
-                    raise RuntimeError("alphavantage empty")
-                else:
-                    return _alphavantage_change_percent(symbols)
-
-            elif provider == "yahoo":
-                data = _yahoo_quote(symbols)
-                items = data.get("quoteResponse", {}).get("result", [])
-                if isinstance(symbols, (list, tuple)):
-                    vals = []
-                    for it in items:
-                        cp = _extract_change_percent(it)
-                        if cp is not None:
-                            vals.append(float(cp))
-                    if vals:
-                        return sum(vals) / len(vals)
-                    raise RuntimeError("yahoo empty")
-                else:
-                    if not items:
-                        raise RuntimeError("yahoo empty")
-                    cp = _extract_change_percent(items[0])
-                    if cp is None:
-                        raise RuntimeError("yahoo cp None")
-                    return float(cp)
-            else:
-                raise RuntimeError(f"unknown provider {provider}")
+            if prov == "yahoo":
+                q = _yahoo_quote([KR_SYMBOLS["KOSPI"]])
+                if q:
+                    cp = _extract_cp(q[0])
+                    if cp is not None:
+                        return float(cp), "KOSPI(^KS11)"
+            elif prov == "yfinance" and _YF_READY:
+                cp = _yf_cp(KR_SYMBOLS["KOSPI"])
+                return float(cp), "KOSPI(^KS11)"
         except Exception as e:
-            last_err = e
-            log.debug("provider %s failed: %s", provider, e)
+            log.debug("KOSPI via %s 실패: %s", prov, e)
             continue
-    if last_err:
-        raise last_err
-    raise RuntimeError("no provider available")
 
-# -------------------- Δ% 계산 --------------------
-
-def get_delta(symbol) -> float:
-    return float(_provider_chain_get_change([symbol]))
-
-def get_delta_k200() -> tuple[float, str]:
-    # 0) KR 선물 (환경변수 제공 시 우선)
-    if KR_FUT_SYMBOLS:
+    # 2) K200 ETF 평균 (069500.KS, 102110.KS)
+    etfs = [KR_SYMBOLS["K200_ETF1"], KR_SYMBOLS["K200_ETF2"]]
+    for prov in DATA_PROVIDERS:
         try:
-            cp = _provider_chain_get_change(KR_FUT_SYMBOLS)
-            return float(cp), f"FUT_AVG({','.join(KR_FUT_SYMBOLS)})"
+            if prov == "yahoo":
+                qs = _yahoo_quote(etfs)
+                vals = []
+                for it in qs:
+                    cp = _extract_cp(it)
+                    if cp is not None:
+                        vals.append(cp)
+                if vals:
+                    return sum(vals) / len(vals), "ETF_AVG(069500,102110)"
+            elif prov == "yfinance" and _YF_READY:
+                vals = []
+                for s in etfs:
+                    try:
+                        vals.append(_yf_cp(s))
+                    except Exception:
+                        pass
+                if vals:
+                    return sum(vals) / len(vals), "ETF_AVG(069500,102110)"
         except Exception as e:
-            log.warning("futures Δ 실패: %s", e)
-    # 1) ^KS200
-    try:
-        cp = _provider_chain_get_change([SYMBOL_PRIMARY])
-        return float(cp), SYMBOL_PRIMARY
-    except Exception as e:
-        log.warning("primary ^KS200 실패: %s", e)
-    # 2) ETF 평균
-    try:
-        cp = _provider_chain_get_change(SYMBOL_FALLBACKS[:2])
-        return float(cp), "ETF_AVG(069500.KS,102110.KS)"
-    except Exception as e:
-        log.warning("ETF 평균 실패: %s", e)
-    # 3) KOSPI 본지수
-    try:
-        cp = _provider_chain_get_change([SYMBOL_FALLBACKS[-1]])
-        return float(cp), SYMBOL_FALLBACKS[-1]
-    except Exception as e:
-        log.warning("KOSPI 본지수 ^KS11 실패: %s", e)
-    raise RuntimeError("ΔK200 추정 실패")
+            log.debug("ETF via %s 실패: %s", prov, e)
+            continue
+
+    # 3) K200 (^KS200)
+    for prov in DATA_PROVIDERS:
+        try:
+            if prov == "yahoo":
+                q = _yahoo_quote([KR_SYMBOLS["K200"]])
+                if q:
+                    cp = _extract_cp(q[0])
+                    if cp is not None:
+                        return float(cp), "K200(^KS200)"
+            elif prov == "yfinance" and _YF_READY:
+                cp = _yf_cp(KR_SYMBOLS["K200"])
+                return float(cp), "K200(^KS200)"
+        except Exception as e:
+            log.debug("K200 via %s 실패: %s", prov, e)
+            continue
+
+    raise RuntimeError("KR Δ 수집 실패 (KOSPI/ETF/K200 모두 실패)")
+
+# -------------------- US Δ 수집 --------------------
+
+def _us_delta(symbol: str) -> float:
+    for prov in DATA_PROVIDERS:
+        try:
+            if prov == "yahoo":
+                q = _yahoo_quote([symbol])
+                if q:
+                    cp = _extract_cp(q[0])
+                    if cp is not None:
+                        return float(cp)
+            elif prov == "yfinance" and _YF_READY:
+                return _yf_cp(symbol)
+        except Exception as e:
+            log.debug("US %s via %s 실패: %s", symbol, prov, e)
+            continue
+    raise RuntimeError(f"US Δ 수집 실패: {symbol}")
 
 # -------------------- 레벨링 --------------------
 
 def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
-    """레벨 판정 - VIX는 별도 기준 적용"""
     a = abs(delta_pct)
-    
     if is_vix:
-        # VIX는 변동성이 크므로 더 높은 임계값 적용
-        if a >= 10.0: return "LV3"  # ±10% 이상
-        if a >= 7.0: return "LV2"   # ±7% 이상
-        if a >= 5.0: return "LV1"   # ±5% 이상
+        if a >= 10.0: return "LV3"
+        if a >= 7.0:  return "LV2"
+        if a >= 5.0:  return "LV1"
     else:
-        # 일반 지수 (KOSPI, S&P500, NASDAQ)
-        if a >= 2.5: return "LV3"   # ±2.5% 이상 (기존 1.5%에서 상향)
-        if a >= 1.5: return "LV2"   # ±1.5% 이상 (기존 1.0%에서 상향)
-        if a >= 0.8: return "LV1"   # ±0.8% 이상 (기존 0.4%에서 상향)
+        if a >= 2.5:  return "LV3"
+        if a >= 1.5:  return "LV2"
+        if a >= 0.8:  return "LV1"
     return None
 
 # -------------------- 알림 --------------------
 
-def post_alert(index_name: str, delta_pct: float | None, level: str | None, source_tag: str, note: str):
-    # level None → CLEARED
+def post_alert(index_name: str, delta_pct: float, level: str | None, source: str, note: str):
     display_level = level if level else "CLEARED"
     payload = {
         "index": index_name,
         "level": display_level,
         "delta_pct": round(delta_pct, 2) if delta_pct is not None else None,
         "triggered_at": _now_kst_iso(),
-        "note": f"{note} [{source_tag}]",
+        "note": f"{note} [{source}]",
     }
     headers = {"Content-Type": "application/json"}
     if SENTINEL_KEY:
         headers["x-sentinel-key"] = SENTINEL_KEY
-
-    url = f"{SENTINEL_BASE_URL}/sentinel/alert" if SENTINEL_BASE_URL else ""
-    if not url.startswith("http"):
-        # 추가 안전망 (베이스가 비어있거나 보정 실패한 경우)
-        raise RuntimeError(f"SENTINEL_BASE_URL invalid: '{SENTINEL_BASE_URL}'")
-
+    url = f"{SENTINEL_BASE_URL}/sentinel/alert"
     r = requests.post(url, headers=headers, json=payload, timeout=15)
     if not r.ok:
         log.error("알람 전송 실패 %s %s", r.status_code, r.text)
     else:
-        log.info("알람 전송: %s %s %.2f%% (%s)", index_name, payload["level"], payload["delta_pct"] or 0.0, note)
+        log.info("알람 전송: %s %s %.2f%% (%s)", index_name, display_level, delta_pct or 0.0, note)
 
-# -------------------- 세션 판별 --------------------
+# -------------------- 세션 --------------------
 
 def current_session() -> str:
-    """KST 기준: KR(08:30~16:00), US(그 외) / 주말은 US 처리"""
+    """KST 기준: KR(09:00~15:40), US(그 외) / 주말은 US"""
     now = _now_kst()
-    hhmm = now.hour * 100 + now.minute
     if now.weekday() >= 5:
         return "US"
-    return "KR" if 830 <= hhmm <= 1600 else "US"
+    hhmm = now.hour * 100 + now.minute
+    return "KR" if 900 <= hhmm <= 1540 else "US"
 
 def is_us_market_open() -> bool:
-    """미국 시장 개장 시간 체크 (KST 기준)
-    미국 시장: 22:30 ~ 05:00 (KST, 일광절약시간 기준)
-    겨울철: 23:30 ~ 06:00 (KST)
-    """
     now = _now_kst()
-    hour = now.hour
-    minute = now.minute
-    
-    # 간단히 여름/겨울 구분 (대략적)
-    # 3월~11월: 일광절약시간
-    month = now.month
-    is_dst = 3 <= month <= 11
-    
+    m = now.month
+    is_dst = 3 <= m <= 11
+    h, mi = now.hour, now.minute
     if is_dst:
-        # 일광절약시간: 22:30 ~ 05:00 (KST)
-        if hour == 22 and minute >= 30:
-            return True
-        elif hour >= 23 or hour < 5:
-            return True
+        if h == 22 and mi >= 30: return True
+        return h >= 23 or h < 5
     else:
-        # 표준시간: 23:30 ~ 06:00 (KST)
-        if hour == 23 and minute >= 30:
-            return True
-        elif hour >= 0 and hour < 6:
-            return True
-        elif hour == 23:
-            return False
-    
-    return False
+        if h == 23 and mi >= 30: return True
+        return 0 <= h < 6
 
-# -------------------- Bollinger(±2σ) --------------------
-
-def _zscore_latest(closes: list[float], window: int) -> tuple[float, float]:
-    if len(closes) < window + 1:
-        raise RuntimeError("insufficient closes for zscore")
-    base = closes[-(window+1):-1]
-    mu = sum(base) / len(base)
-    variance = sum((x - mu) ** 2 for x in base) / (len(base) - 1)
-    sd = math.sqrt(variance) if variance > 0 else 0.0
-    if sd == 0: return 0.0, 0.0
-    last, prev = closes[-1], closes[-2]
-    return (last - mu) / sd, (prev - mu) / sd
-
-def bb_event_for_symbol(symbol: str, rngs=("5d","1mo"), intervals=("30m","60m","1d")):
-    last_err = None
-    for rng in rngs:
-        for iv in intervals:
-            try:
-                _, closes = _yahoo_chart(symbol, rng, iv)
-                z, z_prev = _zscore_latest(closes, BB_WINDOW)
-                breach_now  = abs(z) >= K_SIGMA
-                breach_prev = abs(z_prev) >= K_SIGMA
-                if breach_now and not breach_prev: return "BREACH", z, f"{symbol}:{rng}/{iv}"
-                if (not breach_now) and breach_prev: return "RECOVER", z, f"{symbol}:{rng}/{iv}"
-                return None, z, f"{symbol}:{rng}/{iv}"
-            except Exception as e:
-                last_err = e
-                continue
-    if last_err: raise last_err
-    return None, 0.0, f"{symbol}:n/a"
-
-def check_and_alert_bb(state: dict, sess: str):
-    if sess == "KR":
-        for sym in [SYMBOL_PRIMARY, "069500.KS", "102110.KS", "^KS11"]:
-            try:
-                ev, z, used = bb_event_for_symbol(sym)
-                prev = state.get("BB_ΔK200")
-                if ev and ev != prev:
-                    note = f"KR 세션: Bollinger ±{K_SIGMA}σ {'돌파' if ev=='BREACH' else '회복'} (z={z:.2f})"
-                    post_alert("ΔK200_VOL", round(z,2), ev, used, note)
-                    state["BB_ΔK200"] = ev
-                break
-            except Exception as e:
-                log.debug("KR BB 후보 실패 %s: %s", sym, e)
-                continue
-    else:
-        for state_key, idx_name, sym, label in [
-            ("BB_ΔSPX","ΔSPX_VOL", SYMBOL_SPX, "US S&P500"),
-            ("BB_ΔNASDAQ","ΔNASDAQ_VOL", SYMBOL_NDX, "US NASDAQ"),
-            ("BB_ΔVIX","ΔVIX_VOL", SYMBOL_VIX, "US VIX")
-        ]:
-            try:
-                ev, z, used = bb_event_for_symbol(sym)
-                prev = state.get(state_key)
-                if ev and ev != prev:
-                    note = f"{label}: Bollinger ±{K_SIGMA}σ {'돌파' if ev=='BREACH' else '회복'} (z={z:.2f})"
-                    post_alert(idx_name, round(z,2), ev, used, note)
-                    state[state_key] = ev
-            except Exception as e:
-                log.debug("US BB 실패 %s: %s", sym, e)
-                continue
-    return state
-
-# -------------------- 메인 감시 --------------------
+# -------------------- 메인 --------------------
 
 def check_and_alert():
     state = _load_state()
-    sess = current_session()
+    sess  = current_session()
 
     if sess == "KR":
         try:
-            delta, tag = get_delta_k200()
+            delta, src = get_kr_delta()
             lvl = grade_level(delta)
-            prev = state.get("ΔK200")
+            prev = state.get("ΔKOSPI")
             if lvl != prev:
-                note = "KR 세션: 레벨 변경" if prev else "KR 세션: 레벨 진입"
-                if prev and not lvl: note = "KR 세션: 레벨 해제"
-                elif prev and lvl:   note = f"KR 세션: 레벨 변화 {prev}→{lvl}"
-                post_alert("ΔK200", delta, lvl, tag, note)
-                state["ΔK200"] = lvl
+                note = "KR: 레벨 진입" if not prev else ("KR: 레벨 해제" if not lvl else f"KR: {prev}→{lvl}")
+                post_alert("ΔKOSPI", delta, lvl, src, note)
+                state["ΔKOSPI"] = lvl
+            log.info("KR 체크: %s %.2f%% (레벨 %s)", src, delta, lvl or "정상")
         except Exception as e:
-            log.warning("KR ΔK200 수집/판정 실패: %s", e)
-    else:
-        # US 세션: 먼저 S&P500과 NASDAQ 데이터 수집
-        spx_delta = 0.0
-        nasdaq_delta = 0.0
-        
-        try:
-            spx_delta = get_delta(SYMBOL_SPX)
-        except:
-            pass
-        
-        try:
-            nasdaq_delta = get_delta(SYMBOL_NDX)
-        except:
-            pass
-        
-        # 시장 개장 상태 확인
-        us_market_open = is_us_market_open()
-        
-        # 시장 마감 시간에는 선물 지수 사용 (VIX 제외)
-        if not us_market_open:
-            log.info("미국 시장 마감 - 선물 지수 사용")
-            symbols = [
-                ("ΔES", SYMBOL_SPX_FUT, "US 선물: S&P500"),
-                ("ΔNQ", SYMBOL_NDX_FUT, "US 선물: NASDAQ"),
-                # VIX는 장 마감 시간에 제외
-            ]
-            # 선물 지수 데이터(지수 동반 변동 표시용) 갱신 시도
-            try:
-                spx_delta = get_delta(SYMBOL_SPX_FUT)
-            except:
-                spx_delta = 0.0
-            try:
-                nasdaq_delta = get_delta(SYMBOL_NDX_FUT)
-            except:
-                nasdaq_delta = 0.0
-        else:
-            log.debug("미국 시장 개장 중 - 현물 지수 사용")
-            symbols = [
-                ("ΔSPX", SYMBOL_SPX, "US 세션: S&P500"),
-                ("ΔNASDAQ", SYMBOL_NDX, "US 세션: NASDAQ"),
-                ("ΔVIX", SYMBOL_VIX, "US 세션: VIX")
-            ]
-            # 현물 지수 데이터 수집
-            try:
-                spx_delta = get_delta(SYMBOL_SPX)
-            except:
-                spx_delta = 0.0
-            try:
-                nasdaq_delta = get_delta(SYMBOL_NDX)
-            except:
-                nasdaq_delta = 0.0
-        
-        for idx_name, sym, label in symbols:
-            try:
-                delta = get_delta(sym)
-                is_vix = (sym == SYMBOL_VIX)
-                
-                # VIX 스마트 필터링: 지수가 크게 움직이지 않았는데 VIX만 튀면 무시
-                if is_vix:
-                    # S&P500이나 NASDAQ이 0.8% 미만 변동인데 VIX가 알림 레벨이면 무시
-                    max_index_move = max(abs(spx_delta), abs(nasdaq_delta))
-                    if max_index_move < 0.8:
-                        # 지수 변동이 거의 없는데 VIX만 움직인 경우 건너뛰기
-                        log.debug("VIX 스마트 필터: 지수 변동 %.2f%% 대비 VIX %.2f%% - 무시", max_index_move, delta)
-                        state[idx_name] = None  # 상태 초기화
-                        continue
-                
-                lvl = grade_level(delta, is_vix=is_vix)
-                prev = state.get(idx_name)
-                if lvl != prev:
-                    note = f"{label} 레벨 변경" if prev else f"{label} 레벨 진입"
-                    if prev and not lvl: note = f"{label} 레벨 해제"
-                    elif prev and lvl:   note = f"{label} 레벨 변화 {prev}→{lvl}"
-                    
-                    # VIX의 경우 지수 변동도 함께 표시
-                    if is_vix and lvl:
-                        note += f" (S&P {spx_delta:+.2f}%, NAS {nasdaq_delta:+.2f}%)"
-                    
-                    post_alert(idx_name, delta, lvl, sym, note)
-                    state[idx_name] = lvl
-            except Exception as e:
-                log.warning("%s 수집/판정 실패: %s", label, e)
+            log.error("KR Δ 수집/판정 실패: %s", e)
 
-    # Bollinger 이벤트 비활성화 (노이즈 방지)
-    # try:
-    #     state = check_and_alert_bb(state, sess)
-    # except Exception as _bb_e:
-    #     log.debug("BB 이벤트 처리 실패: %s", _bb_e)
+    else:
+        open_now = is_us_market_open()
+        pairs = (
+            [("ΔSPX", US["SPX"], "US S&P500", False),
+             ("ΔNASDAQ", US["NDX"], "US NASDAQ", False),
+             ("ΔVIX", US["VIX"], "US VIX", True)] if open_now else
+            [("ΔES", US["ES"], "US S&P500 선물", False),
+             ("ΔNQ", US["NQ"], "US NASDAQ 선물", False)]
+        )
+        for key, sym, label, is_vix in pairs:
+            try:
+                d = _us_delta(sym)
+                lvl = grade_level(d, is_vix=is_vix)
+                prev = state.get(key)
+                if lvl != prev:
+                    note = f"{label}: 레벨 진입" if not prev else (f"{label}: 레벨 해제" if not lvl else f"{label}: {prev}→{lvl}")
+                    post_alert(key, d, lvl, sym, note)
+                    state[key] = lvl
+                log.info("US 체크: %s %.2f%% (레벨 %s)", label, d, lvl or "정상")
+            except Exception as e:
+                log.warning("US %s 실패: %s", label, e)
 
     _save_state(state)
 
 
 def run_loop():
-    log.info("시장감시 워커 시작: 간격=%ss, base=%s", WATCH_INTERVAL, SENTINEL_BASE_URL or "(unset)")
-    log.info("정책: %d초 유지, 레벨 변경시에만 업데이트, 한/미 자동 전환", WATCH_INTERVAL)
-    log.info("볼린저 밴드: 비활성화 (노이즈 방지)")
-    log.info("일반지수 임계값: LV1=±0.8%%, LV2=±1.5%%, LV3=±2.5%%")
-    log.info("VIX 임계값: LV1=±5%%, LV2=±7%%, LV3=±10%%")
-    log.info("VIX 스마트 필터: 지수 변동 0.8% 미만 시 VIX 알림 무시")
-    # 초기 즉시 체크
+    log.info("=== Sentinel 시장 감시 시작 ===")
+    log.info("간격: %ds", WATCH_INTERVAL)
+    log.info("KR: KOSPI 우선 → ETF 평균 → K200")
+    log.info("US: S&P500, NASDAQ, VIX (마감 시 선물)")
+    log.info("임계값: LV1=±0.8%%, LV2=±1.5%%, LV3=±2.5%% (VIX 5/7/10)")
+
     try:
-        log.info("초기 시장 체크 실행...")
         check_and_alert()
         log.info("초기 시장 체크 완료")
     except Exception as e:
         log.error("초기 체크 실패: %s", e)
-    # 주기 루프
+
     while True:
+        time.sleep(WATCH_INTERVAL)
         try:
             check_and_alert()
         except Exception as e:
-            log.error("주기 실행 오류: %s", e)
-        time.sleep(WATCH_INTERVAL)
+            log.error("주기 체크 오류: %s", e)
 
 if __name__ == "__main__":
     run_loop()
