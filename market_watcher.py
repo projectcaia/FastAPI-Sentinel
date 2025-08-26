@@ -97,10 +97,12 @@ SYMBOL_NDX_FUT = "NQ=F"  # NASDAQ 선물
 
 def _now_kst():
     return datetime.now(timezone(timedelta(hours=9)))
+
 def _now_kst_iso():
     return _now_kst().isoformat(timespec="seconds")
 
 # -------------------- 상태 저장 --------------------
+
 def _save_state(state: dict):
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
@@ -118,6 +120,7 @@ def _load_state() -> dict:
         return {}
 
 # -------------------- HTTP 유틸 (재시도/백오프) --------------------
+
 def _http_get(url: str, params=None, timeout=10, max_retry=3):
     last = None
     for i in range(max_retry):
@@ -142,6 +145,7 @@ def _http_get(url: str, params=None, timeout=10, max_retry=3):
     raise RuntimeError("HTTP 요청 실패(원인 미상)")
 
 # -------------------- 데이터 소스: Yahoo --------------------
+
 def _yahoo_quote(symbols):
     symbols_param = ",".join(symbols) if isinstance(symbols, (list, tuple)) else symbols
     # query2로 전환
@@ -176,6 +180,7 @@ def _extract_change_percent(q: dict):
     return None
 
 # -------------------- 데이터 소스: yfinance (옵션) --------------------
+
 _YF_READY = False
 if YF_ENABLED:
     try:
@@ -202,6 +207,7 @@ def _yf_change_percent(symbol: str):
     raise RuntimeError("yfinance insufficient data")
 
 # -------------------- 데이터 소스: Alpha Vantage (ETF 프록시) --------------------
+
 def _alphavantage_change_percent(symbol: str) -> float:
     if not ALPHAVANTAGE_API_KEY:
         raise RuntimeError("ALPHAVANTAGE_API_KEY not set")
@@ -231,6 +237,7 @@ def _alphavantage_change_percent(symbol: str) -> float:
     raise RuntimeError(f"AV invalid quote for {sym}: {q}")
 
 # -------------------- 프로바이더 체인 --------------------
+
 def _provider_chain_get_change(symbols):
     last_err = None
     for provider in DATA_PROVIDERS:
@@ -285,6 +292,7 @@ def _provider_chain_get_change(symbols):
     raise RuntimeError("no provider available")
 
 # -------------------- Δ% 계산 --------------------
+
 def get_delta(symbol) -> float:
     return float(_provider_chain_get_change([symbol]))
 
@@ -317,6 +325,7 @@ def get_delta_k200() -> tuple[float, str]:
     raise RuntimeError("ΔK200 추정 실패")
 
 # -------------------- 레벨링 --------------------
+
 def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
     """레벨 판정 - VIX는 별도 기준 적용"""
     a = abs(delta_pct)
@@ -334,6 +343,7 @@ def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
     return None
 
 # -------------------- 알림 --------------------
+
 def post_alert(index_name: str, delta_pct: float | None, level: str | None, source_tag: str, note: str):
     # level None → CLEARED
     display_level = level if level else "CLEARED"
@@ -360,6 +370,7 @@ def post_alert(index_name: str, delta_pct: float | None, level: str | None, sour
         log.info("알람 전송: %s %s %.2f%% (%s)", index_name, payload["level"], payload["delta_pct"] or 0.0, note)
 
 # -------------------- 세션 판별 --------------------
+
 def current_session() -> str:
     """KST 기준: KR(08:30~16:00), US(그 외) / 주말은 US 처리"""
     now = _now_kst()
@@ -400,6 +411,7 @@ def is_us_market_open() -> bool:
     return False
 
 # -------------------- Bollinger(±2σ) --------------------
+
 def _zscore_latest(closes: list[float], window: int) -> tuple[float, float]:
     if len(closes) < window + 1:
         raise RuntimeError("insufficient closes for zscore")
@@ -462,6 +474,7 @@ def check_and_alert_bb(state: dict, sess: str):
     return state
 
 # -------------------- 메인 감시 --------------------
+
 def check_and_alert():
     state = _load_state()
     sess = current_session()
@@ -569,6 +582,7 @@ def check_and_alert():
     #     log.debug("BB 이벤트 처리 실패: %s", _bb_e)
 
     _save_state(state)
+
 
 def run_loop():
     log.info("시장감시 워커 시작: 간격=%ss, base=%s", WATCH_INTERVAL, SENTINEL_BASE_URL or "(unset)")
