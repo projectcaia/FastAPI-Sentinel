@@ -3,14 +3,27 @@ from fastapi.responses import JSONResponse
 import os
 from .function_router import router as function_router
 
+# Optional hub forwarder (safe if missing)
+try:
+    from .hub_patch import register_hub_forwarder  # expects app/hub_patch.py
+except Exception:  # hub_patch not present or import error
+    register_hub_forwarder = None
+
 APP_VERSION = os.environ.get("APP_VERSION", "2025-08-25.v2.4")
 DEBUG_ROUTES = os.environ.get("DEBUG_ROUTES", "0") == "1"
 
 app = FastAPI(title="Caia Connector & Memory Rules v2.4")
 
+# Register Hub forwarder middleware (non-fatal if unavailable)
+if register_hub_forwarder is not None:
+    try:
+        register_hub_forwarder(app)
+    except Exception:
+        # do not crash app if hub patch misconfigured
+        pass
+
 @app.get("/ready")
 async def ready():
-    # Be resilient: never crash health due to optional deps
     details = {}
     try:
         import importlib
