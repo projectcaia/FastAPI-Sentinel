@@ -1,5 +1,30 @@
 # main.py  — Sentinel → Caia (Assistants v2) 최소안정판 (patched 2025-08-21)
-import os, time, json, logging, requests, threading
+# --- HUB FORWARDER (ASCII only) ---
+import os, hmac, hashlib, json, asyncio
+try:
+    import httpx  # ensure in requirements
+except Exception:
+    httpx = None
+
+HUB_URL = os.getenv("HUB_URL", "").strip()
+CONNECTOR_SECRET = os.getenv("CONNECTOR_SECRET", "").strip()
+
+async def _forward_to_hub(raw: bytes, idem_key: str | None = None) -> None:
+    if not HUB_URL or not CONNECTOR_SECRET or httpx is None:
+        return
+    sig = hmac.new(CONNECTOR_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    headers = {"Content-Type": "application/json", "X-Signature": sig}
+    if idem_key:
+        headers["Idempotency-Key"] = idem_key
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(HUB_URL, content=raw, headers=headers)
+    except Exception:
+        # swallow to avoid impacting main flow
+        pass
+# --- END HUB FORWARDER ---
+
+import time, logging, requests, threading
 from typing import Optional, Dict, Any, List
 from collections import deque
 from fastapi import FastAPI, Header, Request, Query
@@ -321,6 +346,19 @@ async def sentinel_alert(request: Request, x_sentinel_key: Optional[str] = Heade
         tg_ok = send_telegram(msg)
         trigger_caia_async(msg)
         _append_inbox(data)
+
+        # Hub forwarding (fire-and-forget)
+        body_bytes = raw  # Already have the raw bytes
+        
+        # Extract idempotency_key from JSON
+        idem_key = None
+        try:
+            idem_key = data.get("idempotency_key")
+        except Exception:
+            pass
+        
+        # Fire-and-forget forwarding
+        asyncio.create_task(_forward_to_hub(body_bytes, idem_key))
 
         return {"status":"delivered","telegram":tg_ok,"caia":{"queued":True},"message":msg}
 
