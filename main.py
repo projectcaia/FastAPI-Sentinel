@@ -10,7 +10,12 @@ HUB_URL = os.getenv("HUB_URL", "").strip()
 CONNECTOR_SECRET = os.getenv("CONNECTOR_SECRET", "").strip()
 
 async def _forward_to_hub(raw: bytes, idem_key: str | None = None) -> None:
-    if not HUB_URL or not CONNECTOR_SECRET or httpx is None:
+    if not HUB_URL or not CONNECTOR_SECRET:
+        log.warning("Hub forward skipped: missing HUB_URL or CONNECTOR_SECRET")
+        return
+    
+    if httpx is None:
+        log.warning("Hub forward skipped: httpx not available")
         return
     
     try:
@@ -56,17 +61,17 @@ async def _forward_to_hub(raw: bytes, idem_key: str | None = None) -> None:
             "Idempotency-Key": idem_key  # Hub checks both header and body
         }
         
+        log.info("Hub forward attempt: %s to %s", idem_key, HUB_URL)  # 시도 로그 추가
+        
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(HUB_URL, content=hub_body, headers=headers)
-            # Optional: log success for debugging
             if response.status_code == 200:
-                log.debug("Hub forward success: %s", idem_key)
-            elif response.status_code == 422:
-                log.warning("Hub validation error: %s", response.text)
+                log.info("Hub forward success: %s", idem_key)  # 성공 로그
+            else:
+                log.warning("Hub forward failed: %d - %s", response.status_code, response.text)  # 실패 로그
+                
     except Exception as e:
-        # Log but don't impact main flow
-        log.debug("Hub forward error: %s", str(e))
-        pass
+        log.error("Hub forward error: %s", str(e))  # 에러 로그
 # --- END HUB FORWARDER ---
 
 import time, logging, requests, threading
