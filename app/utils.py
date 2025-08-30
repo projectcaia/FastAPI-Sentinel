@@ -16,3 +16,19 @@ def summarize(payload: dict, limit=500) -> str:
     m = payload.get("metrics", {})
     txt = f"{index} {rule} 감지(Level {level}). K200 {m.get('dK200')}%, VIX {m.get('dVIX')}% 변화."
     return txt[:limit]
+
+
+import datetime
+try:
+    import holidays
+except ImportError:
+    holidays = None
+
+def is_market_open():
+    today = datetime.date.today()
+    if holidays:
+        kr_holidays = holidays.KR()
+        return today.weekday() < 5 and today not in kr_holidays
+    else:
+        # holidays 패키지가 없으면 단순 주말 체크만
+        return today.weekday() < 5

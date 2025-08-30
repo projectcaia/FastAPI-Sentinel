@@ -1,3 +1,5 @@
+from app.utils import is_market_open
+
 # market_watcher.py — FGPT Sentinel 시장감시 워커 (수정 버전)
 
 import os, time, json, logging, requests, math

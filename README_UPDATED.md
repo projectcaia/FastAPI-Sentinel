@@ -208,3 +208,12 @@ railway restart
 ### 🆕 KR 선물 우선 감시
 - 환경변수 `KR_FUT_SYMBOLS` (예: `K200=F,KOSPI200=F`)를 설정하면 정규장 ΔK200 산출 시 선물 Δ를 우선 사용합니다.
 - 실패 시 `^KS200` → `069500.KS, 102110.KS` 평균 → `^KS11` 순으로 폴백합니다.
+
+
+## 2025-08-30 — Weekend/Holiday Suppression
+- Added `is_market_open()` in `app/utils.py` (KR market, Asia/Seoul).
+- `/sentinel/alert` now returns `{"ok": true, "skipped": "market_closed"}` on weekends/holidays to prevent noisy alerts.
+- New env overrides:
+  - `SKIP_MARKET_CHECK=1` -> always treat as open (testing)
+  - `FORCE_MARKET_CLOSED=1` -> always closed (maintenance)
+- `requirements.txt`: added `holidays` dependency.
