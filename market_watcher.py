@@ -502,17 +502,21 @@ def current_session() -> str:
     
     return "CLOSED"
 
-# ==================== 레벨 판정 ====================
+# ==================== 레벨 판정 (수정) ====================
 def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
     a = abs(delta_pct)
+    
     if is_vix:
-        if a >= 10.0: return "LV3"
-        if a >= 7.0:  return "LV2"
-        if a >= 5.0:  return "LV1"
+        # VIX는 일반 지수의 약 10배 정도 움직임
+        # 지수 0.8% = VIX 8% 정도로 매칭
+        if a >= 25.0: return "LV3"  # ±25% 이상 (지수 2.5%에 대응)
+        if a >= 15.0: return "LV2"  # ±15% 이상 (지수 1.5%에 대응)  
+        if a >= 8.0:  return "LV1"  # ±8% 이상 (지수 0.8%에 대응)
     else:
-        if a >= 2.5:  return "LV3"
-        if a >= 1.5:  return "LV2"
-        if a >= 0.8:  return "LV1"
+        # 일반 지수
+        if a >= 2.5: return "LV3"
+        if a >= 1.5: return "LV2"
+        if a >= 0.8: return "LV1"
     return None
 
 # ==================== 알림 전송 ====================
@@ -587,6 +591,13 @@ def check_and_alert():
         spx_delta, spx_fresh = get_us_spot_data("^GSPC")
         ndx_delta, ndx_fresh = get_us_spot_data("^IXIC")
         
+        # 지수 최대 변동폭 계산
+        max_index_move = 0.0
+        if spx_delta is not None and ndx_delta is not None:
+            max_index_move = max(abs(spx_delta), abs(ndx_delta))
+            log.info("지수 변동: S&P %.2f%%, NASDAQ %.2f%% (최대: %.2f%%)", 
+                    spx_delta, ndx_delta, max_index_move)
+        
         for sym in US_SPOT:
             delta, is_fresh = get_us_spot_data(sym)
             if delta is None or not is_fresh:
@@ -595,16 +606,30 @@ def check_and_alert():
             
             is_vix = (sym == "^VIX")
             
-            # VIX 필터
-            if is_vix and spx_delta is not None and ndx_delta is not None:
-                max_move = max(abs(spx_delta), abs(ndx_delta))
-                if max_move < VIX_FILTER_THRESHOLD:
-                    log.debug("VIX 필터: 지수 변동 %.2f%% 미만 → VIX %.2f%% 무시", 
-                             VIX_FILTER_THRESHOLD, delta)
+            # VIX 필터: 지수가 0.8% 미만 변동인데 VIX만 튀면 무시
+            if is_vix:
+                if max_index_move < VIX_FILTER_THRESHOLD:  # 0.8%
+                    log.info("VIX 필터 작동: 지수 변동 %.2f%% < %.2f%% → VIX %.2f%% 무시", 
+                            max_index_move, VIX_FILTER_THRESHOLD, delta)
                     state["ΔVIX"] = None
                     continue
             
-            lvl = grade_level(delta, is_vix=is_vix)
+            # VIX는 다른 레벨 기준 적용
+            if is_vix:
+                # VIX 전용 레벨 (지수의 약 10배)
+                a = abs(delta)
+                if a >= 25.0: 
+                    lvl = "LV3"
+                elif a >= 15.0: 
+                    lvl = "LV2"
+                elif a >= 8.0: 
+                    lvl = "LV1"
+                else:
+                    lvl = None
+            else:
+                # 일반 지수 레벨
+                lvl = grade_level(delta, is_vix=False)
+            
             key = "ΔVIX" if is_vix else ("ΔSPX" if sym == "^GSPC" else "ΔNASDAQ")
             prev = state.get(key)
             name = human_name(sym)
@@ -659,7 +684,6 @@ def check_and_alert():
     
     _save_state(state)
     log.info("===== 체크 완료 =====")
-
 # ==================== 메인 루프 ====================
 def run_loop():
     log.info("=== Sentinel 시장감시 시작 (최종 안정화 버전) ===")
