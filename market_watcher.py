@@ -337,7 +337,7 @@ def get_us_spot_data(symbol: str) -> tuple[float | None, bool]:
         params = {
             "interval": "5m",
             "range": "1d",
-            "includePrePost": "false" if is_us_market_open() else "true",
+            "includePrePost": "true",  # 항상 true로 변경
             "_nocache": str(int(time.time()))
         }
         r = _http_get(url, params=params)
@@ -346,27 +346,28 @@ def get_us_spot_data(symbol: str) -> tuple[float | None, bool]:
         chart = data.get("chart", {}).get("result", [{}])[0]
         meta = chart.get("meta", {})
         
-        current_price = meta.get("regularMarketPrice")
-        prev_close = meta.get("previousClose")
-        timestamp = meta.get("regularMarketTime")
+        # 여러 가격 필드 체크
+        current_price = meta.get("regularMarketPrice") or meta.get("price")
+        prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+        timestamp = meta.get("regularMarketTime") or meta.get("currentTradingPeriod", {}).get("regular", {}).get("start")
         
-        if current_price and prev_close and timestamp:
-            age_sec = _utc_ts_now() - float(timestamp)
-            is_fresh = age_sec <= MAX_STALENESS_SEC
-            
-            if is_fresh and prev_close != 0:
+        if current_price and prev_close:
+            # 타임스탬프 없어도 계산
+            if prev_close != 0:
                 change_pct = (float(current_price) - float(prev_close)) / float(prev_close) * 100.0
-                log.debug("미국 Chart %s: %.2f%% (age=%ds)", symbol, change_pct, age_sec)
+                log.info("미국 Chart %s: 현재=%.2f, 전일=%.2f, 변화=%.2f%%", 
+                        symbol, current_price, prev_close, change_pct)
                 return change_pct, True
                 
     except Exception as e:
-        log.debug("미국 Chart 실패(%s): %s", symbol, e)
+        log.error("미국 Chart 실패(%s): %s", symbol, e)  # error로 상세 로그
     
     # 2차: Quote API
     try:
         url = "https://query2.finance.yahoo.com/v7/finance/quote"
         params = {
             "symbols": symbol,
+            "fields": "symbol,regularMarketPrice,regularMarketChangePercent,regularMarketPreviousClose,price,previousClose",
             "crumb": str(int(time.time())),
             "_nocache": str(int(time.time()))
         }
@@ -377,29 +378,24 @@ def get_us_spot_data(symbol: str) -> tuple[float | None, bool]:
         if items:
             q = items[0]
             
-            # marketState 확인
-            market_state = q.get("marketState", "")
+            # 여러 필드 체크
+            price = q.get("regularMarketPrice") or q.get("price")
+            prev = q.get("regularMarketPreviousClose") or q.get("previousClose")
+            change_pct_direct = q.get("regularMarketChangePercent")
             
-            # 정규장 시간이면 regularMarket 데이터만
-            if market_state == "REGULAR" or is_us_market_open():
-                price = q.get("regularMarketPrice")
-                prev = q.get("regularMarketPreviousClose")
-                timestamp = q.get("regularMarketTime")
-            else:
-                # 시간외는 post/pre 데이터도 사용
-                price = q.get("postMarketPrice") or q.get("preMarketPrice") or q.get("regularMarketPrice")
-                timestamp = q.get("postMarketTime") or q.get("preMarketTime") or q.get("regularMarketTime")
-                prev = q.get("regularMarketPreviousClose")
+            # 직접 제공되는 변화율 우선
+            if change_pct_direct is not None:
+                log.info("미국 Quote %s: %.2f%% (직접)", symbol, change_pct_direct)
+                return float(change_pct_direct), True
             
-            if price and prev and timestamp:
-                age_sec = _utc_ts_now() - float(timestamp)
-                if age_sec <= MAX_STALENESS_SEC and prev != 0:
-                    change_pct = (float(price) - float(prev)) / float(prev) * 100.0
-                    log.debug("미국 Quote %s: %.2f%% (상태: %s)", symbol, change_pct, market_state)
-                    return change_pct, True
+            # 계산
+            if price and prev and prev != 0:
+                change_pct = (float(price) - float(prev)) / float(prev) * 100.0
+                log.info("미국 Quote %s: %.2f%% (계산)", symbol, change_pct)
+                return change_pct, True
                     
     except Exception as e:
-        log.debug("미국 Quote 실패(%s): %s", symbol, e)
+        log.error("미국 Quote 실패(%s): %s", symbol, e)  # error로 상세 로그
     
     return None, False
 
