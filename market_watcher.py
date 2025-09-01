@@ -1,4 +1,4 @@
-# market_watcher.py — FGPT Sentinel 시장감시 워커 (실시간·신선도 강화 버전)
+# market_watcher.py — FGPT Sentinel 시장감시 워커 (실시간·신선도 + 사람친화 지표명)
 # -*- coding: utf-8 -*-
 
 import os, time, json, logging, requests, math
@@ -44,7 +44,6 @@ BB_WINDOW = parse_int_env("BOLL_WINDOW", 20)
 # 멀티소스 설정
 YF_ENABLED = os.getenv("YF_ENABLED", "false").lower() in ("1", "true", "yes")
 _RAW_PROVIDERS = [s.strip().lower() for s in os.getenv("DATA_PROVIDERS", "yahoo,yfinance,alphavantage").split(",") if s.strip()]
-# 내부적으로 우선순위 강제: yahoo > yfinance > alphavantage
 _PREFERRED = {"yahoo": 0, "yfinance": 1, "alphavantage": 2}
 DATA_PROVIDERS = sorted(set(_RAW_PROVIDERS), key=lambda x: _PREFERRED.get(x, 99))
 
@@ -58,15 +57,6 @@ AV_PROXY_MAP = {
     "^KS200":"069500.KS"
 }
 
-# 공통 헤더
-COMMON_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://finance.yahoo.com/",
-    "Origin": "https://finance.yahoo.com",
-}
-
 # 심볼 정의
 SYMBOL_PRIMARY = "^KS200"
 SYMBOL_FALLBACKS = ["069500.KS", "102110.KS", "^KS11"]
@@ -76,18 +66,21 @@ SYMBOL_VIX = "^VIX"
 SYMBOL_SPX_FUT = "ES=F"
 SYMBOL_NDX_FUT = "NQ=F"
 
-# 표시 이름
-DISPLAY_NAMES = {
-    "^KS200": "한국 시장: KOSPI200",
-    "069500.KS": "한국 시장: KODEX200",
-    "102110.KS": "한국 시장: TIGER200",
-    "^KS11": "한국 시장: 코스피",
-    "^GSPC": "미국 S&P500",
-    "^IXIC": "미국 NASDAQ",
-    "^VIX": "미국 VIX: 변동성지수",
-    "ES=F": "미국 S&P500 선물",
-    "NQ=F": "미국 NASDAQ 선물"
+# === 사람친화 지표명 매핑 ===
+HUMAN_NAMES = {
+    "^KS200":     "KOSPI 200",
+    "^KS11":      "KOSPI",
+    "069500.KS":  "KODEX 200",
+    "102110.KS":  "TIGER 200",
+    "^GSPC":      "S&P 500",
+    "^IXIC":      "NASDAQ",
+    "^VIX":       "VIX 변동성지수",
+    "ES=F":       "S&P 500 선물",
+    "NQ=F":       "NASDAQ-100 선물",
 }
+
+def human_name(symbol_or_tag: str, fallback: str | None = None) -> str:
+    return HUMAN_NAMES.get(symbol_or_tag, fallback or symbol_or_tag)
 
 def _now_kst():
     return datetime.now(timezone(timedelta(hours=9)))
@@ -120,7 +113,7 @@ def _http_get(url: str, params=None, timeout=10, max_retry=3):
     last = None
     for i in range(max_retry):
         try:
-            r = requests.get(url, params=params, headers=COMMON_HEADERS, timeout=timeout)
+            r = requests.get(url, params=params, headers=H_COMMON, timeout=timeout)
             r.raise_for_status()
             return r
         except requests.HTTPError as e:
@@ -138,6 +131,15 @@ def _http_get(url: str, params=None, timeout=10, max_retry=3):
         raise last
     raise RuntimeError("HTTP 요청 실패")
 
+# 공통 헤더
+H_COMMON = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://finance.yahoo.com/",
+    "Origin": "https://finance.yahoo.com",
+}
+
 # -------------------- 야후 파이낸스 --------------------
 def _yahoo_quote(symbols):
     symbols_param = ",".join(symbols) if isinstance(symbols, (list, tuple)) else symbols
@@ -146,9 +148,6 @@ def _yahoo_quote(symbols):
     return r.json()
 
 def _pick_price_fields(q: dict):
-    """
-    가격/전일종가/마켓상태/타임스탬프(UTC epoch) 추출
-    """
     price = q.get("regularMarketPrice") or q.get("price")
     prev  = q.get("regularMarketPreviousClose") or q.get("previousClose")
     state = q.get("marketState")  # "REGULAR", "CLOSED", "PRE", "POST" 등
@@ -174,19 +173,14 @@ def _is_fresh(ts_epoch: float | None, max_age_sec: int) -> bool:
     return (now - float(ts_epoch)) <= max_age_sec
 
 def _extract_change_percent(q: dict, symbol: str = None, require_regular: bool | None = None, require_fresh: bool = False):
-    """
-    REGULAR 상태 & 신선도 조건을 만족하는 데이터만 변화율 계산.
-    - require_regular=True: marketState != REGULAR 이면 무시
-    - require_fresh=True: MAX_STALENESS_SEC 초과 데이터 무시
-    """
-    price, prev, market_state, ts = _pick_price_fields(q)
     is_kr = symbol and (".KS" in symbol or "^KS" in symbol)
     if require_regular is None:
         require_regular = bool(is_kr)
 
+    price, prev, market_state, ts = _pick_price_fields(q)
+
     if require_regular and market_state and market_state != "REGULAR":
         return None
-
     if require_fresh and not _is_fresh(ts, MAX_STALENESS_SEC):
         return None
 
@@ -238,7 +232,6 @@ def _yf_change_percent(symbol: str):
 def _alphavantage_change_percent(symbol: str) -> float:
     if not ALPHAVANTAGE_API_KEY:
         raise RuntimeError("ALPHAVANTAGE_API_KEY not set")
-    # 선물/인덱스 직접 미지원 → ETF 프록시
     sym = AV_PROXY_MAP.get(symbol, symbol)
     url = "https://www.alphavantage.co/query"
     params = {"function": "GLOBAL_QUOTE", "symbol": sym, "apikey": ALPHAVANTAGE_API_KEY}
@@ -263,7 +256,6 @@ def _alphavantage_change_percent(symbol: str) -> float:
 
 # -------------------- 세션/시간 --------------------
 def current_session() -> str:
-    """KST 기준 세션 판별"""
     now = _now_kst()
     hhmm = now.hour * 100 + now.minute
     if now.weekday() >= 5:
@@ -271,7 +263,6 @@ def current_session() -> str:
     return "KR" if 830 <= hhmm <= 1600 else "US"
 
 def is_us_market_open() -> bool:
-    """미국 정규장 시간 체크 (KST 기준, 서머타임 단순화)"""
     now = _now_kst()
     hour = now.hour
     minute = now.minute
@@ -291,11 +282,6 @@ def is_us_market_open() -> bool:
 
 # -------------------- 프로바이더 체인 --------------------
 def _provider_chain_get_change(symbols, require_regular_by_symbol: bool = False, require_fresh_by_symbol: bool = False):
-    """
-    멀티소스 체인으로 변화율 수집.
-    - require_regular_by_symbol: KR/현물지수 등 장중 REGULAR 강제
-    - require_fresh_by_symbol: 신선도(MAX_STALENESS_SEC) 강제
-    """
     last_err = None
     if not isinstance(symbols, (list, tuple)):
         symbols = [symbols]
@@ -314,7 +300,6 @@ def _provider_chain_get_change(symbols, require_regular_by_symbol: bool = False,
                 for idx, sym in enumerate(symbols):
                     if idx >= len(items):
                         continue
-                    # 신선도/정규장 요구조건 심볼별 적용
                     cp = _extract_change_percent(
                         items[idx],
                         sym,
@@ -340,13 +325,13 @@ def _provider_chain_get_change(symbols, require_regular_by_symbol: bool = False,
                 raise RuntimeError("yfinance no valid data")
 
             elif provider == "alphavantage" and ALPHAVANTAGE_API_KEY:
-                # AV는 미국 현물 지수 장마감 시 전일 종가 편향 → 스킵 조건
+                # AV는 현물지수 마감/선물 미지원 편향 → 스킵 조건
                 skip = False
                 for sym in symbols:
                     if sym in (SYMBOL_SPX, SYMBOL_NDX, SYMBOL_VIX) and not us_open:
                         skip = True
                     if sym in (SYMBOL_SPX_FUT, SYMBOL_NDX_FUT):
-                        skip = True  # 선물 직접 미지원
+                        skip = True
                 if skip:
                     raise RuntimeError("alphavantage skipped for closed spot/futures")
 
@@ -371,20 +356,16 @@ def _provider_chain_get_change(symbols, require_regular_by_symbol: bool = False,
 
 # -------------------- 변화율 수집 --------------------
 def get_delta(symbol) -> float:
-    # 미국 선물/현물 판단
     require_regular = False
     require_fresh   = False
 
     if symbol in (SYMBOL_SPX, SYMBOL_NDX, SYMBOL_VIX):
-        # 현물 지수는 정규장/신선도 요구
         require_regular = True
         require_fresh   = True
     if symbol in (SYMBOL_SPX_FUT, SYMBOL_NDX_FUT):
-        # 선물은 실시간이므로 신선도만 엄격
         require_regular = False
         require_fresh   = True
     if ".KS" in symbol or "^KS" in symbol:
-        # 한국 심볼은 장중 REGULAR + 신선도
         require_regular = True
         require_fresh   = True
 
@@ -393,30 +374,21 @@ def get_delta(symbol) -> float:
                                             require_fresh_by_symbol=require_fresh))
 
 def get_delta_k200() -> tuple[float, str]:
-    """
-    한국 시장 변화율 (정규장 실시간/신선도 엄격)
-    - 1순위: 069500.KS (KODEX200)
-    - 2순위: ^KS200
-    - 3순위: ^KS11
-    """
     try:
         cp = _provider_chain_get_change(["069500.KS"], True, True)
         return float(cp), "069500.KS"
     except Exception as e:
-        log.warning("ETF(KODEX200) 실패: %s", e)
-
+        log.warning("KODEX 200 실패: %s", e)
     try:
         cp = _provider_chain_get_change([SYMBOL_PRIMARY], True, True)
         return float(cp), SYMBOL_PRIMARY
     except Exception as e:
-        log.warning("^KS200 실패: %s", e)
-
+        log.warning("KOSPI 200 실패: %s", e)
     try:
         cp = _provider_chain_get_change(["^KS11"], True, True)
         return float(cp), "^KS11"
     except Exception as e:
         log.warning("KOSPI 실패: %s", e)
-
     raise RuntimeError("KR 데이터 수집 실패")
 
 # -------------------- 레벨 판정 --------------------
@@ -434,7 +406,11 @@ def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
 
 # -------------------- 알림 전송 --------------------
 def post_alert(index_name: str, delta_pct: float | None, level: str | None, source_tag: str, note: str):
-    display_name = DISPLAY_NAMES.get(source_tag, index_name)
+    """
+    index: 사람친화 지표명(예: S&P 500, NASDAQ, KOSPI, KODEX 200, S&P 500 선물, NASDAQ-100 선물)
+    """
+    display_name = human_name(source_tag, fallback=index_name)
+
     payload = {
         "index": display_name,
         "level": level or "CLEARED",
@@ -442,10 +418,13 @@ def post_alert(index_name: str, delta_pct: float | None, level: str | None, sour
         "triggered_at": _now_kst_iso(),
         "note": note,
     }
+
     headers = {"Content-Type": "application/json"}
     if SENTINEL_KEY:
         headers["x-sentinel-key"] = SENTINEL_KEY
+
     url = f"{SENTINEL_BASE_URL}/sentinel/alert"
+
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=15)
         if not r.ok:
@@ -467,12 +446,13 @@ def check_and_alert():
             delta, tag = get_delta_k200()
             lvl = grade_level(delta)
             prev = state.get("ΔK200")
-            log.info("KR: %.2f%% [%s → %s]", delta, prev or "없음", lvl or "정상")
+            name = human_name(tag)
+            log.info("%s: %.2f%% [%s → %s]", name, delta, prev or "없음", lvl or "정상")
             if lvl != prev:
                 note = ("레벨 진입" if (not prev and lvl) else
                         "레벨 해제" if (prev and not lvl) else
                         f"{prev} → {lvl}")
-                post_alert("ΔK200", delta, lvl, tag, note)
+                post_alert(name, delta, lvl, tag, note)
                 state["ΔK200"] = lvl
         except Exception as e:
             log.warning("KR 수집 실패: %s", e)
@@ -484,7 +464,6 @@ def check_and_alert():
                 ("ΔES", SYMBOL_SPX_FUT, "ES=F"),
                 ("ΔNQ", SYMBOL_NDX_FUT, "NQ=F"),
             ]
-            # 현물 지수는 마감시 수집하지 않음 (전일 종가 오인 방지)
             spx_delta = nasdaq_delta = None
         else:
             log.info("미국 시장 개장 - 현물 지수 사용(정규장·신선도 필수)")
@@ -493,7 +472,6 @@ def check_and_alert():
                 ("ΔNASDAQ", SYMBOL_NDX, SYMBOL_NDX),
                 ("ΔVIX", SYMBOL_VIX, SYMBOL_VIX)
             ]
-            # VIX 필터용 선행 수집
             try:
                 spx_delta = get_delta(SYMBOL_SPX)
             except Exception:
@@ -507,25 +485,32 @@ def check_and_alert():
             try:
                 delta = get_delta(sym)
                 is_vix = (sym == SYMBOL_VIX)
+                name = human_name(tag)
+
                 if is_vix:
                     max_index_move = max(abs(spx_delta or 0.0), abs(nasdaq_delta or 0.0))
                     if max_index_move < 0.8:
                         log.debug("VIX 필터: 지수 %.2f%% 대비 VIX %.2f%% - 무시", max_index_move, delta)
                         state[idx_name] = None
                         continue
+
                 lvl = grade_level(delta, is_vix=is_vix)
                 prev = state.get(idx_name)
-                log.info("%s: %.2f%% [%s → %s]", idx_name, delta, prev or "없음", lvl or "정상")
+
+                log.info("%s: %.2f%% [%s → %s]", name, delta, prev or "없음", lvl or "정상")
+
                 if lvl != prev:
                     note = ("레벨 진입" if (not prev and lvl) else
                             "레벨 해제" if (prev and not lvl) else
                             f"{prev} → {lvl}")
                     if is_vix and lvl and us_open:
                         note += f" (S&P {spx_delta:+.2f}%, NAS {nasdaq_delta:+.2f}%)"
-                    post_alert(idx_name, delta, lvl, tag, note)
+
+                    post_alert(name, delta, lvl, tag, note)
                     state[idx_name] = lvl
+
             except Exception as e:
-                log.warning("%s 수집 실패: %s", idx_name, e)
+                log.warning("%s 수집 실패: %s", name if 'name' in locals() else sym, e)
 
     _save_state(state)
     log.info("===== 체크 완료 =====")
