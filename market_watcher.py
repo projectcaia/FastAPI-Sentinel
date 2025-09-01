@@ -1,4 +1,4 @@
-# market_watcher.py — FGPT Sentinel 시장감시 워커 (실시간 수정 버전)
+# market_watcher.py — FGPT Sentinel 시장감시 워커 (당일 변화율 버전)
 # -*- coding: utf-8 -*-
 
 import os, time, json, logging, requests, math
@@ -47,6 +47,7 @@ _YF_READY = False
 if YF_ENABLED:
     try:
         import yfinance as yf
+        import pandas as pd
         _YF_READY = True
     except Exception as e:
         log.warning("yfinance import 실패: %s", e)
@@ -125,36 +126,29 @@ def _http_get(url: str, params=None, timeout=12, max_retry=3):
         raise last
     raise RuntimeError("HTTP 요청 실패")
 
-# ==================== 데이터 수집 (단순화) ====================
-def get_realtime_data(symbol: str) -> tuple[float | None, str]:
-    """실시간 데이터 수집 - yfinance 우선"""
+# ==================== 데이터 수집 (당일 변화율) ====================
+def get_intraday_change(symbol: str) -> tuple[float | None, str]:
+    """당일 시가 대비 현재 변화율 계산"""
     
-    # 1차: yfinance (가장 신뢰성 높음)
+    # 1차: yfinance (당일 데이터)
     if _YF_READY:
         try:
-            ticker = yf.download(symbol, period="1d", interval="1m", progress=False, prepost=True)
+            # 당일 1분봉 데이터
+            ticker = yf.download(symbol, period="1d", interval="1m", progress=False, prepost=True, auto_adjust=True)
             if ticker is not None and len(ticker) > 0:
-                current = float(ticker["Close"].iloc[-1])
+                # 당일 시가와 현재가
+                open_price = float(ticker["Open"].iloc[0])  # 첫 봉의 시가
+                current = float(ticker["Close"].iloc[-1])   # 마지막 봉의 종가
                 
-                # 전일 종가 가져오기
-                info = yf.Ticker(symbol).info
-                prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
-                
-                if not prev:
-                    # 2일치 데이터로 전일 종가 추출
-                    daily = yf.download(symbol, period="2d", interval="1d", progress=False)
-                    if daily is not None and len(daily) >= 2:
-                        prev = float(daily["Close"].iloc[-2])
-                
-                if prev and prev != 0:
-                    change_pct = (current - prev) / prev * 100.0
-                    log.debug("%s yfinance: 현재=%.2f, 전일=%.2f, 변화=%.2f%%", 
-                            symbol, current, prev, change_pct)
-                    return change_pct, "yfinance"
+                if open_price and open_price != 0:
+                    change_pct = (current - open_price) / open_price * 100.0
+                    log.debug("%s yfinance 당일: 시가=%.2f, 현재=%.2f, 변화=%.2f%%", 
+                            symbol, open_price, current, change_pct)
+                    return change_pct, "yfinance_intraday"
         except Exception as e:
-            log.debug("yfinance 실패(%s): %s", symbol, e)
+            log.debug("yfinance 당일 실패(%s): %s", symbol, e)
     
-    # 2차: Yahoo Quote API
+    # 2차: Yahoo Quote API (regularMarketDayRange 활용)
     try:
         url = "https://query2.finance.yahoo.com/v7/finance/quote"
         params = {
@@ -168,29 +162,20 @@ def get_realtime_data(symbol: str) -> tuple[float | None, str]:
         if items:
             q = items[0]
             
-            # regularMarketChangePercent 직접 사용
-            change_pct = q.get("regularMarketChangePercent")
-            if change_pct is not None:
-                log.debug("%s Yahoo Quote: %.2f%%", symbol, change_pct)
-                return float(change_pct), "yahoo_quote"
+            # 당일 시가와 현재가 직접 가져오기
+            current = q.get("regularMarketPrice")
+            open_price = q.get("regularMarketOpen")
             
-            # 계산
-            price = q.get("regularMarketPrice")
-            prev = q.get("regularMarketPreviousClose")
-            if price and prev and prev != 0:
-                change_pct = (float(price) - float(prev)) / float(prev) * 100.0
-                log.debug("%s Yahoo 계산: %.2f%%", symbol, change_pct)
-                return change_pct, "yahoo_calc"
+            if current and open_price and open_price != 0:
+                change_pct = (float(current) - float(open_price)) / float(open_price) * 100.0
+                log.debug("%s Yahoo 당일: 시가=%.2f, 현재=%.2f, 변화=%.2f%%", 
+                        symbol, open_price, current, change_pct)
+                return change_pct, "yahoo_intraday"
                 
     except Exception as e:
-        log.debug("Yahoo Quote 실패(%s): %s", symbol, e)
+        log.debug("Yahoo Quote 당일 실패(%s): %s", symbol, e)
     
-    return None, "failed"
-
-def get_futures_data(symbol: str) -> tuple[float | None, str]:
-    """선물 데이터 수집 - Chart API 메타 우선"""
-    
-    # Chart API (선물은 이게 제일 정확)
+    # 3차: Chart API로 당일 데이터
     try:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
         params = {
@@ -203,20 +188,75 @@ def get_futures_data(symbol: str) -> tuple[float | None, str]:
         
         chart = data.get("chart", {}).get("result", [{}])[0]
         meta = chart.get("meta", {})
+        indicators = chart.get("indicators", {}).get("quote", [{}])[0]
         
+        # 당일 시가와 현재가
         current = meta.get("regularMarketPrice")
-        prev = meta.get("previousClose") or meta.get("chartPreviousClose")
+        opens = indicators.get("open", [])
         
-        if current and prev and prev != 0:
-            change_pct = (float(current) - float(prev)) / float(prev) * 100.0
-            log.debug("선물 %s: %.2f%%", symbol, change_pct)
-            return change_pct, "chart"
+        if current and opens and opens[0] is not None:
+            open_price = float(opens[0])
+            if open_price != 0:
+                change_pct = (float(current) - open_price) / open_price * 100.0
+                log.debug("%s Chart 당일: 시가=%.2f, 현재=%.2f, 변화=%.2f%%", 
+                        symbol, open_price, current, change_pct)
+                return change_pct, "chart_intraday"
             
     except Exception as e:
-        log.debug("선물 Chart 실패(%s): %s", symbol, e)
+        log.debug("Chart 당일 실패(%s): %s", symbol, e)
     
-    # 폴백: 일반 데이터 수집
-    return get_realtime_data(symbol)
+    return None, "failed"
+
+def get_futures_intraday(symbol: str) -> tuple[float | None, str]:
+    """선물 당일 변화율 - 연속 거래 특성 고려"""
+    
+    # 선물은 24시간 거래이므로 세션 시작 시점 기준
+    try:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+        params = {
+            "interval": "15m",  # 15분봉
+            "range": "1d"
+        }
+        
+        r = _http_get(url, params=params)
+        data = r.json()
+        
+        chart = data.get("chart", {}).get("result", [{}])[0]
+        meta = chart.get("meta", {})
+        indicators = chart.get("indicators", {}).get("quote", [{}])[0]
+        
+        current = meta.get("regularMarketPrice")
+        opens = indicators.get("open", [])
+        
+        # 선물 세션 시작 시점 찾기 (KST 06:00 또는 07:00)
+        timestamps = chart.get("timestamp", [])
+        if timestamps and opens:
+            kst_now = _now_kst()
+            session_start_hour = 6 if kst_now.month in [11,12,1,2,3] else 7  # 표준시/서머타임
+            
+            for i, ts in enumerate(timestamps):
+                dt = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=9)))
+                if dt.hour == session_start_hour and dt.minute < 30:
+                    if opens[i] is not None:
+                        open_price = float(opens[i])
+                        if open_price != 0:
+                            change_pct = (float(current) - open_price) / open_price * 100.0
+                            log.debug("선물 %s 세션: 시가=%.2f, 현재=%.2f, 변화=%.2f%%", 
+                                    symbol, open_price, current, change_pct)
+                            return change_pct, "futures_session"
+                            
+        # 폴백: 첫 데이터 포인트 사용
+        if current and opens and opens[0] is not None:
+            open_price = float(opens[0])
+            if open_price != 0:
+                change_pct = (float(current) - open_price) / open_price * 100.0
+                return change_pct, "futures_first"
+                
+    except Exception as e:
+        log.debug("선물 당일 실패(%s): %s", symbol, e)
+    
+    # 폴백
+    return get_intraday_change(symbol)
 
 # ==================== 시장 시간 판정 ====================
 def current_session() -> str:
@@ -309,23 +349,23 @@ def check_and_alert():
         return
     
     if sess == "KR":
-        # 한국 정규장
-        log.info("한국 정규장 데이터 수집...")
+        # 한국 정규장 - 당일 변화율
+        log.info("한국 정규장 당일 데이터 수집...")
         
         for sym in KR_SPOT_PRIORITY:
-            delta, source = get_realtime_data(sym)
+            delta, source = get_intraday_change(sym)
             if delta is not None:
                 lvl = grade_level(delta)
                 prev = state.get("ΔK200")
                 name = human_name(sym)
                 
-                log.info("%s: %.2f%% [%s → %s] (소스: %s)", 
+                log.info("%s: 당일 %.2f%% [%s → %s] (소스: %s)", 
                         name, delta, prev or "없음", lvl or "정상", source)
                 
                 if lvl != prev:
-                    note = ("레벨 진입" if (not prev and lvl) else
-                           "레벨 해제" if (prev and not lvl) else
-                           f"{prev} → {lvl}")
+                    note = ("당일 레벨 진입" if (not prev and lvl) else
+                           "당일 레벨 해제" if (prev and not lvl) else
+                           f"당일 {prev} → {lvl}")
                     post_alert(delta, lvl, sym, note)
                     state["ΔK200"] = lvl
                 break
@@ -333,20 +373,20 @@ def check_and_alert():
             log.warning("한국 시장 데이터 수집 실패")
     
     elif sess == "US":
-        # 미국 정규장
-        log.info("미국 정규장 데이터 수집...")
+        # 미국 정규장 - 당일 변화율
+        log.info("미국 정규장 당일 데이터 수집...")
         
         # S&P, NASDAQ 먼저 수집
-        spx_delta, _ = get_realtime_data("^GSPC")
-        ndx_delta, _ = get_realtime_data("^IXIC")
+        spx_delta, _ = get_intraday_change("^GSPC")
+        ndx_delta, _ = get_intraday_change("^IXIC")
         
         max_index_move = 0.0
         if spx_delta is not None and ndx_delta is not None:
             max_index_move = max(abs(spx_delta), abs(ndx_delta))
-            log.info("지수 변동: S&P %.2f%%, NASDAQ %.2f%%", spx_delta, ndx_delta)
+            log.info("당일 지수 변동: S&P %.2f%%, NASDAQ %.2f%%", spx_delta, ndx_delta)
         
         for sym in US_SPOT:
-            delta, source = get_realtime_data(sym)
+            delta, source = get_intraday_change(sym)
             if delta is None:
                 log.warning("%s 데이터 수집 실패", human_name(sym))
                 continue
@@ -355,7 +395,7 @@ def check_and_alert():
             
             # VIX 필터
             if is_vix and max_index_move < VIX_FILTER_THRESHOLD:
-                log.info("VIX 필터: 지수 %.2f%% < %.2f%% → VIX %.2f%% 무시", 
+                log.info("VIX 필터: 당일 지수 %.2f%% < %.2f%% → VIX %.2f%% 무시", 
                         max_index_move, VIX_FILTER_THRESHOLD, delta)
                 state["ΔVIX"] = None
                 continue
@@ -365,23 +405,23 @@ def check_and_alert():
             prev = state.get(key)
             name = human_name(sym)
             
-            log.info("%s: %.2f%% [%s → %s]", name, delta, prev or "없음", lvl or "정상")
+            log.info("%s: 당일 %.2f%% [%s → %s]", name, delta, prev or "없음", lvl or "정상")
             
             if lvl != prev:
-                note = ("레벨 진입" if (not prev and lvl) else
-                       "레벨 해제" if (prev and not lvl) else
-                       f"{prev} → {lvl}")
+                note = ("당일 레벨 진입" if (not prev and lvl) else
+                       "당일 레벨 해제" if (prev and not lvl) else
+                       f"당일 {prev} → {lvl}")
                 if is_vix and lvl and spx_delta and ndx_delta:
                     note += f" (S&P {spx_delta:+.2f}%, NAS {ndx_delta:+.2f}%)"
                 post_alert(delta, lvl, sym, note)
                 state[key] = lvl
     
     elif sess == "FUTURES":
-        # 선물 시간
-        log.info("선물 시장 데이터 수집...")
+        # 선물 시간 - 세션 기준 변화율
+        log.info("선물 시장 당일 데이터 수집...")
         
         for key, sym in [("ΔES_FUT", "ES=F"), ("ΔNQ_FUT", "NQ=F")]:
-            delta, source = get_futures_data(sym)
+            delta, source = get_futures_intraday(sym)
             name = human_name(sym)
             
             if delta is None:
@@ -389,7 +429,7 @@ def check_and_alert():
                 state[key] = None
                 continue
             
-            log.info("%s: %.2f%% (소스: %s)", name, delta, source)
+            log.info("%s: 세션 %.2f%% (소스: %s)", name, delta, source)
             
             # 0.8% 미만은 무시
             if abs(delta) < 0.8:
@@ -408,7 +448,7 @@ def check_and_alert():
                 except:
                     pass
             
-            note = f"선물 시장 변동"
+            note = f"선물 세션 변동"
             post_alert(delta, "PRE", sym, note, kind="PRE")
             log.info("%s: %.2f%% [PRE 알림]", name, delta)
             state[key] = delta
@@ -418,10 +458,11 @@ def check_and_alert():
 
 # ==================== 메인 루프 ====================
 def run_loop():
-    log.info("=== Sentinel 시장감시 시작 ===")
+    log.info("=== Sentinel 시장감시 시작 (당일 변화율 모드) ===")
     log.info("간격: %d초", WATCH_INTERVAL)
     log.info("임계값 - 일반: 0.8%/1.5%/2.5%, VIX: 8%/15%/25%")
     log.info("VIX 필터: 지수 변동 %.1f%% 미만시 무시", VIX_FILTER_THRESHOLD)
+    log.info("※ 모든 변화율은 당일 시가 대비 현재가 기준")
     
     # 초기 체크
     try:
