@@ -27,6 +27,7 @@ def _pint(key, default):
 
 WATCH_INTERVAL = _pint("WATCH_INTERVAL_SEC", 1800)
 STATE_PATH     = os.getenv("WATCHER_STATE_PATH", "./market_state.json")
+US_BASELINE_PATH = os.getenv("US_BASELINE_PATH", "./us_baseline.json")
 
 # -------------------- 데이터 소스 --------------------
 YF_ENABLED = os.getenv("YF_ENABLED", "true").lower() in ("1","true","yes")
@@ -90,6 +91,8 @@ def current_session() -> str:
 
 def is_us_market_open() -> bool:
     now = _now_kst()
+    if now.weekday() >= 5:  # 주말
+        return False
     h, m = now.hour, now.minute
     is_dst = 3 <= now.month <= 11
     if is_dst:  # 22:30~05:00
@@ -112,6 +115,22 @@ def _load_state() -> dict:
         return {}
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_baseline(baseline: dict):
+    try:
+        with open(US_BASELINE_PATH, "w", encoding="utf-8") as f:
+            json.dump(baseline, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning("베이스라인 저장 실패: %s", e)
+
+def _load_baseline() -> dict:
+    if not os.path.exists(US_BASELINE_PATH):
+        return {}
+    try:
+        with open(US_BASELINE_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -141,9 +160,8 @@ def _yahoo_quote(symbols):
     r = _http_get(url, params={"symbols": sym}, timeout=15)
     return r.json().get("quoteResponse", {}).get("result", [])
 
-def _extract_intraday_change(quote: dict, max_age_sec: int = 1800) -> float | None:
-    """정규장 데이터 우선 추출"""
-    # 정규장 데이터 우선 사용
+def _extract_kr_intraday_change(quote: dict, max_age_sec: int = 1800) -> float | None:
+    """한국 시장: 정규장 데이터 우선 추출 (전일 종가 대비)"""
     price = quote.get("regularMarketPrice") or quote.get("price")
     prev = quote.get("regularMarketPreviousClose") or quote.get("previousClose")
     rmt = quote.get("regularMarketTime") or quote.get("marketTime")
@@ -162,17 +180,33 @@ def _extract_intraday_change(quote: dict, max_age_sec: int = 1800) -> float | No
     
     return (float(price) - float(prev)) / float(prev) * 100.0
 
-def _yf_change_intraday(symbol: str) -> float:
+def _extract_us_current_price(quote: dict) -> float | None:
+    """미국 시장: 현재가 추출"""
+    # 정규장 시간이면 regularMarketPrice, 아니면 price (시간외 거래가)
+    price = quote.get("regularMarketPrice") or quote.get("price")
+    return float(price) if price is not None else None
+
+def _yf_kr_change_intraday(symbol: str) -> float:
+    """한국: 전일 종가 대비 변화율"""
     if not _YF_READY: raise RuntimeError("yfinance not available")
     t = yf.Ticker(symbol)
     info = t.fast_info
-    # regularMarketPrice 우선 시도
     last = getattr(info, "regularMarketPrice", None) or getattr(info, "last_price", None)
     prev = getattr(info, "regularMarketPreviousClose", None) or getattr(info, "previous_close", None)
     
     if last is not None and prev not in (None, 0):
         return (float(last) - float(prev)) / float(prev) * 100.0
     raise RuntimeError(f"no intraday for {symbol}")
+
+def _yf_us_current_price(symbol: str) -> float:
+    """미국: 현재가"""
+    if not _YF_READY: raise RuntimeError("yfinance not available")
+    t = yf.Ticker(symbol)
+    info = t.fast_info
+    price = getattr(info, "last_price", None)
+    if price is not None:
+        return float(price)
+    raise RuntimeError(f"no price for {symbol}")
 
 # -------------------- KR 지표 (정규장 intraday only) --------------------
 def get_kr_delta() -> tuple[float, str]:
@@ -182,11 +216,11 @@ def get_kr_delta() -> tuple[float, str]:
             if provider == "yahoo":
                 quotes = _yahoo_quote([KR["KOSPI"]])
                 if quotes:
-                    cp = _extract_intraday_change(quotes[0], KR_MAX_STALENESS)
+                    cp = _extract_kr_intraday_change(quotes[0], KR_MAX_STALENESS)
                     if cp is not None:
                         return cp, "KOSPI"
             elif provider == "yfinance" and _YF_READY:
-                return _yf_change_intraday(KR["KOSPI"]), "KOSPI"
+                return _yf_kr_change_intraday(KR["KOSPI"]), "KOSPI"
         except Exception as e:
             log.debug("KOSPI %s 실패: %s", provider, e)
 
@@ -196,7 +230,7 @@ def get_kr_delta() -> tuple[float, str]:
         quotes = _yahoo_quote(syms)
         vals = []
         for q in quotes:
-            cp = _extract_intraday_change(q, KR_MAX_STALENESS)
+            cp = _extract_kr_intraday_change(q, KR_MAX_STALENESS)
             if cp is not None: 
                 vals.append(cp)
         if vals:
@@ -208,7 +242,7 @@ def get_kr_delta() -> tuple[float, str]:
         vals = []
         for s in syms:
             try: 
-                vals.append(_yf_change_intraday(s))
+                vals.append(_yf_kr_change_intraday(s))
             except: 
                 pass
         if vals:
@@ -218,7 +252,7 @@ def get_kr_delta() -> tuple[float, str]:
     try:
         quotes = _yahoo_quote([KR["KOSDAQ"]])
         if quotes:
-            cp = _extract_intraday_change(quotes[0], KR_MAX_STALENESS)
+            cp = _extract_kr_intraday_change(quotes[0], KR_MAX_STALENESS)
             if cp is not None:
                 return cp, "KOSDAQ"
     except Exception as e:
@@ -226,21 +260,81 @@ def get_kr_delta() -> tuple[float, str]:
 
     raise RuntimeError("KR intraday 실패")
 
-# -------------------- US 지표 --------------------
-def get_us_delta(symbol: str) -> float:
+# -------------------- US 지표 (현재가 기준) --------------------
+def get_us_current_price(symbol: str) -> float:
+    """미국 지수 현재가 가져오기"""
     for provider in DATA_PROVIDERS:
         try:
             if provider == "yahoo":
                 q = _yahoo_quote([symbol])
                 if q:
-                    cp = _extract_intraday_change(q[0], 3600)
-                    if cp is not None:
-                        return cp
+                    price = _extract_us_current_price(q[0])
+                    if price is not None:
+                        return price
             elif provider == "yfinance" and _YF_READY:
-                return _yf_change_intraday(symbol)
+                return _yf_us_current_price(symbol)
         except Exception as e:
             log.debug("%s %s 실패: %s", symbol, provider, e)
-    raise RuntimeError(f"{symbol} 수집 실패")
+    raise RuntimeError(f"{symbol} 가격 수집 실패")
+
+def update_us_baseline(force_update: bool = False):
+    """미국 시장 개장시 베이스라인 업데이트"""
+    baseline = _load_baseline()
+    now = _now_kst()
+    last_update = baseline.get("last_update", "")
+    
+    # 오늘 이미 업데이트했으면 스킵 (force_update가 아닌 경우)
+    if not force_update and last_update.startswith(now.strftime("%Y-%m-%d")):
+        return baseline
+    
+    # 미국 시장 개장 직후에만 업데이트 (KST 22:30~23:30 or 23:30~00:30)
+    h, m = now.hour, now.minute
+    is_dst = 3 <= now.month <= 11
+    should_update = False
+    
+    if is_dst and h == 22 and m >= 30:
+        should_update = True
+    elif is_dst and h == 23 and m < 30:
+        should_update = True
+    elif not is_dst and h == 23 and m >= 30:
+        should_update = True
+    elif not is_dst and h == 0 and m < 30:
+        should_update = True
+    
+    if should_update or force_update:
+        try:
+            # 현물 지수 베이스라인 설정
+            baseline["SPX"] = get_us_current_price(US["SPX"])
+            baseline["NDX"] = get_us_current_price(US["NDX"])
+            baseline["VIX"] = get_us_current_price(US["VIX"])
+            baseline["last_update"] = _now_kst_iso()
+            _save_baseline(baseline)
+            log.info("미국 베이스라인 업데이트: SPX=%.2f, NDX=%.2f, VIX=%.2f", 
+                     baseline["SPX"], baseline["NDX"], baseline["VIX"])
+        except Exception as e:
+            log.error("베이스라인 업데이트 실패: %s", e)
+    
+    return baseline
+
+def get_us_delta_from_baseline(symbol_key: str, current_price: float) -> float:
+    """베이스라인 대비 변화율 계산"""
+    baseline = _load_baseline()
+    
+    # 선물의 경우 매핑
+    mapping = {
+        "ES": "SPX",  # ES 선물 -> SPX 베이스라인
+        "NQ": "NDX"   # NQ 선물 -> NDX 베이스라인
+    }
+    
+    baseline_key = mapping.get(symbol_key, symbol_key)
+    base_price = baseline.get(baseline_key)
+    
+    if base_price and base_price != 0:
+        return (current_price - base_price) / base_price * 100.0
+    else:
+        # 베이스라인이 없으면 0 반환 (첫 실행시)
+        log.warning("%s 베이스라인 없음", baseline_key)
+        return 0.0
 
 # -------------------- 레벨 --------------------
 def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
@@ -257,12 +351,8 @@ def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
 
 # -------------------- 알림 --------------------
 def post_alert(index_name: str, delta_pct: float, level: str | None, display_name: str, note: str):
-    """
-    index_name: 내부 식별자
-    display_name: 사용자에게 보여질 이름
-    """
     payload = {
-        "index": display_name,  # 사용자에게 보여질 이름으로 변경
+        "index": display_name,
         "level": level or "CLEARED",
         "delta_pct": round(delta_pct, 2) if delta_pct is not None else None,
         "triggered_at": _now_kst_iso(),
@@ -305,7 +395,11 @@ def check_and_alert():
         mo = is_us_market_open()
         log.info("US: %s", "개장" if mo else "마감(선물)")
         
-        # 심볼 매핑 정리
+        # 미국 시장 개장시 베이스라인 업데이트
+        if mo:
+            update_us_baseline()
+        
+        # 심볼 선택
         if mo:
             symbols = [
                 ("SPX", US["SPX"], False),
@@ -320,11 +414,15 @@ def check_and_alert():
         
         for key, sym, is_vix in symbols:
             try:
-                delta = get_us_delta(sym)
+                # 현재가 가져오기
+                current_price = get_us_current_price(sym)
+                # 베이스라인 대비 변화율 계산
+                delta = get_us_delta_from_baseline(key, current_price)
                 level = grade_level(delta, is_vix)
                 prev = state.get(key)
                 display_name = US_NAMES.get(key, key)
-                log.info("US %s: %.2f%% (현재: %s, 이전: %s)", key, delta, level or "정상", prev or "정상")
+                log.info("US %s: 현재가=%.2f, 변화율=%.2f%% (현재: %s, 이전: %s)", 
+                         key, current_price, delta, level or "정상", prev or "정상")
                 if level != prev:
                     note = ("레벨 진입" if not prev else
                             "레벨 해제" if not level else
@@ -341,10 +439,18 @@ def run_loop():
     log.info("=== Sentinel 시장 감시 시작 ===")
     log.info("간격: %d초", WATCH_INTERVAL)
     log.info("데이터 소스: %s", ", ".join(DATA_PROVIDERS))
+    
+    # 초기 베이스라인 설정 (미국 시장)
+    try:
+        update_us_baseline(force_update=True)
+    except Exception as e:
+        log.warning("초기 베이스라인 설정 실패: %s", e)
+    
     try:
         check_and_alert()
     except Exception as e:
         log.error("초기 체크 실패: %s", e)
+    
     while True:
         time.sleep(WATCH_INTERVAL)
         try:
