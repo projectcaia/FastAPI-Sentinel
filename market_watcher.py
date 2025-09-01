@@ -265,65 +265,186 @@ def get_kr_spot_data() -> tuple[float | None, str, str]:
 
 # ==================== 미국/선물 데이터 수집 (기존 코드 유지) ====================
 def get_futures_data(symbol: str) -> tuple[float | None, bool, str]:
-    """선물 데이터 수집"""
-    # 기존 코드 유지
+    """선물 데이터 수집 - 여러 방법 시도"""
+    
+    # 1차: Yahoo Chart API (가장 신뢰성 높음)
+    try:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+        params = {
+            "interval": "2m",  # 2분봉 (더 많은 데이터)
+            "range": "1d",
+            "includePrePost": "true",
+            "events": "div,split"
+        }
+        
+        # 헤더 강화
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
+            "Referer": "https://finance.yahoo.com/",
+            "Origin": "https://finance.yahoo.com"
+        }
+        
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        
+        chart = data.get("chart", {}).get("result", [{}])[0]
+        meta = chart.get("meta", {})
+        
+        # regularMarketPrice가 실시간
+        current_price = meta.get("regularMarketPrice")
+        prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+        
+        if current_price and prev_close and prev_close != 0:
+            change_pct = (float(current_price) - float(prev_close)) / float(prev_close) * 100.0
+            log.debug("Chart API 선물 %s: 현재=%.2f, 전일=%.2f, 변화=%.2f%%", 
+                     symbol, current_price, prev_close, change_pct)
+            return change_pct, True, "chart_meta"
+        
+        # 캔들 데이터에서 추출
+        quotes = chart.get("indicators", {}).get("quote", [{}])[0]
+        closes = quotes.get("close", [])
+        timestamps = chart.get("timestamp", [])
+        
+        if closes and timestamps:
+            # 마지막 유효 데이터
+            valid_data = [(t, c) for t, c in zip(timestamps, closes) if c is not None]
+            if valid_data:
+                last_ts, last_close = valid_data[-1]
+                age = _utc_ts_now() - last_ts
+                
+                if age <= MAX_STALENESS_SEC and prev_close and prev_close != 0:
+                    change_pct = (last_close - float(prev_close)) / float(prev_close) * 100.0
+                    log.debug("Chart 캔들 선물 %s: %.2f%% (age=%ds)", symbol, change_pct, age)
+                    return change_pct, True, "chart_candle"
+                    
+    except Exception as e:
+        log.debug("Chart API 선물 실패(%s): %s", symbol, e)
+    
+    # 2차: Yahoo Quote API (spark 데이터 활용)
     try:
         url = "https://query2.finance.yahoo.com/v7/finance/quote"
         params = {
             "symbols": symbol,
-            "crumb": str(int(time.time())),
-            "formatted": "false",
-            "includePrePost": "true"
+            "fields": "symbol,regularMarketPrice,regularMarketChangePercent,regularMarketPreviousClose,regularMarketTime,spark,preMarketPrice,preMarketChangePercent,postMarketPrice,postMarketChangePercent",
+            "crumb": str(int(time.time()))
         }
+        
         r = _http_get(url, params=params)
         data = r.json()
         
         items = data.get("quoteResponse", {}).get("result", [])
         if items:
             q = items[0]
-            price = q.get("regularMarketPrice")
-            prev = q.get("regularMarketPreviousClose")
-            timestamp = q.get("regularMarketTime")
             
-            if price and prev and timestamp:
-                age_sec = _utc_ts_now() - float(timestamp)
-                if age_sec <= MAX_STALENESS_SEC:
-                    change_pct = (float(price) - float(prev)) / float(prev) * 100.0
-                    return change_pct, True, "yahoo"
+            # 여러 필드 체크
+            for price_field, time_field in [
+                ("regularMarketPrice", "regularMarketTime"),
+                ("postMarketPrice", "postMarketTime"),
+                ("preMarketPrice", "preMarketTime")
+            ]:
+                price = q.get(price_field)
+                timestamp = q.get(time_field)
+                
+                if price and timestamp:
+                    age_sec = _utc_ts_now() - float(timestamp)
+                    if age_sec <= MAX_STALENESS_SEC:
+                        prev = q.get("regularMarketPreviousClose")
+                        if prev and prev != 0:
+                            change_pct = (float(price) - float(prev)) / float(prev) * 100.0
+                            log.debug("Quote API 선물 %s: %.2f%% from %s", symbol, change_pct, price_field)
+                            return change_pct, True, f"quote_{price_field}"
+            
+            # spark 데이터 (최근 거래 내역)
+            spark = q.get("spark")
+            if spark:
+                close_data = spark.get("close", [])
+                if close_data and len(close_data) > 1:
+                    last = close_data[-1]
+                    prev = q.get("regularMarketPreviousClose") or close_data[0]
+                    if last and prev and prev != 0:
+                        change_pct = (last - float(prev)) / float(prev) * 100.0
+                        log.debug("Spark 선물 %s: %.2f%%", symbol, change_pct)
+                        return change_pct, True, "spark"
+                        
     except Exception as e:
-        log.debug("선물 Yahoo 실패(%s): %s", symbol, e)
+        log.debug("Quote API 선물 실패(%s): %s", symbol, e)
     
+    # 3차: yfinance (설치되어 있으면)
+    if _YF_READY:
+        try:
+            ticker = yf.Ticker(symbol)
+            
+            # download 방식 (더 안정적)
+            df = yf.download(symbol, period="1d", interval="5m", progress=False, prepost=True)
+            if df is not None and len(df) > 0:
+                last_close = float(df["Close"].iloc[-1])
+                
+                # info에서 전일 종가
+                info = ticker.info
+                prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
+                
+                if not prev:
+                    # 전일 데이터 가져오기
+                    df_daily = yf.download(symbol, period="5d", interval="1d", progress=False)
+                    if df_daily is not None and len(df_daily) >= 2:
+                        prev = float(df_daily["Close"].iloc[-2])
+                
+                if prev and prev != 0:
+                    change_pct = (last_close - prev) / prev * 100.0
+                    log.debug("yfinance 선물 %s: %.2f%%", symbol, change_pct)
+                    return change_pct, True, "yfinance"
+                    
+        except Exception as e:
+            log.debug("yfinance 선물 실패(%s): %s", symbol, e)
+    
+    # 4차: 대체 심볼 시도 (CME 선물)
+    alt_symbols = {
+        "ES=F": ["ESU24.CME", "ESZ24.CME", "ES"],  # S&P 500 선물 대체
+        "NQ=F": ["NQU24.CME", "NQZ24.CME", "NQ"]   # NASDAQ 선물 대체
+    }
+    
+    if symbol in alt_symbols:
+        for alt in alt_symbols[symbol]:
+            try:
+                # 대체 심볼로 재귀 호출 (1단계만)
+                result = get_futures_data_simple(alt)
+                if result[0] is not None:
+                    log.debug("대체 심볼 %s → %s 성공", symbol, alt)
+                    return result
+            except:
+                continue
+    
+    log.warning("선물 %s: 모든 방법 실패", symbol)
     return None, False, "failed"
 
-def get_us_spot_data(symbol: str) -> tuple[float | None, bool]:
-    """미국 현물 데이터 수집"""
-    # 기존 코드 유지
+def get_futures_data_simple(symbol: str) -> tuple[float | None, bool, str]:
+    """간단한 선물 데이터 수집 (재귀 방지용)"""
     try:
-        url = "https://query2.finance.yahoo.com/v7/finance/quote"
-        params = {
-            "symbols": symbol,
-            "crumb": str(int(time.time())),
-            "formatted": "false"
-        }
-        r = _http_get(url, params=params)
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+        r = requests.get(url, headers=H_COMMON, timeout=5)
         data = r.json()
         
-        items = data.get("quoteResponse", {}).get("result", [])
-        if items:
-            q = items[0]
-            price = q.get("regularMarketPrice")
-            prev = q.get("regularMarketPreviousClose")
-            timestamp = q.get("regularMarketTime")
-            
-            if price and prev and timestamp:
-                age_sec = _utc_ts_now() - float(timestamp)
-                if age_sec <= MAX_STALENESS_SEC:
-                    change_pct = (float(price) - float(prev)) / float(prev) * 100.0
-                    return change_pct, True
-    except Exception as e:
-        log.debug("미국 Yahoo 실패(%s): %s", symbol, e)
+        chart = data.get("chart", {}).get("result", [{}])[0]
+        meta = chart.get("meta", {})
+        
+        current = meta.get("regularMarketPrice")
+        prev = meta.get("previousClose")
+        
+        if current and prev and prev != 0:
+            return (current - prev) / prev * 100.0, True, f"alt_{symbol}"
+    except:
+        pass
     
-    return None, False
+    return None, False, "failed"
 
 # ==================== 시장 시간 판정 ====================
 def is_market_holiday() -> bool:
