@@ -1,4 +1,5 @@
-# market_watcher.py — Sentinel 시장감시 워커 (수정 버전)
+# market_watcher.py — Sentinel 시장감시 워커 (최종 수정본)
+# -*- coding: utf-8 -*-
 
 import os, time, json, logging, requests
 from datetime import datetime, timezone, timedelta
@@ -6,8 +7,11 @@ from typing import Optional, Tuple, Dict
 
 # -------------------- 설정/로그 --------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
 log = logging.getLogger("market-watcher")
 
 def _normalize_base(url: str) -> str:
@@ -37,21 +41,20 @@ if YF_ENABLED:
         import yfinance as yf
         _YF_READY = True
     except Exception as e:
-        log.warning("yfinance 로드 실패: %s", e)
+        log.warning("yfinance load failed: %s", e)
 
-# 한국 지수
-KR_SYMBOLS = {
+# 심볼 정의
+SYMBOLS = {
+    # 한국
     "KOSPI": "^KS11",
-    "KOSDAQ": "^KQ11"
-}
-
-# 미국 지수
-US_SYMBOLS = {
+    "KOSDAQ": "^KQ11",
+    # 미국 현물
     "SPX": "^GSPC",
     "NASDAQ": "^IXIC",
     "VIX": "^VIX",
-    "ES": "ES=F",  # S&P500 선물
-    "NQ": "NQ=F"   # NASDAQ 선물
+    # 미국 선물
+    "ES": "ES=F",
+    "NQ": "NQ=F"
 }
 
 # 표시 이름
@@ -72,46 +75,41 @@ def _now_kst():
 def _now_kst_iso():
     return _now_kst().isoformat(timespec="seconds")
 
-def is_kr_market_hours() -> bool:
-    """한국 정규장 시간 체크 (09:00~15:30)"""
+def get_market_session() -> str:
+    """현재 활성 시장 판단"""
     now = _now_kst()
-    if now.weekday() >= 5:  # 주말
-        return False
-    hhmm = now.hour * 100 + now.minute
-    return 900 <= hhmm <= 1530
-
-def is_us_market_hours() -> bool:
-    """미국 정규장 시간 체크"""
-    now = _now_kst()
-    if now.weekday() >= 5:  # 주말
-        return False
-    h, m = now.hour, now.minute
+    weekday = now.weekday()
+    hour = now.hour
+    minute = now.minute
+    hhmm = hour * 100 + minute
+    
+    # 주말 체크 (토=5, 일=6)
+    if weekday >= 5:
+        # 월요일 새벽 선물 체크 (일요일 밤 = 월요일 0시 이후)
+        if weekday == 6 and hour >= 18:  # 일요일 18시 이후
+            return "US_FUTURES"
+        return "CLOSED"
+    
+    # 평일
+    # 한국 정규장: 09:00~15:30
+    if 900 <= hhmm <= 1530:
+        return "KR"
+    
+    # 미국 시장 시간 계산 (서머타임 3~11월)
     is_dst = 3 <= now.month <= 11
     
+    # 미국 정규장
     if is_dst:  # 서머타임: 22:30~05:00
-        if h == 22: return m >= 30
-        return 23 <= h or h < 5
+        if (hour == 22 and minute >= 30) or (23 <= hour) or (hour < 5):
+            return "US"
     else:  # 표준시: 23:30~06:00
-        if h == 23: return m >= 30
-        return 0 <= h < 6
-
-def is_us_premarket() -> bool:
-    """미국 프리마켓 시간 체크 (정규장 전)"""
-    now = _now_kst()
-    if now.weekday() >= 5:
-        return False
-    h = now.hour
-    # 대략 17:00~22:30(서머) or 18:00~23:30(표준)
-    return 17 <= h <= 22
-
-def get_active_session() -> str:
-    """현재 활성 세션 결정"""
-    if is_kr_market_hours():
-        return "KR"
-    elif is_us_market_hours():
-        return "US"
-    elif is_us_premarket():
-        return "US_PRE"
+        if (hour == 23 and minute >= 30) or (0 <= hour < 6):
+            return "US"
+    
+    # 미국 선물 (거의 24시간, 한국 시간 기준 오전 6~7시 정도만 휴장)
+    if 7 <= hour <= 22:  # 대략적인 선물 거래 시간
+        return "US_FUTURES"
+    
     return "CLOSED"
 
 # -------------------- 상태 관리 --------------------
@@ -120,22 +118,16 @@ def _save_state(state: dict):
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        log.warning("상태 저장 실패: %s", e)
+        log.warning("State save failed: %s", e)
 
 def _load_state() -> dict:
     if not os.path.exists(STATE_PATH):
-        return {"levels": {}, "last_prices": {}}
+        return {"levels": {}, "last_check": {}}
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            # 구조 보장
-            if "levels" not in data:
-                data["levels"] = {}
-            if "last_prices" not in data:
-                data["last_prices"] = {}
-            return data
+            return json.load(f)
     except Exception:
-        return {"levels": {}, "last_prices": {}}
+        return {"levels": {}, "last_check": {}}
 
 # -------------------- 데이터 수집 --------------------
 def _http_get(url: str, params=None, timeout=10):
@@ -143,12 +135,16 @@ def _http_get(url: str, params=None, timeout=10):
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json"
     }
-    r = requests.get(url, params=params, headers=headers, timeout=timeout)
-    r.raise_for_status()
-    return r
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        r.raise_for_status()
+        return r
+    except Exception as e:
+        log.debug("HTTP request failed: %s", e)
+        raise
 
 def get_yahoo_quote(symbol: str) -> Optional[Dict]:
-    """Yahoo Finance에서 실시간 시세 가져오기"""
+    """Yahoo Finance API로 시세 조회"""
     try:
         url = "https://query2.finance.yahoo.com/v7/finance/quote"
         r = _http_get(url, params={"symbols": symbol})
@@ -156,54 +152,49 @@ def get_yahoo_quote(symbol: str) -> Optional[Dict]:
         results = data.get("quoteResponse", {}).get("result", [])
         return results[0] if results else None
     except Exception as e:
-        log.debug("Yahoo quote 실패 %s: %s", symbol, e)
+        log.debug("Yahoo quote failed for %s: %s", symbol, e)
         return None
 
-def get_yf_data(symbol: str) -> Optional[Tuple[float, float]]:
-    """yfinance로 현재가와 전일종가 가져오기"""
-    if not _YF_READY:
+def get_market_data(symbol_key: str) -> Optional[Tuple[float, float]]:
+    """시장 데이터 수집 (현재가, 변화율%)"""
+    symbol = SYMBOLS.get(symbol_key)
+    if not symbol:
         return None
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.fast_info
-        current = getattr(info, "last_price", None)
-        prev = getattr(info, "previous_close", None)
-        if current and prev:
-            return float(current), float(prev)
-    except Exception as e:
-        log.debug("yfinance 실패 %s: %s", symbol, e)
-    return None
-
-def calculate_change_percent(current: float, previous: float) -> float:
-    """변화율 계산"""
-    if previous == 0:
-        return 0.0
-    return ((current - previous) / previous) * 100.0
-
-def get_market_data(symbol: str) -> Optional[Tuple[float, float]]:
-    """시장 데이터 수집 (현재가, 변화율)"""
-    # Yahoo Finance API 시도
+    
+    # Yahoo Finance API
     quote = get_yahoo_quote(symbol)
     if quote:
-        # 정규장 데이터 우선
+        # 정규장 우선, 없으면 일반 가격
         current = quote.get("regularMarketPrice") or quote.get("price")
-        previous = quote.get("regularMarketPreviousClose") or quote.get("previousClose")
         
-        if current and previous:
-            change = calculate_change_percent(float(current), float(previous))
-            return float(current), change
+        # 한국 시장은 regularMarketPreviousClose 사용
+        if symbol_key in ["KOSPI", "KOSDAQ"]:
+            previous = quote.get("regularMarketPreviousClose") or quote.get("previousClose")
+        else:
+            # 미국은 previousClose 사용
+            previous = quote.get("previousClose")
+        
+        if current and previous and previous != 0:
+            change_pct = ((float(current) - float(previous)) / float(previous)) * 100
+            return float(current), change_pct
     
     # yfinance 백업
-    data = get_yf_data(symbol)
-    if data:
-        current, previous = data
-        change = calculate_change_percent(current, previous)
-        return current, change
+    if _YF_READY:
+        try:
+            ticker = yf.Ticker(symbol)
+            info = ticker.fast_info
+            current = getattr(info, "last_price", None)
+            previous = getattr(info, "previous_close", None)
+            if current and previous and previous != 0:
+                change_pct = ((float(current) - float(previous)) / float(previous)) * 100
+                return float(current), change_pct
+        except Exception as e:
+            log.debug("yfinance failed for %s: %s", symbol, e)
     
     return None
 
 # -------------------- 레벨 판정 --------------------
-def grade_level(change_pct: float, is_vix: bool = False) -> Optional[str]:
+def calculate_level(change_pct: float, is_vix: bool = False) -> Optional[str]:
     """변화율에 따른 레벨 판정"""
     abs_change = abs(change_pct)
     
@@ -212,20 +203,26 @@ def grade_level(change_pct: float, is_vix: bool = False) -> Optional[str]:
         return None
     
     if is_vix:
+        # VIX는 별도 기준
         if abs_change >= 10.0: return "LV3"
         if abs_change >= 7.0: return "LV2"
         if abs_change >= 5.0: return "LV1"
-        return None
     else:
+        # 일반 지수
         if abs_change >= 2.5: return "LV3"
         if abs_change >= 1.5: return "LV2"
         if abs_change >= 0.8: return "LV1"
-        return None
+    
+    return None
 
 # -------------------- 알림 전송 --------------------
-def send_alert(symbol: str, change_pct: float, level: str, note: str):
-    """센티넬 알림 전송"""
-    display_name = DISPLAY_NAMES.get(symbol, symbol)
+def send_alert(symbol_key: str, price: float, change_pct: float, level: str, note: str):
+    """센티넬로 알림 전송"""
+    if not SENTINEL_BASE_URL:
+        log.warning("SENTINEL_BASE_URL not configured")
+        return
+    
+    display_name = DISPLAY_NAMES.get(symbol_key, symbol_key)
     
     payload = {
         "index": display_name,
@@ -244,25 +241,22 @@ def send_alert(symbol: str, change_pct: float, level: str, note: str):
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=10)
         if r.ok:
-            log.info("✓ 알림: %s %s %.2f%% - %s", display_name, level, change_pct, note)
+            log.info("Alert sent: %s [%s] %.2f%% - %s", 
+                    display_name, level, change_pct, note)
         else:
-            log.error("알림 실패: %s", r.text)
+            log.error("Alert failed: %s", r.text)
     except Exception as e:
-        log.error("알림 전송 오류: %s", e)
+        log.error("Alert send error: %s", e)
 
-# -------------------- 메인 체크 로직 --------------------
+# -------------------- 메인 체크 --------------------
 def check_markets():
-    """시장 체크 및 알림"""
-    session = get_active_session()
+    """시장 체크 및 알림 처리"""
+    session = get_market_session()
+    log.info("===== Market Check [%s] =====", session)
     
     if session == "CLOSED":
-        log.info("시장 마감 시간 - 체크 생략")
+        log.info("Markets closed - skipping")
         return
-    
-    log.info("===== 시장 체크 (%s) =====", session)
-    
-    state = _load_state()
-    levels = state["levels"]
     
     # 체크할 심볼 결정
     symbols_to_check = []
@@ -271,37 +265,35 @@ def check_markets():
         symbols_to_check = ["KOSPI", "KOSDAQ"]
     elif session == "US":
         symbols_to_check = ["SPX", "NASDAQ", "VIX"]
-    elif session == "US_PRE":
-        symbols_to_check = ["ES", "NQ"]  # 선물만
+    elif session == "US_FUTURES":
+        symbols_to_check = ["ES", "NQ"]
+    
+    # 상태 로드
+    state = _load_state()
+    levels = state.get("levels", {})
     
     # 각 심볼 체크
-    for symbol in symbols_to_check:
+    for symbol_key in symbols_to_check:
         try:
-            # 실제 심볼 코드
-            actual_symbol = KR_SYMBOLS.get(symbol) or US_SYMBOLS.get(symbol)
-            if not actual_symbol:
-                continue
-            
             # 데이터 수집
-            data = get_market_data(actual_symbol)
+            data = get_market_data(symbol_key)
             if not data:
-                log.warning("%s 데이터 수집 실패", symbol)
+                log.warning("No data for %s", symbol_key)
                 continue
             
-            current_price, change_pct = data
+            price, change_pct = data
             
-            # VIX 여부 체크
-            is_vix = (symbol == "VIX")
+            # 레벨 계산
+            is_vix = (symbol_key == "VIX")
+            new_level = calculate_level(change_pct, is_vix)
+            old_level = levels.get(symbol_key)
             
-            # 레벨 판정
-            new_level = grade_level(change_pct, is_vix)
-            old_level = levels.get(symbol)
+            # 로그
+            log.info("%s: $%.2f (%.2f%%) [%s -> %s]",
+                    symbol_key, price, change_pct,
+                    old_level or "None", new_level or "Normal")
             
-            log.info("%s: %.2f (%.2f%%) [%s → %s]", 
-                     symbol, current_price, change_pct, 
-                     old_level or "없음", new_level or "정상")
-            
-            # 레벨 변경시만 알림
+            # 레벨 변경시 알림
             if new_level != old_level:
                 if not old_level and new_level:
                     note = "레벨 진입"
@@ -310,29 +302,38 @@ def check_markets():
                 else:
                     note = f"{old_level} → {new_level}"
                 
-                send_alert(symbol, change_pct, new_level, note)
-                levels[symbol] = new_level
-            
+                send_alert(symbol_key, price, change_pct, new_level, note)
+                levels[symbol_key] = new_level
+                
         except Exception as e:
-            log.error("%s 처리 오류: %s", symbol, e)
+            log.error("Error checking %s: %s", symbol_key, e)
     
     # 상태 저장
     state["levels"] = levels
+    state["last_check"] = _now_kst_iso()
     _save_state(state)
-    log.info("===== 체크 완료 =====")
+    
+    log.info("===== Check Complete =====")
 
 # -------------------- 메인 루프 --------------------
 def main():
-    log.info("=== Sentinel 시장 감시 시작 ===")
-    log.info("체크 간격: %d초", WATCH_INTERVAL)
+    log.info("=== Sentinel Market Watcher Started ===")
+    log.info("Check interval: %d seconds", WATCH_INTERVAL)
+    log.info("Sentinel URL: %s", SENTINEL_BASE_URL or "NOT SET")
     
+    # 초기 체크
+    try:
+        check_markets()
+    except Exception as e:
+        log.error("Initial check failed: %s", e)
+    
+    # 주기적 체크
     while True:
+        time.sleep(WATCH_INTERVAL)
         try:
             check_markets()
         except Exception as e:
-            log.error("체크 실패: %s", e)
-        
-        time.sleep(WATCH_INTERVAL)
+            log.error("Periodic check failed: %s", e)
 
 if __name__ == "__main__":
     main()
