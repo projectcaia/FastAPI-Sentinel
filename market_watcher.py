@@ -1,4 +1,4 @@
-# market_watcher.py — FGPT Sentinel 시장감시 워커 (최종 안정화 버전)
+# market_watcher.py — FGPT Sentinel 시장감시 워커 (실시간 수정 버전)
 # -*- coding: utf-8 -*-
 
 import os, time, json, logging, requests, math
@@ -37,8 +37,6 @@ def parse_float_env(key: str, default: float) -> float:
 
 # 주기/신선도
 WATCH_INTERVAL = parse_int_env("WATCH_INTERVAL_SEC", 1800)  # 30분
-MAX_STALENESS_SEC = parse_int_env("MAX_STALENESS_SEC", 1800)  # 30분 이내 데이터만 허용
-KR_MAX_STALENESS_SEC = parse_int_env("KR_MAX_STALENESS_SEC", 600)  # 한국은 10분 이내로 더 엄격
 VIX_FILTER_THRESHOLD = parse_float_env("VIX_FILTER_THRESHOLD", 0.8)  # VIX 필터 임계값
 
 STATE_PATH = os.getenv("WATCHER_STATE_PATH", "./market_state.json")
@@ -69,7 +67,7 @@ HUMAN_NAMES = {
 def human_name(sym: str) -> str:
     return HUMAN_NAMES.get(sym, sym)
 
-# 심볼 정의 - 한국 ETF 우선 (더 안정적)
+# 심볼 정의
 KR_SPOT_PRIORITY = ["069500.KS", "102110.KS", "^KS11"]  
 US_SPOT = ["^GSPC", "^IXIC", "^VIX"]
 FUTURES_SYMBOLS = ["ES=F", "NQ=F"]
@@ -83,9 +81,6 @@ def _now_kst_iso():
 
 def _utc_ts_now() -> float:
     return datetime.now(timezone.utc).timestamp()
-
-def _utc_to_kst(ts: float) -> datetime:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(timezone(timedelta(hours=9)))
 
 # ==================== 상태 파일 ====================
 def _save_state(state: dict):
@@ -111,7 +106,6 @@ H_COMMON = {
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
-    "If-None-Match": "*",  # 캐시 방지 추가
     "Referer": "https://finance.yahoo.com/",
     "Origin": "https://finance.yahoo.com",
 }
@@ -131,89 +125,41 @@ def _http_get(url: str, params=None, timeout=12, max_retry=3):
         raise last
     raise RuntimeError("HTTP 요청 실패")
 
-# ==================== 한국 시장 전용 데이터 수집 (강화) ====================
-def is_kr_market_open() -> bool:
-    """한국 정규장 시간 체크"""
-    now = _now_kst()
-    if now.weekday() >= 5:  # 주말
-        return False
-    hhmm = now.hour * 100 + now.minute
-    return 900 <= hhmm <= 1530
-
-def get_kr_realtime_data(symbol: str) -> tuple[float | None, bool, str]:
-    """한국 시장 실시간 데이터 수집 - 3중 검증"""
+# ==================== 데이터 수집 (단순화) ====================
+def get_realtime_data(symbol: str) -> tuple[float | None, str]:
+    """실시간 데이터 수집 - yfinance 우선"""
     
-    # 정규장 시간 체크
-    if not is_kr_market_open():
-        log.debug("%s: 한국 정규장 시간 아님", symbol)
-        return None, False, "market_closed"
-    
-    # 1차: Yahoo Chart API (분봉 우선 - 가장 신뢰성 높음)
-    try:
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
-        params = {
-            "interval": "2m",  # 2분봉
-            "range": "1d",
-            "includePrePost": "false",  # 정규장만
-            "_nocache": str(int(time.time()))  # 캐시 방지
-        }
-        r = _http_get(url, params=params)
-        data = r.json()
-        
-        chart = data.get("chart", {}).get("result", [{}])[0]
-        meta = chart.get("meta", {})
-        
-        # 메타데이터에서 현재가
-        current_price = meta.get("regularMarketPrice")
-        prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
-        timestamp = meta.get("regularMarketTime")
-        volume = meta.get("regularMarketVolume", 0)
-        
-        # 거래량 체크 (거래량 0이면 장 마감)
-        if volume and volume > 0:
-            if current_price and prev_close and timestamp:
-                age_sec = _utc_ts_now() - float(timestamp)
-                is_fresh = age_sec <= KR_MAX_STALENESS_SEC
+    # 1차: yfinance (가장 신뢰성 높음)
+    if _YF_READY:
+        try:
+            ticker = yf.download(symbol, period="1d", interval="1m", progress=False, prepost=True)
+            if ticker is not None and len(ticker) > 0:
+                current = float(ticker["Close"].iloc[-1])
                 
-                if is_fresh:
-                    change_pct = (float(current_price) - float(prev_close)) / float(prev_close) * 100.0
-                    kst_time = _utc_to_kst(float(timestamp)).strftime("%H:%M:%S")
-                    log.info("한국 Chart: %s = %.2f%% (가격: %.0f, 전일: %.0f, 시각: %s KST, 거래량: %d)", 
-                            symbol, change_pct, float(current_price), float(prev_close), kst_time, volume)
-                    return change_pct, True, f"chart_{kst_time}"
-        
-        # 캔들 데이터 체크
-        quotes = chart.get("indicators", {}).get("quote", [{}])[0]
-        closes = quotes.get("close", [])
-        volumes = quotes.get("volume", [])
-        timestamps = chart.get("timestamp", [])
-        
-        if closes and timestamps:
-            # 마지막 유효 데이터 (거래량 있는 것만)
-            valid_data = [(t, c, v) for t, c, v in zip(timestamps, closes, volumes or [0]*len(closes)) 
-                         if c is not None and v and v > 0]
-            if valid_data:
-                last_ts, last_close, last_vol = valid_data[-1]
-                age = _utc_ts_now() - last_ts
+                # 전일 종가 가져오기
+                info = yf.Ticker(symbol).info
+                prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
                 
-                if age <= KR_MAX_STALENESS_SEC and prev_close and prev_close != 0:
-                    change_pct = (last_close - float(prev_close)) / float(prev_close) * 100.0
-                    kst_time = _utc_to_kst(last_ts).strftime("%H:%M:%S")
-                    log.info("한국 Chart 캔들: %s = %.2f%% (시각: %s, 거래량: %d)", 
-                            symbol, change_pct, kst_time, last_vol)
-                    return change_pct, True, f"candle_{kst_time}"
-                    
-    except Exception as e:
-        log.debug("한국 Chart 실패(%s): %s", symbol, e)
+                if not prev:
+                    # 2일치 데이터로 전일 종가 추출
+                    daily = yf.download(symbol, period="2d", interval="1d", progress=False)
+                    if daily is not None and len(daily) >= 2:
+                        prev = float(daily["Close"].iloc[-2])
+                
+                if prev and prev != 0:
+                    change_pct = (current - prev) / prev * 100.0
+                    log.debug("%s yfinance: 현재=%.2f, 전일=%.2f, 변화=%.2f%%", 
+                            symbol, current, prev, change_pct)
+                    return change_pct, "yfinance"
+        except Exception as e:
+            log.debug("yfinance 실패(%s): %s", symbol, e)
     
     # 2차: Yahoo Quote API
     try:
         url = "https://query2.finance.yahoo.com/v7/finance/quote"
         params = {
             "symbols": symbol,
-            "crumb": str(int(time.time())),
-            "formatted": "false",
-            "_nocache": str(int(time.time()))
+            "crumb": str(int(time.time()))
         }
         r = _http_get(url, params=params)
         data = r.json()
@@ -222,317 +168,98 @@ def get_kr_realtime_data(symbol: str) -> tuple[float | None, bool, str]:
         if items:
             q = items[0]
             
-            # marketState 체크
-            market_state = q.get("marketState", "")
-            if market_state != "REGULAR":
-                log.debug("%s: 정규장 아님 (상태: %s)", symbol, market_state)
-                # 정규장이 아니어도 최근 데이터면 사용
+            # regularMarketChangePercent 직접 사용
+            change_pct = q.get("regularMarketChangePercent")
+            if change_pct is not None:
+                log.debug("%s Yahoo Quote: %.2f%%", symbol, change_pct)
+                return float(change_pct), "yahoo_quote"
             
+            # 계산
             price = q.get("regularMarketPrice")
             prev = q.get("regularMarketPreviousClose")
-            timestamp = q.get("regularMarketTime")
-            volume = q.get("regularMarketVolume", 0)
-            
-            if price and prev and timestamp and volume > 0:
-                age_sec = _utc_ts_now() - float(timestamp)
-                is_fresh = age_sec <= KR_MAX_STALENESS_SEC
-                
-                if is_fresh:
-                    change_pct = (float(price) - float(prev)) / float(prev) * 100.0
-                    kst_time = _utc_to_kst(float(timestamp)).strftime("%H:%M:%S")
-                    log.info("한국 Quote: %s = %.2f%% (시각: %s KST, 상태: %s)", 
-                            symbol, change_pct, kst_time, market_state)
-                    return change_pct, True, f"quote_{kst_time}"
-                    
-    except Exception as e:
-        log.debug("한국 Quote 실패(%s): %s", symbol, e)
-    
-    # 3차: yfinance
-    if _YF_READY:
-        try:
-            ticker = yf.Ticker(symbol)
-            
-            # 오늘 분봉 데이터
-            df = ticker.history(period="1d", interval="2m", prepost=False, actions=False)
-            if df is not None and len(df) > 0:
-                last_time = df.index[-1]
-                last_close = float(df["Close"].iloc[-1])
-                last_volume = float(df["Volume"].iloc[-1]) if "Volume" in df else 0
-                
-                if last_volume > 0:  # 거래량 체크
-                    now = datetime.now(timezone.utc)
-                    if hasattr(last_time, 'tz_localize'):
-                        last_time_utc = last_time.tz_localize('UTC')
-                    else:
-                        last_time_utc = last_time
-                    
-                    age_sec = (now - last_time_utc).total_seconds()
-                    
-                    if age_sec <= KR_MAX_STALENESS_SEC:
-                        info = ticker.info
-                        prev = info.get("previousClose") or info.get("regularMarketPreviousClose")
-                        
-                        if prev and prev != 0:
-                            change_pct = (last_close - prev) / prev * 100.0
-                            kst_time = _utc_to_kst(last_time_utc.timestamp()).strftime("%H:%M:%S")
-                            log.info("한국 yfinance: %s = %.2f%% (시각: %s KST)", 
-                                    symbol, change_pct, kst_time)
-                            return change_pct, True, f"yf_{kst_time}"
-                            
-        except Exception as e:
-            log.debug("한국 yfinance 실패(%s): %s", symbol, e)
-    
-    return None, False, "failed"
-
-def get_kr_spot_data() -> tuple[float | None, str, str]:
-    """한국 현물 데이터 수집 - 우선순위대로 시도"""
-    
-    for sym in KR_SPOT_PRIORITY:
-        change_pct, is_fresh, source = get_kr_realtime_data(sym)
-        if change_pct is not None and is_fresh:
-            return change_pct, sym, source
-        else:
-            log.debug("%s: 실시간 데이터 수집 실패 (%s)", human_name(sym), source)
-    
-    log.warning("한국 시장: 모든 심볼 데이터 수집 실패")
-    return None, "", "none"
-
-# ==================== 미국 시장 데이터 수집 (강화) ====================
-def is_us_market_open() -> bool:
-    """미국 정규장 시간 체크"""
-    now = _now_kst()
-    if now.weekday() >= 5:
-        return False
-    
-    hour = now.hour
-    minute = now.minute
-    month = now.month
-    
-    # DST 정확한 계산 (3월 둘째 일요일 ~ 11월 첫째 일요일)
-    is_dst = (month > 3 and month < 11) or \
-             (month == 3 and now.day >= 8) or \
-             (month == 11 and now.day <= 7)
-    
-    if is_dst:
-        # 22:30 ~ 05:00 KST
-        if hour == 22 and minute >= 30:
-            return True
-        elif hour >= 23 or hour < 5:
-            return True
-    else:
-        # 23:30 ~ 06:00 KST
-        if hour == 23 and minute >= 30:
-            return True
-        elif hour >= 0 and hour < 6:
-            return True
-    
-    return False
-
-def get_us_spot_data(symbol: str) -> tuple[float | None, bool]:
-    """미국 현물 데이터 수집 - 실시간 캔들 우선"""
-    
-    # 1차: Chart API - 캔들 데이터 우선!
-    try:
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
-        params = {
-            "interval": "1m",  # 1분봉으로 변경 (더 실시간)
-            "range": "1d",
-            "includePrePost": "true",
-            "_nocache": str(int(time.time()))
-        }
-        r = _http_get(url, params=params)
-        data = r.json()
-        
-        chart = data.get("chart", {}).get("result", [{}])[0]
-        
-        # 캔들 데이터 먼저 체크!
-        quotes = chart.get("indicators", {}).get("quote", [{}])[0]
-        closes = quotes.get("close", [])
-        timestamps = chart.get("timestamp", [])
-        
-        if closes and timestamps:
-            # 마지막 유효 캔들
-            valid_data = [(t, c) for t, c in zip(timestamps, closes) if c is not None]
-            if valid_data:
-                last_ts, last_close = valid_data[-1]
-                age = _utc_ts_now() - last_ts
-                
-                # 30분 이내 데이터만
-                if age <= MAX_STALENESS_SEC:
-                    # 전일 종가
-                    meta = chart.get("meta", {})
-                    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
-                    
-                    if prev_close and prev_close != 0:
-                        change_pct = (last_close - float(prev_close)) / float(prev_close) * 100.0
-                        kst_time = _utc_to_kst(last_ts).strftime("%H:%M:%S")
-                        log.info("미국 실시간 %s: 현재=%.2f, 전일=%.2f, 변화=%.2f%% (시각: %s KST, age=%ds)", 
-                                symbol, last_close, prev_close, change_pct, kst_time, age)
-                        return change_pct, True
-                else:
-                    log.warning("%s: 캔들 데이터 오래됨 (%d초)", symbol, age)
-        
-        # 캔들 없으면 meta 사용 (폴백)
-        meta = chart.get("meta", {})
-        current_price = meta.get("regularMarketPrice")
-        prev_close = meta.get("previousClose")
-        timestamp = meta.get("regularMarketTime")
-        
-        if current_price and prev_close and timestamp:
-            age_sec = _utc_ts_now() - float(timestamp)
-            if age_sec <= MAX_STALENESS_SEC and prev_close != 0:
-                change_pct = (float(current_price) - float(prev_close)) / float(prev_close) * 100.0
-                log.warning("미국 메타(전일?) %s: %.2f%% (age=%ds) - 실시간 아닐 수 있음", 
-                           symbol, change_pct, age_sec)
-                return change_pct, True
-                
-    except Exception as e:
-        log.error("미국 Chart 실패(%s): %s", symbol, e)
-    
-    # 2차: Quote API
-    try:
-        url = "https://query2.finance.yahoo.com/v7/finance/quote"
-        params = {
-            "symbols": symbol,
-            "crumb": str(int(time.time())),
-            "_nocache": str(int(time.time()))
-        }
-        r = _http_get(url, params=params)
-        data = r.json()
-        
-        items = data.get("quoteResponse", {}).get("result", [])
-        if items:
-            q = items[0]
-            
-            # regularMarket 데이터 체크
-            price = q.get("regularMarketPrice")
-            prev = q.get("regularMarketPreviousClose")
-            timestamp = q.get("regularMarketTime")
-            
-            if price and prev and timestamp:
-                age_sec = _utc_ts_now() - float(timestamp)
-                if age_sec <= MAX_STALENESS_SEC and prev != 0:
-                    change_pct = (float(price) - float(prev)) / float(prev) * 100.0
-                    kst_time = _utc_to_kst(float(timestamp)).strftime("%H:%M:%S")
-                    log.info("미국 Quote %s: %.2f%% (시각: %s KST)", symbol, change_pct, kst_time)
-                    return change_pct, True
-                else:
-                    log.warning("%s Quote: 데이터 오래됨 (%d초)", symbol, age_sec)
-                    
-    except Exception as e:
-        log.error("미국 Quote 실패(%s): %s", symbol, e)
-    
-    return None, False
-
-# ==================== 선물 데이터 수집 (기존 유지) ====================
-def get_futures_data(symbol: str) -> tuple[float | None, bool, str]:
-    """선물 데이터 수집 - 여러 방법 시도"""
-    
-    # 1차: Yahoo Chart API
-    try:
-        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
-        params = {
-            "interval": "2m",
-            "range": "1d",
-            "includePrePost": "true",
-            "events": "div,split",
-            "_nocache": str(int(time.time()))
-        }
-        
-        headers = {
-            **H_COMMON,
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
-        }
-        
-        r = requests.get(url, params=params, headers=headers, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        
-        chart = data.get("chart", {}).get("result", [{}])[0]
-        meta = chart.get("meta", {})
-        
-        current_price = meta.get("regularMarketPrice")
-        prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
-        
-        if current_price and prev_close and prev_close != 0:
-            change_pct = (float(current_price) - float(prev_close)) / float(prev_close) * 100.0
-            log.debug("Chart API 선물 %s: %.2f%%", symbol, change_pct)
-            return change_pct, True, "chart_meta"
-            
-    except Exception as e:
-        log.debug("Chart API 선물 실패(%s): %s", symbol, e)
-    
-    # 2차: Quote API
-    try:
-        url = "https://query2.finance.yahoo.com/v7/finance/quote"
-        params = {
-            "symbols": symbol,
-            "fields": "symbol,regularMarketPrice,regularMarketChangePercent,regularMarketPreviousClose,regularMarketTime",
-            "crumb": str(int(time.time())),
-            "_nocache": str(int(time.time()))
-        }
-        
-        r = _http_get(url, params=params)
-        data = r.json()
-        
-        items = data.get("quoteResponse", {}).get("result", [])
-        if items:
-            q = items[0]
-            price = q.get("regularMarketPrice")
-            prev = q.get("regularMarketPreviousClose")
-            
             if price and prev and prev != 0:
                 change_pct = (float(price) - float(prev)) / float(prev) * 100.0
-                log.debug("Quote API 선물 %s: %.2f%%", symbol, change_pct)
-                return change_pct, True, "quote"
+                log.debug("%s Yahoo 계산: %.2f%%", symbol, change_pct)
+                return change_pct, "yahoo_calc"
                 
     except Exception as e:
-        log.debug("Quote API 선물 실패(%s): %s", symbol, e)
+        log.debug("Yahoo Quote 실패(%s): %s", symbol, e)
     
-    return None, False, "failed"
+    return None, "failed"
+
+def get_futures_data(symbol: str) -> tuple[float | None, str]:
+    """선물 데이터 수집 - Chart API 메타 우선"""
+    
+    # Chart API (선물은 이게 제일 정확)
+    try:
+        url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
+        params = {
+            "interval": "5m",
+            "range": "1d"
+        }
+        
+        r = _http_get(url, params=params)
+        data = r.json()
+        
+        chart = data.get("chart", {}).get("result", [{}])[0]
+        meta = chart.get("meta", {})
+        
+        current = meta.get("regularMarketPrice")
+        prev = meta.get("previousClose") or meta.get("chartPreviousClose")
+        
+        if current and prev and prev != 0:
+            change_pct = (float(current) - float(prev)) / float(prev) * 100.0
+            log.debug("선물 %s: %.2f%%", symbol, change_pct)
+            return change_pct, "chart"
+            
+    except Exception as e:
+        log.debug("선물 Chart 실패(%s): %s", symbol, e)
+    
+    # 폴백: 일반 데이터 수집
+    return get_realtime_data(symbol)
 
 # ==================== 시장 시간 판정 ====================
-def is_market_holiday() -> bool:
-    """주말/휴일 체크"""
-    now = _now_kst()
-    if now.weekday() >= 5:
-        return True
-    return False
-
 def current_session() -> str:
     """현재 세션 판정"""
-    if is_market_holiday():
+    now = _now_kst()
+    
+    # 주말
+    if now.weekday() >= 5:
         return "CLOSED"
     
-    now = _now_kst()
     hhmm = now.hour * 100 + now.minute
     
     # 한국 정규장: 09:00 ~ 15:30
     if 900 <= hhmm <= 1530:
         return "KR"
     
-    # 미국 정규장 체크
-    if is_us_market_open():
-        return "US"
+    # 미국 정규장 (서머타임): 22:30 ~ 05:00
+    # 미국 정규장 (표준시): 23:30 ~ 06:00
+    month = now.month
+    is_dst = 3 <= month <= 11
     
-    # 선물 시간 (한국 장 마감 후 ~ 미국 장 시작 전)
+    if is_dst:
+        if (hhmm >= 2230) or (hhmm < 500):
+            return "US"
+    else:
+        if (hhmm >= 2330) or (hhmm < 600):
+            return "US"
+    
+    # 선물 시간
     if 1530 < hhmm < 2230:
         return "FUTURES"
     
     return "CLOSED"
 
-# ==================== 레벨 판정 (수정) ====================
+# ==================== 레벨 판정 ====================
 def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
     a = abs(delta_pct)
     
     if is_vix:
-        # VIX는 일반 지수의 약 10배 정도 움직임
-        # 지수 0.8% = VIX 8% 정도로 매칭
-        if a >= 25.0: return "LV3"  # ±25% 이상 (지수 2.5%에 대응)
-        if a >= 15.0: return "LV2"  # ±15% 이상 (지수 1.5%에 대응)  
-        if a >= 8.0:  return "LV1"  # ±8% 이상 (지수 0.8%에 대응)
+        # VIX 레벨 (높게 설정)
+        if a >= 25.0: return "LV3"
+        if a >= 15.0: return "LV2"
+        if a >= 8.0:  return "LV1"
     else:
         # 일반 지수
         if a >= 2.5: return "LV3"
@@ -582,75 +309,58 @@ def check_and_alert():
         return
     
     if sess == "KR":
-        # ★★★ 한국 정규장 - 가장 중요 ★★★
-        log.info("한국 정규장 데이터 수집 시작...")
-        delta, tag, source = get_kr_spot_data()
+        # 한국 정규장
+        log.info("한국 정규장 데이터 수집...")
         
-        if delta is None:
-            log.warning("한국 시장 데이터 수집 실패 - 정규장 시간이 아니거나 데이터 없음")
-            return
-        
-        lvl = grade_level(delta)
-        prev = state.get("ΔK200")
-        name = human_name(tag)
-        
-        log.info("★ %s: %.2f%% [%s → %s] (소스: %s)", name, delta, prev or "없음", lvl or "정상", source)
-        
-        if lvl != prev:
-            note = ("레벨 진입" if (not prev and lvl) else
-                   "레벨 해제" if (prev and not lvl) else
-                   f"{prev} → {lvl}")
-            note += f" (소스: {source})"
-            post_alert(delta, lvl, tag, note)
-            state["ΔK200"] = lvl
+        for sym in KR_SPOT_PRIORITY:
+            delta, source = get_realtime_data(sym)
+            if delta is not None:
+                lvl = grade_level(delta)
+                prev = state.get("ΔK200")
+                name = human_name(sym)
+                
+                log.info("%s: %.2f%% [%s → %s] (소스: %s)", 
+                        name, delta, prev or "없음", lvl or "정상", source)
+                
+                if lvl != prev:
+                    note = ("레벨 진입" if (not prev and lvl) else
+                           "레벨 해제" if (prev and not lvl) else
+                           f"{prev} → {lvl}")
+                    post_alert(delta, lvl, sym, note)
+                    state["ΔK200"] = lvl
+                break
+        else:
+            log.warning("한국 시장 데이터 수집 실패")
     
     elif sess == "US":
         # 미국 정규장
         log.info("미국 정규장 데이터 수집...")
         
-        # S&P, NASDAQ 먼저 수집 (VIX 필터용)
-        spx_delta, spx_fresh = get_us_spot_data("^GSPC")
-        ndx_delta, ndx_fresh = get_us_spot_data("^IXIC")
+        # S&P, NASDAQ 먼저 수집
+        spx_delta, _ = get_realtime_data("^GSPC")
+        ndx_delta, _ = get_realtime_data("^IXIC")
         
-        # 지수 최대 변동폭 계산
         max_index_move = 0.0
         if spx_delta is not None and ndx_delta is not None:
             max_index_move = max(abs(spx_delta), abs(ndx_delta))
-            log.info("지수 변동: S&P %.2f%%, NASDAQ %.2f%% (최대: %.2f%%)", 
-                    spx_delta, ndx_delta, max_index_move)
+            log.info("지수 변동: S&P %.2f%%, NASDAQ %.2f%%", spx_delta, ndx_delta)
         
         for sym in US_SPOT:
-            delta, is_fresh = get_us_spot_data(sym)
-            if delta is None or not is_fresh:
+            delta, source = get_realtime_data(sym)
+            if delta is None:
                 log.warning("%s 데이터 수집 실패", human_name(sym))
                 continue
             
             is_vix = (sym == "^VIX")
             
-            # VIX 필터: 지수가 0.8% 미만 변동인데 VIX만 튀면 무시
-            if is_vix:
-                if max_index_move < VIX_FILTER_THRESHOLD:  # 0.8%
-                    log.info("VIX 필터 작동: 지수 변동 %.2f%% < %.2f%% → VIX %.2f%% 무시", 
-                            max_index_move, VIX_FILTER_THRESHOLD, delta)
-                    state["ΔVIX"] = None
-                    continue
+            # VIX 필터
+            if is_vix and max_index_move < VIX_FILTER_THRESHOLD:
+                log.info("VIX 필터: 지수 %.2f%% < %.2f%% → VIX %.2f%% 무시", 
+                        max_index_move, VIX_FILTER_THRESHOLD, delta)
+                state["ΔVIX"] = None
+                continue
             
-            # VIX는 다른 레벨 기준 적용
-            if is_vix:
-                # VIX 전용 레벨 (지수의 약 10배)
-                a = abs(delta)
-                if a >= 25.0: 
-                    lvl = "LV3"
-                elif a >= 15.0: 
-                    lvl = "LV2"
-                elif a >= 8.0: 
-                    lvl = "LV1"
-                else:
-                    lvl = None
-            else:
-                # 일반 지수 레벨
-                lvl = grade_level(delta, is_vix=False)
-            
+            lvl = grade_level(delta, is_vix=is_vix)
             key = "ΔVIX" if is_vix else ("ΔSPX" if sym == "^GSPC" else "ΔNASDAQ")
             prev = state.get(key)
             name = human_name(sym)
@@ -671,11 +381,11 @@ def check_and_alert():
         log.info("선물 시장 데이터 수집...")
         
         for key, sym in [("ΔES_FUT", "ES=F"), ("ΔNQ_FUT", "NQ=F")]:
-            delta, is_fresh, source = get_futures_data(sym)
+            delta, source = get_futures_data(sym)
             name = human_name(sym)
             
-            if delta is None or not is_fresh:
-                log.info("%s: 데이터 없음/오래됨", name)
+            if delta is None:
+                log.info("%s: 데이터 없음", name)
                 state[key] = None
                 continue
             
@@ -698,21 +408,20 @@ def check_and_alert():
                 except:
                     pass
             
-            note = f"선물 시장 변동 (소스: {source})"
+            note = f"선물 시장 변동"
             post_alert(delta, "PRE", sym, note, kind="PRE")
             log.info("%s: %.2f%% [PRE 알림]", name, delta)
             state[key] = delta
     
     _save_state(state)
     log.info("===== 체크 완료 =====")
+
 # ==================== 메인 루프 ====================
 def run_loop():
-    log.info("=== Sentinel 시장감시 시작 (최종 안정화 버전) ===")
+    log.info("=== Sentinel 시장감시 시작 ===")
     log.info("간격: %d초", WATCH_INTERVAL)
-    log.info("신선도: 일반 %d초, 한국 %d초 이내", MAX_STALENESS_SEC, KR_MAX_STALENESS_SEC)
-    log.info("임계값 - 일반: 0.8%/1.5%/2.5%, VIX: 5%/7%/10%")
+    log.info("임계값 - 일반: 0.8%/1.5%/2.5%, VIX: 8%/15%/25%")
     log.info("VIX 필터: 지수 변동 %.1f%% 미만시 무시", VIX_FILTER_THRESHOLD)
-    log.info("한국 우선순위: %s", " → ".join([human_name(s) for s in KR_SPOT_PRIORITY]))
     
     # 초기 체크
     try:
