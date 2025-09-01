@@ -329,45 +329,71 @@ def is_us_market_open() -> bool:
     return False
 
 def get_us_spot_data(symbol: str) -> tuple[float | None, bool]:
-    """미국 현물 데이터 수집"""
+    """미국 현물 데이터 수집 - 실시간 캔들 우선"""
     
-    # 1차: Chart API
+    # 1차: Chart API - 캔들 데이터 우선!
     try:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
         params = {
-            "interval": "5m",
+            "interval": "1m",  # 1분봉으로 변경 (더 실시간)
             "range": "1d",
-            "includePrePost": "true",  # 항상 true로 변경
+            "includePrePost": "true",
             "_nocache": str(int(time.time()))
         }
         r = _http_get(url, params=params)
         data = r.json()
         
         chart = data.get("chart", {}).get("result", [{}])[0]
+        
+        # 캔들 데이터 먼저 체크!
+        quotes = chart.get("indicators", {}).get("quote", [{}])[0]
+        closes = quotes.get("close", [])
+        timestamps = chart.get("timestamp", [])
+        
+        if closes and timestamps:
+            # 마지막 유효 캔들
+            valid_data = [(t, c) for t, c in zip(timestamps, closes) if c is not None]
+            if valid_data:
+                last_ts, last_close = valid_data[-1]
+                age = _utc_ts_now() - last_ts
+                
+                # 30분 이내 데이터만
+                if age <= MAX_STALENESS_SEC:
+                    # 전일 종가
+                    meta = chart.get("meta", {})
+                    prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
+                    
+                    if prev_close and prev_close != 0:
+                        change_pct = (last_close - float(prev_close)) / float(prev_close) * 100.0
+                        kst_time = _utc_to_kst(last_ts).strftime("%H:%M:%S")
+                        log.info("미국 실시간 %s: 현재=%.2f, 전일=%.2f, 변화=%.2f%% (시각: %s KST, age=%ds)", 
+                                symbol, last_close, prev_close, change_pct, kst_time, age)
+                        return change_pct, True
+                else:
+                    log.warning("%s: 캔들 데이터 오래됨 (%d초)", symbol, age)
+        
+        # 캔들 없으면 meta 사용 (폴백)
         meta = chart.get("meta", {})
+        current_price = meta.get("regularMarketPrice")
+        prev_close = meta.get("previousClose")
+        timestamp = meta.get("regularMarketTime")
         
-        # 여러 가격 필드 체크
-        current_price = meta.get("regularMarketPrice") or meta.get("price")
-        prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
-        timestamp = meta.get("regularMarketTime") or meta.get("currentTradingPeriod", {}).get("regular", {}).get("start")
-        
-        if current_price and prev_close:
-            # 타임스탬프 없어도 계산
-            if prev_close != 0:
+        if current_price and prev_close and timestamp:
+            age_sec = _utc_ts_now() - float(timestamp)
+            if age_sec <= MAX_STALENESS_SEC and prev_close != 0:
                 change_pct = (float(current_price) - float(prev_close)) / float(prev_close) * 100.0
-                log.info("미국 Chart %s: 현재=%.2f, 전일=%.2f, 변화=%.2f%%", 
-                        symbol, current_price, prev_close, change_pct)
+                log.warning("미국 메타(전일?) %s: %.2f%% (age=%ds) - 실시간 아닐 수 있음", 
+                           symbol, change_pct, age_sec)
                 return change_pct, True
                 
     except Exception as e:
-        log.error("미국 Chart 실패(%s): %s", symbol, e)  # error로 상세 로그
+        log.error("미국 Chart 실패(%s): %s", symbol, e)
     
     # 2차: Quote API
     try:
         url = "https://query2.finance.yahoo.com/v7/finance/quote"
         params = {
             "symbols": symbol,
-            "fields": "symbol,regularMarketPrice,regularMarketChangePercent,regularMarketPreviousClose,price,previousClose",
             "crumb": str(int(time.time())),
             "_nocache": str(int(time.time()))
         }
@@ -378,24 +404,23 @@ def get_us_spot_data(symbol: str) -> tuple[float | None, bool]:
         if items:
             q = items[0]
             
-            # 여러 필드 체크
-            price = q.get("regularMarketPrice") or q.get("price")
-            prev = q.get("regularMarketPreviousClose") or q.get("previousClose")
-            change_pct_direct = q.get("regularMarketChangePercent")
+            # regularMarket 데이터 체크
+            price = q.get("regularMarketPrice")
+            prev = q.get("regularMarketPreviousClose")
+            timestamp = q.get("regularMarketTime")
             
-            # 직접 제공되는 변화율 우선
-            if change_pct_direct is not None:
-                log.info("미국 Quote %s: %.2f%% (직접)", symbol, change_pct_direct)
-                return float(change_pct_direct), True
-            
-            # 계산
-            if price and prev and prev != 0:
-                change_pct = (float(price) - float(prev)) / float(prev) * 100.0
-                log.info("미국 Quote %s: %.2f%% (계산)", symbol, change_pct)
-                return change_pct, True
+            if price and prev and timestamp:
+                age_sec = _utc_ts_now() - float(timestamp)
+                if age_sec <= MAX_STALENESS_SEC and prev != 0:
+                    change_pct = (float(price) - float(prev)) / float(prev) * 100.0
+                    kst_time = _utc_to_kst(float(timestamp)).strftime("%H:%M:%S")
+                    log.info("미국 Quote %s: %.2f%% (시각: %s KST)", symbol, change_pct, kst_time)
+                    return change_pct, True
+                else:
+                    log.warning("%s Quote: 데이터 오래됨 (%d초)", symbol, age_sec)
                     
     except Exception as e:
-        log.error("미국 Quote 실패(%s): %s", symbol, e)  # error로 상세 로그
+        log.error("미국 Quote 실패(%s): %s", symbol, e)
     
     return None, False
 
