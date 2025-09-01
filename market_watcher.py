@@ -40,17 +40,35 @@ if YF_ENABLED:
     except Exception as e:
         log.warning("yfinance 로드 실패: %s", e)
 
-# 한국 지수 심볼
+# 한국 지수 심볼 및 이름
 KR = {
     "KOSPI": "^KS11",
     "K200_ETF1": "069500.KS",
     "K200_ETF2": "102110.KS",
     "KOSDAQ": "^KQ11"
 }
-# 미국 지수 심볼
+
+KR_NAMES = {
+    "KOSPI": "한국 시장: 코스피",
+    "K200_ETF": "한국 시장: KODEX 200",
+    "KOSDAQ": "한국 시장: 코스닥"
+}
+
+# 미국 지수 심볼 및 이름
 US = {
-    "SPX": "^GSPC", "NDX": "^IXIC", "VIX": "^VIX",
-    "ES": "ES=F", "NQ": "NQ=F"
+    "SPX": "^GSPC", 
+    "NDX": "^IXIC", 
+    "VIX": "^VIX",
+    "ES": "ES=F", 
+    "NQ": "NQ=F"
+}
+
+US_NAMES = {
+    "SPX": "미국 S&P500",
+    "NDX": "미국 NASDAQ",
+    "VIX": "미국 VIX: 변동성지수",
+    "ES": "미국 S&P500 선물",
+    "NQ": "미국 NASDAQ 선물"
 }
 
 # intraday 데이터 신선도 (초)
@@ -238,13 +256,17 @@ def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
     return None
 
 # -------------------- 알림 --------------------
-def post_alert(index_name: str, delta_pct: float, level: str | None, source: str, note: str):
+def post_alert(index_name: str, delta_pct: float, level: str | None, display_name: str, note: str):
+    """
+    index_name: 내부 식별자
+    display_name: 사용자에게 보여질 이름
+    """
     payload = {
-        "index": index_name,
+        "index": display_name,  # 사용자에게 보여질 이름으로 변경
         "level": level or "CLEARED",
         "delta_pct": round(delta_pct, 2) if delta_pct is not None else None,
         "triggered_at": _now_kst_iso(),
-        "note": f"{note} [{source}]",
+        "note": note,
     }
     headers = {"Content-Type": "application/json"}
     if SENTINEL_KEY: headers["x-sentinel-key"] = SENTINEL_KEY
@@ -252,7 +274,7 @@ def post_alert(index_name: str, delta_pct: float, level: str | None, source: str
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=15)
         if r.ok:
-            log.info("알림 전송: %s %s %.2f%% (%s)", index_name, level or "CLEARED", delta_pct or 0, note)
+            log.info("알림 전송: %s %s %.2f%% (%s)", display_name, level or "CLEARED", delta_pct or 0, note)
         else:
             log.error("알림 실패: %s %s", r.status_code, r.text)
     except Exception as e:
@@ -269,41 +291,48 @@ def check_and_alert():
             delta, source = get_kr_delta()
             level = grade_level(delta)
             prev = state.get("KR_LEVEL")
+            display_name = KR_NAMES.get(source, source)
             log.info("KR(%s): %.2f%% (현재: %s, 이전: %s)", source, delta, level or "정상", prev or "정상")
             if level != prev:
                 note = ("레벨 진입" if not prev else
                         "레벨 해제" if not level else
                         f"{prev}→{level}")
-                idx = "ΔK200" if source.startswith("K200") else "ΔKOSPI"
-                post_alert(idx, delta, level, source, note)
+                post_alert(source, delta, level, display_name, note)
                 state["KR_LEVEL"] = level
         except Exception as e:
             log.error("KR 수집 실패: %s", e)
     else:
         mo = is_us_market_open()
         log.info("US: %s", "개장" if mo else "마감(선물)")
-        symbols = (
-            [("ΔSPX", US["SPX"], "S&P500", False),
-             ("ΔNASDAQ", US["NDX"], "NASDAQ", False),
-             ("ΔVIX", US["VIX"], "VIX", True)]
-            if mo else
-            [("ΔES", US["ES"], "S&P500 선물", False),
-             ("ΔNQ", US["NQ"], "NASDAQ 선물", False)]
-        )
-        for idx_name, sym, label, is_vix in symbols:
+        
+        # 심볼 매핑 정리
+        if mo:
+            symbols = [
+                ("SPX", US["SPX"], False),
+                ("NDX", US["NDX"], False),
+                ("VIX", US["VIX"], True)
+            ]
+        else:
+            symbols = [
+                ("ES", US["ES"], False),
+                ("NQ", US["NQ"], False)
+            ]
+        
+        for key, sym, is_vix in symbols:
             try:
                 delta = get_us_delta(sym)
                 level = grade_level(delta, is_vix)
-                prev  = state.get(idx_name)
-                log.info("US %s: %.2f%% (현재: %s, 이전: %s)", label, delta, level or "정상", prev or "정상")
+                prev = state.get(key)
+                display_name = US_NAMES.get(key, key)
+                log.info("US %s: %.2f%% (현재: %s, 이전: %s)", key, delta, level or "정상", prev or "정상")
                 if level != prev:
                     note = ("레벨 진입" if not prev else
                             "레벨 해제" if not level else
                             f"{prev}→{level}")
-                    post_alert(idx_name, delta, level, sym, note)
-                    state[idx_name] = level
+                    post_alert(key, delta, level, display_name, note)
+                    state[key] = level
             except Exception as e:
-                log.warning("US %s 실패: %s", label, e)
+                log.warning("US %s 실패: %s", key, e)
 
     _save_state(state)
     log.info("===== 시장 체크 완료 =====")
