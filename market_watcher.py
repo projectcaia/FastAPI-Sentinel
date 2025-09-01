@@ -1,4 +1,4 @@
-# market_watcher.py — FGPT Sentinel 시장감시 워커 (당일 변화율 버전)
+# market_watcher.py — FGPT Sentinel 시장감시 워커 (당일 변화율 완전판)
 # -*- coding: utf-8 -*-
 
 import os, time, json, logging, requests, math
@@ -6,7 +6,10 @@ from datetime import datetime, timezone, timedelta
 
 # ==================== 설정/로그 ====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 log = logging.getLogger("market-watcher")
 
 def _normalize_base(url: str) -> str:
@@ -41,7 +44,10 @@ VIX_FILTER_THRESHOLD = parse_float_env("VIX_FILTER_THRESHOLD", 0.8)  # VIX 필�
 
 STATE_PATH = os.getenv("WATCHER_STATE_PATH", "./market_state.json")
 
-# yfinance 설정
+# yfinance 설정 - 경고 억제
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+
 YF_ENABLED = os.getenv("YF_ENABLED", "true").lower() in ("1", "true", "yes")
 _YF_READY = False
 if YF_ENABLED:
@@ -49,6 +55,7 @@ if YF_ENABLED:
         import yfinance as yf
         import pandas as pd
         _YF_READY = True
+        log.info("yfinance 모듈 준비 완료")
     except Exception as e:
         log.warning("yfinance import 실패: %s", e)
 
@@ -60,7 +67,7 @@ HUMAN_NAMES = {
     "102110.KS":  "TIGER 200",
     "^GSPC":      "S&P 500",
     "^IXIC":      "NASDAQ",
-    "^VIX":       "VIX 변동성지수",
+    "^VIX":       "VIX",
     "ES=F":       "S&P 500 선물",
     "NQ=F":       "NASDAQ-100 선물",
 }
@@ -68,8 +75,8 @@ HUMAN_NAMES = {
 def human_name(sym: str) -> str:
     return HUMAN_NAMES.get(sym, sym)
 
-# 심볼 정의
-KR_SPOT_PRIORITY = ["069500.KS", "102110.KS", "^KS11"]  
+# 심볼 정의 - 한국 시장 우선순위 조정
+KR_SPOT_PRIORITY = ["^KS11", "069500.KS", "102110.KS", "^KS200"]  # KOSPI 우선
 US_SPOT = ["^GSPC", "^IXIC", "^VIX"]
 FUTURES_SYMBOLS = ["ES=F", "NQ=F"]
 
@@ -104,7 +111,7 @@ def _load_state() -> dict:
 H_COMMON = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Referer": "https://finance.yahoo.com/",
@@ -127,59 +134,72 @@ def _http_get(url: str, params=None, timeout=12, max_retry=3):
     raise RuntimeError("HTTP 요청 실패")
 
 # ==================== 데이터 수집 (당일 변화율) ====================
-def get_intraday_change(symbol: str) -> tuple[float | None, str]:
+def get_intraday_change(symbol: str, is_kr: bool = False) -> tuple[float | None, str]:
     """당일 시가 대비 현재 변화율 계산"""
     
-    # 1차: yfinance (당일 데이터)
+    # 한국 시장은 Yahoo API 우선 (더 안정적)
+    if is_kr:
+        # Yahoo Quote API 먼저 시도
+        try:
+            url = "https://query2.finance.yahoo.com/v7/finance/quote"
+            params = {
+                "symbols": symbol,
+                "crumb": str(int(time.time()))
+            }
+            r = _http_get(url, params=params)
+            data = r.json()
+            
+            items = data.get("quoteResponse", {}).get("result", [])
+            if items:
+                q = items[0]
+                
+                # 당일 시가와 현재가
+                current = q.get("regularMarketPrice")
+                open_price = q.get("regularMarketOpen")
+                
+                if current and open_price and open_price != 0:
+                    change_pct = (float(current) - float(open_price)) / float(open_price) * 100.0
+                    log.info("[한국] %s 당일: 시가=%.2f, 현재=%.2f, 변화율=%.2f%%", 
+                            symbol, float(open_price), float(current), change_pct)
+                    return change_pct, "yahoo_kr"
+                    
+        except Exception as e:
+            log.debug("Yahoo API 실패(%s): %s", symbol, e)
+    
+    # yfinance 시도
     if _YF_READY:
         try:
             # 당일 1분봉 데이터
-            ticker = yf.download(symbol, period="1d", interval="1m", progress=False, prepost=True, auto_adjust=True)
+            ticker = yf.download(
+                symbol, 
+                period="1d", 
+                interval="1m" if not is_kr else "5m",  # 한국은 5분봉
+                progress=False, 
+                prepost=True, 
+                auto_adjust=True,
+                threads=False
+            )
+            
             if ticker is not None and len(ticker) > 0:
-                # 당일 시가와 현재가
-                open_price = float(ticker["Open"].iloc[0])  # 첫 봉의 시가
-                current = float(ticker["Close"].iloc[-1])   # 마지막 봉의 종가
+                # iloc 사용법 수정
+                open_price = ticker["Open"].iloc[0] if len(ticker) > 0 else None
+                current = ticker["Close"].iloc[-1] if len(ticker) > 0 else None
                 
-                if open_price and open_price != 0:
+                if open_price and current and open_price != 0:
+                    open_price = float(open_price)
+                    current = float(current)
                     change_pct = (current - open_price) / open_price * 100.0
-                    log.debug("%s yfinance 당일: 시가=%.2f, 현재=%.2f, 변화=%.2f%%", 
+                    log.info("%s 당일: 시가=%.2f, 현재=%.2f, 변화율=%.2f%%", 
                             symbol, open_price, current, change_pct)
-                    return change_pct, "yfinance_intraday"
+                    return change_pct, "yfinance"
         except Exception as e:
-            log.debug("yfinance 당일 실패(%s): %s", symbol, e)
+            log.debug("yfinance 실패(%s): %s", symbol, e)
     
-    # 2차: Yahoo Quote API (regularMarketDayRange 활용)
-    try:
-        url = "https://query2.finance.yahoo.com/v7/finance/quote"
-        params = {
-            "symbols": symbol,
-            "crumb": str(int(time.time()))
-        }
-        r = _http_get(url, params=params)
-        data = r.json()
-        
-        items = data.get("quoteResponse", {}).get("result", [])
-        if items:
-            q = items[0]
-            
-            # 당일 시가와 현재가 직접 가져오기
-            current = q.get("regularMarketPrice")
-            open_price = q.get("regularMarketOpen")
-            
-            if current and open_price and open_price != 0:
-                change_pct = (float(current) - float(open_price)) / float(open_price) * 100.0
-                log.debug("%s Yahoo 당일: 시가=%.2f, 현재=%.2f, 변화=%.2f%%", 
-                        symbol, open_price, current, change_pct)
-                return change_pct, "yahoo_intraday"
-                
-    except Exception as e:
-        log.debug("Yahoo Quote 당일 실패(%s): %s", symbol, e)
-    
-    # 3차: Chart API로 당일 데이터
+    # Chart API 폴백
     try:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
         params = {
-            "interval": "5m",
+            "interval": "5m" if is_kr else "1m",
             "range": "1d"
         }
         
@@ -190,31 +210,35 @@ def get_intraday_change(symbol: str) -> tuple[float | None, str]:
         meta = chart.get("meta", {})
         indicators = chart.get("indicators", {}).get("quote", [{}])[0]
         
-        # 당일 시가와 현재가
         current = meta.get("regularMarketPrice")
         opens = indicators.get("open", [])
         
-        if current and opens and opens[0] is not None:
-            open_price = float(opens[0])
-            if open_price != 0:
+        if current and opens:
+            # 첫 번째 유효한 시가 찾기
+            open_price = None
+            for o in opens:
+                if o is not None:
+                    open_price = float(o)
+                    break
+            
+            if open_price and open_price != 0:
                 change_pct = (float(current) - open_price) / open_price * 100.0
-                log.debug("%s Chart 당일: 시가=%.2f, 현재=%.2f, 변화=%.2f%%", 
-                        symbol, open_price, current, change_pct)
-                return change_pct, "chart_intraday"
+                log.info("%s Chart 당일: 시가=%.2f, 현재=%.2f, 변화율=%.2f%%", 
+                        symbol, open_price, float(current), change_pct)
+                return change_pct, "chart"
             
     except Exception as e:
-        log.debug("Chart 당일 실패(%s): %s", symbol, e)
+        log.debug("Chart API 실패(%s): %s", symbol, e)
     
     return None, "failed"
 
 def get_futures_intraday(symbol: str) -> tuple[float | None, str]:
-    """선물 당일 변화율 - 연속 거래 특성 고려"""
+    """선물 당일 변화율 - 세션 기준"""
     
-    # 선물은 24시간 거래이므로 세션 시작 시점 기준
     try:
         url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
         params = {
-            "interval": "15m",  # 15분봉
+            "interval": "15m",
             "range": "1d"
         }
         
@@ -228,34 +252,23 @@ def get_futures_intraday(symbol: str) -> tuple[float | None, str]:
         current = meta.get("regularMarketPrice")
         opens = indicators.get("open", [])
         
-        # 선물 세션 시작 시점 찾기 (KST 06:00 또는 07:00)
-        timestamps = chart.get("timestamp", [])
-        if timestamps and opens:
-            kst_now = _now_kst()
-            session_start_hour = 6 if kst_now.month in [11,12,1,2,3] else 7  # 표준시/서머타임
+        # 첫 번째 유효한 시가 사용
+        if current and opens:
+            open_price = None
+            for o in opens:
+                if o is not None:
+                    open_price = float(o)
+                    break
             
-            for i, ts in enumerate(timestamps):
-                dt = datetime.fromtimestamp(ts, tz=timezone(timedelta(hours=9)))
-                if dt.hour == session_start_hour and dt.minute < 30:
-                    if opens[i] is not None:
-                        open_price = float(opens[i])
-                        if open_price != 0:
-                            change_pct = (float(current) - open_price) / open_price * 100.0
-                            log.debug("선물 %s 세션: 시가=%.2f, 현재=%.2f, 변화=%.2f%%", 
-                                    symbol, open_price, current, change_pct)
-                            return change_pct, "futures_session"
-                            
-        # 폴백: 첫 데이터 포인트 사용
-        if current and opens and opens[0] is not None:
-            open_price = float(opens[0])
-            if open_price != 0:
+            if open_price and open_price != 0:
                 change_pct = (float(current) - open_price) / open_price * 100.0
-                return change_pct, "futures_first"
+                log.info("선물 %s: 시가=%.2f, 현재=%.2f, 변화율=%.2f%%", 
+                        symbol, open_price, float(current), change_pct)
+                return change_pct, "futures"
                 
     except Exception as e:
-        log.debug("선물 당일 실패(%s): %s", symbol, e)
+        log.debug("선물 데이터 실패(%s): %s", symbol, e)
     
-    # 폴백
     return get_intraday_change(symbol)
 
 # ==================== 시장 시간 판정 ====================
@@ -296,7 +309,7 @@ def grade_level(delta_pct: float, is_vix: bool = False) -> str | None:
     a = abs(delta_pct)
     
     if is_vix:
-        # VIX 레벨 (높게 설정)
+        # VIX 레벨
         if a >= 25.0: return "LV3"
         if a >= 15.0: return "LV2"
         if a >= 8.0:  return "LV1"
@@ -330,7 +343,7 @@ def post_alert(delta_pct: float | None, level: str | None, source_tag: str, note
         if not r.ok:
             log.error("알림 전송 실패 %s %s", r.status_code, r.text)
         else:
-            log.info("알림 전송: [%s] %s %s %.2f%% (%s)", 
+            log.info(">>> 알림 전송: [%s] %s %s %.2f%% (%s)", 
                     kind, display_name, level or "CLEARED", delta_pct or 0, note)
     except Exception as e:
         log.error("알림 전송 오류: %s", e)
@@ -340,26 +353,30 @@ def check_and_alert():
     state = _load_state()
     sess = current_session()
     
-    log.info("===== 시장 체크 [%s] %s =====", sess, _now_kst().strftime("%Y-%m-%d %H:%M:%S KST"))
+    log.info("="*60)
+    log.info("시장 체크 시작 [세션: %s] %s", sess, _now_kst().strftime("%Y-%m-%d %H:%M:%S KST"))
+    log.info("="*60)
+    
     state["last_checked_at"] = _now_kst_iso()
     
     if sess == "CLOSED":
-        log.info("시장 휴장 - 감시 스킵")
+        log.info("시장 휴장 중 - 감시 스킵")
         _save_state(state)
         return
     
     if sess == "KR":
         # 한국 정규장 - 당일 변화율
-        log.info("한국 정규장 당일 데이터 수집...")
+        log.info("【한국 정규장】 당일 데이터 수집 중...")
         
+        collected = False
         for sym in KR_SPOT_PRIORITY:
-            delta, source = get_intraday_change(sym)
+            delta, source = get_intraday_change(sym, is_kr=True)
             if delta is not None:
                 lvl = grade_level(delta)
                 prev = state.get("ΔK200")
                 name = human_name(sym)
                 
-                log.info("%s: 당일 %.2f%% [%s → %s] (소스: %s)", 
+                log.info("✓ %s: 당일 변화율 %.2f%% [이전:%s → 현재:%s] (데이터:%s)", 
                         name, delta, prev or "없음", lvl or "정상", source)
                 
                 if lvl != prev:
@@ -368,13 +385,16 @@ def check_and_alert():
                            f"당일 {prev} → {lvl}")
                     post_alert(delta, lvl, sym, note)
                     state["ΔK200"] = lvl
+                
+                collected = True
                 break
-        else:
-            log.warning("한국 시장 데이터 수집 실패")
+        
+        if not collected:
+            log.error("⚠ 한국 시장 데이터 수집 실패! 모든 심볼 시도 실패")
     
     elif sess == "US":
         # 미국 정규장 - 당일 변화율
-        log.info("미국 정규장 당일 데이터 수집...")
+        log.info("【미국 정규장】 당일 데이터 수집 중...")
         
         # S&P, NASDAQ 먼저 수집
         spx_delta, _ = get_intraday_change("^GSPC")
@@ -388,14 +408,14 @@ def check_and_alert():
         for sym in US_SPOT:
             delta, source = get_intraday_change(sym)
             if delta is None:
-                log.warning("%s 데이터 수집 실패", human_name(sym))
+                log.warning("⚠ %s 데이터 수집 실패", human_name(sym))
                 continue
             
             is_vix = (sym == "^VIX")
             
             # VIX 필터
             if is_vix and max_index_move < VIX_FILTER_THRESHOLD:
-                log.info("VIX 필터: 당일 지수 %.2f%% < %.2f%% → VIX %.2f%% 무시", 
+                log.info("VIX 필터 적용: 지수 변동 %.2f%% < %.2f%% → VIX %.2f%% 무시", 
                         max_index_move, VIX_FILTER_THRESHOLD, delta)
                 state["ΔVIX"] = None
                 continue
@@ -405,7 +425,8 @@ def check_and_alert():
             prev = state.get(key)
             name = human_name(sym)
             
-            log.info("%s: 당일 %.2f%% [%s → %s]", name, delta, prev or "없음", lvl or "정상")
+            log.info("✓ %s: 당일 %.2f%% [이전:%s → 현재:%s]", 
+                    name, delta, prev or "없음", lvl or "정상")
             
             if lvl != prev:
                 note = ("당일 레벨 진입" if (not prev and lvl) else
@@ -417,19 +438,19 @@ def check_and_alert():
                 state[key] = lvl
     
     elif sess == "FUTURES":
-        # 선물 시간 - 세션 기준 변화율
-        log.info("선물 시장 당일 데이터 수집...")
+        # 선물 시간
+        log.info("【선물 시장】 세션 데이터 수집 중...")
         
         for key, sym in [("ΔES_FUT", "ES=F"), ("ΔNQ_FUT", "NQ=F")]:
             delta, source = get_futures_intraday(sym)
             name = human_name(sym)
             
             if delta is None:
-                log.info("%s: 데이터 없음", name)
+                log.info("⚠ %s: 데이터 없음", name)
                 state[key] = None
                 continue
             
-            log.info("%s: 세션 %.2f%% (소스: %s)", name, delta, source)
+            log.info("✓ %s: 세션 변화율 %.2f%% (데이터:%s)", name, delta, source)
             
             # 0.8% 미만은 무시
             if abs(delta) < 0.8:
@@ -450,25 +471,30 @@ def check_and_alert():
             
             note = f"선물 세션 변동"
             post_alert(delta, "PRE", sym, note, kind="PRE")
-            log.info("%s: %.2f%% [PRE 알림]", name, delta)
             state[key] = delta
     
     _save_state(state)
-    log.info("===== 체크 완료 =====")
+    log.info("체크 완료")
+    log.info("-"*60)
 
 # ==================== 메인 루프 ====================
 def run_loop():
-    log.info("=== Sentinel 시장감시 시작 (당일 변화율 모드) ===")
-    log.info("간격: %d초", WATCH_INTERVAL)
-    log.info("임계값 - 일반: 0.8%/1.5%/2.5%, VIX: 8%/15%/25%")
-    log.info("VIX 필터: 지수 변동 %.1f%% 미만시 무시", VIX_FILTER_THRESHOLD)
-    log.info("※ 모든 변화율은 당일 시가 대비 현재가 기준")
+    log.info("="*60)
+    log.info("Sentinel 시장감시 시작 (당일 변화율 모드)")
+    log.info("="*60)
+    log.info("설정:")
+    log.info("  - 체크 간격: %d초", WATCH_INTERVAL)
+    log.info("  - 일반 임계값: 0.8% / 1.5% / 2.5%")
+    log.info("  - VIX 임계값: 8% / 15% / 25%")
+    log.info("  - VIX 필터: 지수 변동 %.1f%% 미만시 무시", VIX_FILTER_THRESHOLD)
+    log.info("  - 모든 변화율은 당일 시가 대비 현재가 기준")
+    log.info("-"*60)
     
     # 초기 체크
     try:
         check_and_alert()
     except Exception as e:
-        log.error("초기 체크 실패: %s", e)
+        log.error("초기 체크 실패: %s", e, exc_info=True)
     
     # 주기적 체크
     while True:
@@ -476,7 +502,7 @@ def run_loop():
         try:
             check_and_alert()
         except Exception as e:
-            log.error("주기 체크 오류: %s", e)
+            log.error("주기 체크 오류: %s", e, exc_info=True)
 
 if __name__ == "__main__":
     run_loop()
