@@ -428,72 +428,72 @@ def check_and_alert():
                 "updated_at": _now_kst_iso()
             }
     
-elif sess == "FUTURES":
-    # 선물 시간
-    log.info("【선물 시장】 세션 데이터 수집 중...")
+    elif sess == "FUTURES":
+        # 선물 시간
+        log.info("【선물 시장】 세션 데이터 수집 중...")
+        
+        for sym in FUTURES_SYMBOLS:
+            delta, source = get_intraday_change(sym)
+            name = human_name(sym)
+            
+            if delta is None:
+                log.info("⚠ %s: 데이터 없음", name)
+                continue
+            
+            log.info("✓ %s: 세션 변화율 %.2f%% (데이터:%s)", name, delta, source)
+            
+            # 상태 키
+            state_key = f"FUT_{sym}"
+            prev_state = state.get(state_key, {})
+            prev_delta = prev_state.get("delta")
+            prev_alert_level = prev_state.get("alert_level")
+            
+            # 레벨 판정 (0.8% / 1.5% / 2.5%)
+            current_level = grade_level(delta, is_vix=False)
+            
+            # 알림 조건 개선
+            should_alert = False
+            alert_note = ""
+            
+            # 1. 레벨 변경시 알림
+            if current_level != prev_alert_level:
+                should_alert = True
+                if not prev_alert_level and current_level:
+                    alert_note = f"선물 {current_level} 진입 ({delta:+.2f}%)"
+                elif prev_alert_level and not current_level:
+                    alert_note = f"선물 정상 복귀 ({delta:+.2f}%)"
+                else:
+                    alert_note = f"선물 {prev_alert_level}→{current_level} ({delta:+.2f}%)"
+            
+            # 2. 첫 감지시 0.8% 이상이면 알림
+            elif prev_delta is None and abs(delta) >= 0.8:
+                should_alert = True
+                alert_note = f"선물 {'상승' if delta > 0 else '하락'} 감지 ({delta:+.2f}%)"
+            
+            # 3. 급변시 알림 (이전 대비 0.5% 이상 변화)
+            elif prev_delta is not None and abs(delta - prev_delta) >= 0.5:
+                should_alert = True
+                alert_note = f"선물 급변 {prev_delta:.2f}%→{delta:+.2f}%"
+            
+            # 4. 강제 알림 (4시간마다, 레벨 있을 때만)
+            elif force_alert and current_level:
+                should_alert = True
+                alert_note = f"선물 {current_level} 유지 중 ({delta:+.2f}%)"
+            
+            if should_alert:
+                post_alert(delta, current_level or "WATCH", sym, alert_note, kind="FUTURES")
+                state["last_alert_time"] = current_time
+            
+            # 상태 업데이트
+            state[state_key] = {
+                "delta": delta,
+                "alert_level": current_level,
+                "updated_at": _now_kst_iso()
+            }
     
-    for sym in FUTURES_SYMBOLS:
-        delta, source = get_intraday_change(sym)
-        name = human_name(sym)
-        
-        if delta is None:
-            log.info("⚠ %s: 데이터 없음", name)
-            continue
-        
-        log.info("✓ %s: 세션 변화율 %.2f%% (데이터:%s)", name, delta, source)
-        
-        # 상태 키
-        state_key = f"FUT_{sym}"
-        prev_state = state.get(state_key, {})
-        prev_delta = prev_state.get("delta")
-        prev_alert_level = prev_state.get("alert_level")  # 알림 레벨 추적
-        
-        # 레벨 판정 (0.8% / 1.5% / 2.5%)
-        current_level = grade_level(delta, is_vix=False)
-        
-        # 알림 조건 개선
-        should_alert = False
-        alert_note = ""
-        
-        # 1. 레벨 변경시 알림
-        if current_level != prev_alert_level:
-            should_alert = True
-            if not prev_alert_level and current_level:
-                alert_note = f"선물 {current_level} 진입 ({delta:+.2f}%)"
-            elif prev_alert_level and not current_level:
-                alert_note = f"선물 정상 복귀 ({delta:+.2f}%)"
-            else:
-                alert_note = f"선물 {prev_alert_level}→{current_level} ({delta:+.2f}%)"
-        
-        # 2. 첫 감지시 0.8% 이상이면 알림
-        elif prev_delta is None and abs(delta) >= 0.8:
-            should_alert = True
-            alert_note = f"선물 {'상승' if delta > 0 else '하락'} 감지 ({delta:+.2f}%)"
-        
-        # 3. 급변시 알림 (이전 대비 0.5% 이상 변화)
-        elif prev_delta is not None and abs(delta - prev_delta) >= 0.5:
-            should_alert = True
-            alert_note = f"선물 급변 {prev_delta:.2f}%→{delta:+.2f}%"
-        
-        # 4. 강제 알림 (4시간마다, 레벨 있을 때만)
-        elif force_alert and current_level:
-            should_alert = True
-            alert_note = f"선물 {current_level} 유지 중 ({delta:+.2f}%)"
-        
-        if should_alert:
-            post_alert(delta, current_level or "WATCH", sym, alert_note, kind="FUTURES")
-            state["last_alert_time"] = current_time
-        
-        # 상태 업데이트
-        state[state_key] = {
-            "delta": delta,
-            "alert_level": current_level,
-            "updated_at": _now_kst_iso()
-        }
-
-_save_state(state)
-log.info("체크 완료 - 상태 저장됨")
-log.info("-"*60)
+    _save_state(state)
+    log.info("체크 완료 - 상태 저장됨")
+    log.info("-"*60)
 
 # ==================== 시장 시간 판정 ====================
 def current_session() -> str:
