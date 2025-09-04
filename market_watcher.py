@@ -44,7 +44,7 @@ def parse_float_env(key: str, default: float) -> float:
         return default
 
 # 주기/설정
-WATCH_INTERVAL = parse_int_env("WATCH_INTERVAL_SEC", 300)  # 5분 (더 자주 체크)
+WATCH_INTERVAL = parse_int_env("WATCH_INTERVAL_SEC", 300)  # 5분
 VIX_FILTER_THRESHOLD = parse_float_env("VIX_FILTER_THRESHOLD", 0.8)
 FORCE_ALERT_INTERVAL = parse_int_env("FORCE_ALERT_HOURS", 4)
 VOLATILITY_WINDOW = parse_int_env("VOLATILITY_WINDOW_MIN", 60)  # 60분 윈도우
@@ -255,12 +255,7 @@ def grade_level(value: float, is_vix: bool = False, is_volatility: bool = False)
     """레벨 판정"""
     a = abs(value)
     
-    if is_vix:
-        # VIX 레벨
-        if a >= 25.0: return "LV3"
-        if a >= 15.0: return "LV2"
-        if a >= 8.0:  return "LV1"
-    elif is_volatility:
+    if is_volatility:
         # 변동성 기반 (일중 스윙)
         if a >= 3.0: return "LV3"
         if a >= 2.0: return "LV2"
@@ -270,6 +265,16 @@ def grade_level(value: float, is_vix: bool = False, is_volatility: bool = False)
         if a >= 2.5: return "LV3"
         if a >= 1.5: return "LV2"
         if a >= 0.8: return "LV1"
+    return None
+
+def grade_level_vix_relative(change_pct: float) -> str | None:
+    """VIX 상대적 변화율 기준 레벨 판정"""
+    a = abs(change_pct)
+    
+    # VIX 변화율 기준 (일반 지수보다 높게 설정)
+    if a >= 30.0: return "LV3"  # VIX 30% 이상 변화
+    if a >= 20.0: return "LV2"  # VIX 20% 이상 변화  
+    if a >= 10.0: return "LV1"  # VIX 10% 이상 변화
     return None
 
 # ==================== 알림 전송 ====================
@@ -285,7 +290,7 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
         "note": note,
         "kind": kind,
         "symbol": symbol,
-        "details": {
+        "details": data.get("vix_context", {}) if "vix_context" in data else {
             "current": data.get("current"),
             "high": data.get("high"),
             "low": data.get("low"),
@@ -401,10 +406,17 @@ def check_and_alert():
     
     # VIX 필터용 지수 변동 체크 (미국장만)
     max_index_move = 0
+    spx_delta = None
+    ndx_delta = None
+    
     if sess == "US":
         for sym in ["^GSPC", "^IXIC"]:
             data = get_market_data(sym)
-            if data and data.get("change_pct"):
+            if data and data.get("change_pct") is not None:
+                if sym == "^GSPC":
+                    spx_delta = data["change_pct"]
+                else:
+                    ndx_delta = data["change_pct"]
                 max_index_move = max(max_index_move, abs(data["change_pct"]))
     
     # 각 심볼 감시
@@ -417,32 +429,116 @@ def check_and_alert():
         name = human_name(symbol)
         is_vix = (symbol == "^VIX")
         
-        # VIX 필터
-        if is_vix and sess == "US" and max_index_move < VIX_FILTER_THRESHOLD:
-            log.info("VIX 필터: 지수 변동 %.2f%% < %.1f%% → VIX 무시", 
-                    max_index_move, VIX_FILTER_THRESHOLD)
-            continue
+        # VIX 특별 처리
+        if is_vix:
+            vix_value = data["current"]
+            vix_change_pct = data.get("change_pct", 0)
+            
+            # 1. 지수 변동 필터 (0.8% 미만이면 VIX 무시)
+            if sess == "US" and max_index_move < VIX_FILTER_THRESHOLD:
+                log.info("VIX 필터: 지수 변동 %.2f%% < %.1f%% → VIX %.2f (%.2f%%) 무시", 
+                        max_index_move, VIX_FILTER_THRESHOLD, vix_value, vix_change_pct)
+                continue
+            
+            # 2. VIX 변화율 기준 레벨 판정
+            current_level = grade_level_vix_relative(vix_change_pct)
+            
+            # 3. 추가 조건: VIX 절대값이 너무 낮으면(12 미만) 레벨 하향
+            if vix_value < 12 and current_level:
+                log.info("VIX 절대값 낮음(%.1f) - 레벨 무시", vix_value)
+                current_level = None
+            
+            # 4. 추가 조건: VIX 절대값이 높으면(30 이상) 레벨 상향
+            if vix_value >= 30 and not current_level:
+                current_level = "LV1"  # 최소 LV1 보장
+            
+            log.info("✓ VIX: 값=%.2f, 변화율=%.2f%%, 지수변동=%.2f%%, 레벨=%s", 
+                    vix_value, vix_change_pct, max_index_move, current_level or "정상")
+            
+            # 상태 체크
+            state_key = f"{sess}_{symbol}"
+            prev_state = state.get(state_key, {})
+            prev_level = prev_state.get("level")
+            
+            # 알림 조건
+            should_alert = False
+            alert_note = ""
+            
+            # 레벨 변경시 알림
+            if current_level != prev_level:
+                should_alert = True
+                
+                if not prev_level and current_level:
+                    # 레벨 진입
+                    direction = "상승" if vix_change_pct > 0 else "하락"
+                    alert_note = f"VIX {current_level} 진입 ({direction} {abs(vix_change_pct):.1f}%)"
+                elif prev_level and not current_level:
+                    # 레벨 해제
+                    alert_note = f"VIX 안정화 (현재 {vix_value:.1f})"
+                else:
+                    # 레벨 변경
+                    alert_note = f"VIX {prev_level} → {current_level} (변화 {vix_change_pct:+.1f}%)"
+                
+                # 컨텍스트 정보 추가
+                if max_index_move >= 0.8 and spx_delta is not None and ndx_delta is not None:
+                    sp_direction = "하락" if spx_delta < 0 else "상승"
+                    nas_direction = "하락" if ndx_delta < 0 else "상승"
+                    alert_note += f" [S&P {sp_direction} {abs(spx_delta):.1f}%, NAS {nas_direction} {abs(ndx_delta):.1f}%]"
+            
+            # 강제 알림 (4시간마다, 레벨 유지중)
+            elif force_alert and current_level:
+                should_alert = True
+                alert_note = f"VIX {current_level} 유지 중 (현재 {vix_value:.1f}, 변화 {vix_change_pct:+.1f}%)"
+            
+            if should_alert:
+                # VIX 알림에 추가 정보 포함
+                data["vix_context"] = {
+                    "value": vix_value,
+                    "change_pct": vix_change_pct,
+                    "index_volatility": max_index_move,
+                    "sp500_change": spx_delta,
+                    "nasdaq_change": ndx_delta
+                }
+                post_alert(data, current_level, symbol, alert_note, kind="VIX")
+                state["last_alert_time"] = current_time
+            
+            # 상태 업데이트
+            state[state_key] = {
+                "level": current_level,
+                "vix_value": vix_value,
+                "change_pct": vix_change_pct,
+                "updated_at": _now_kst_iso()
+            }
+            
+            continue  # VIX 처리 완료, 다음 심볼로
         
+        # 일반 지수 처리
         # 변동성 계산
         volatility = calculate_volatility(state, symbol, data["current"])
         data["volatility"] = volatility
         
-        # 로그 출력
+        # None 값 처리 - 로그 출력 수정
+        current_price = data.get("current", 0)
+        change_pct = data.get("change_pct", 0) 
+        max_swing = volatility.get("max_swing", 0)
+        high_price = data.get("high", 0) or 0  # None을 0으로 변환
+        low_price = data.get("low", 0) or 0   # None을 0으로 변환
+        
         log.info("✓ %s: 현재=%.2f, 전일대비=%.2f%%, 일중변동=%.2f%% (고:%.2f/저:%.2f)", 
                 name, 
-                data["current"],
-                data.get("change_pct", 0),
-                volatility.get("max_swing", 0),
-                data.get("high", 0),
-                data.get("low", 0))
+                current_price,
+                change_pct,
+                max_swing,
+                high_price,
+                low_price)
         
         # 상태 키
         state_key = f"{sess}_{symbol}"
         prev_state = state.get(state_key, {})
         
         # 레벨 판정 (다중 기준)
-        change_level = grade_level(data.get("change_pct", 0), is_vix=is_vix)
-        volatility_level = grade_level(volatility.get("max_swing", 0), is_volatility=True)
+        change_level = grade_level(change_pct, is_vix=False)
+        volatility_level = grade_level(max_swing, is_volatility=True)
         
         # 최종 레벨 (더 높은 것 선택)
         levels = [l for l in [change_level, volatility_level] if l]
@@ -470,13 +566,13 @@ def check_and_alert():
                 alert_note = f"{prev_level} → {current_level}"
             
             # 변동성 정보 추가
-            if volatility.get("max_swing", 0) >= 1.0:
-                alert_note += f" (일중 {volatility['max_swing']:.1f}% 변동)"
+            if max_swing >= 1.0:
+                alert_note += f" (일중 {max_swing:.1f}% 변동)"
         
         # 2. 급격한 변동성 증가
-        elif volatility.get("max_swing", 0) - prev_volatility >= 1.0:
+        elif max_swing - prev_volatility >= 1.0:
             should_alert = True
-            alert_note = f"변동성 급증: {prev_volatility:.1f}% → {volatility['max_swing']:.1f}%"
+            alert_note = f"변동성 급증: {prev_volatility:.1f}% → {max_swing:.1f}%"
         
         # 3. 강제 알림
         elif force_alert and current_level:
@@ -484,13 +580,15 @@ def check_and_alert():
             alert_note = f"정기: {current_level} 유지 중"
         
         # 4. 선물 특별 처리
-        elif sess == "FUTURES" and abs(data.get("change_pct", 0)) >= 0.8:
-            if symbol not in state.get("futures_alerted", {}):
+        elif sess == "FUTURES" and abs(change_pct) >= 0.8:
+            # 선물 알림 중복 방지 개선
+            futures_key = f"futures_{symbol}_{_now_kst().strftime('%Y%m%d')}"
+            if futures_key not in state.get("futures_alerted", {}):
                 should_alert = True
-                alert_note = f"선물 {'상승' if data['change_pct'] > 0 else '하락'} {abs(data['change_pct']):.2f}%"
+                alert_note = f"선물 {'상승' if change_pct > 0 else '하락'} {abs(change_pct):.2f}%"
                 if "futures_alerted" not in state:
                     state["futures_alerted"] = {}
-                state["futures_alerted"][symbol] = current_time
+                state["futures_alerted"][futures_key] = current_time
         
         if should_alert:
             post_alert(data, current_level, symbol, alert_note, kind=sess)
@@ -499,7 +597,7 @@ def check_and_alert():
         # 상태 업데이트
         state[state_key] = {
             "level": current_level,
-            "change_pct": data.get("change_pct"),
+            "change_pct": change_pct,
             "volatility": volatility,
             "updated_at": _now_kst_iso()
         }
@@ -517,7 +615,8 @@ def run_loop():
     log.info("  - 체크 간격: %d초", WATCH_INTERVAL)
     log.info("  - 전일대비: 0.8% / 1.5% / 2.5%")
     log.info("  - 일중변동: 1.0% / 2.0% / 3.0%")
-    log.info("  - VIX: 8% / 15% / 25%")
+    log.info("  - VIX 변화율: 10% / 20% / 30%")
+    log.info("  - VIX 필터: 지수 %.1f%% 미만 변동시 무시", VIX_FILTER_THRESHOLD)
     log.info("  - 변동성 윈도우: %d분", VOLATILITY_WINDOW)
     log.info("-"*60)
     
