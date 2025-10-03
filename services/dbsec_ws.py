@@ -90,9 +90,19 @@ class KOSPI200FuturesMonitor:
                     break
                     
             except Exception as e:
-                logger.error(f"Monitoring error: {e}")
-                self.reconnect_attempts += 1
-                await asyncio.sleep(5)
+                error_msg = str(e)
+                logger.error(f"Monitoring error: {error_msg}")
+                
+                # Handle token-related errors with longer backoff
+                if "token" in error_msg.lower() or "access" in error_msg.lower():
+                    self.reconnect_attempts += 1
+                    # Longer backoff for token issues: 60s, 120s, 300s, etc.
+                    backoff = min(60 * (2 ** (self.reconnect_attempts - 1)), 1800)  # Max 30min
+                    logger.warning(f"Token-related error, waiting {backoff}s before retry...")
+                    await asyncio.sleep(backoff)
+                else:
+                    self.reconnect_attempts += 1
+                    await asyncio.sleep(5)
         
         logger.error("WebSocket monitoring stopped")
         
@@ -105,7 +115,11 @@ class KOSPI200FuturesMonitor:
         # Get access token
         access_token = await token_manager.get_token()
         if not access_token:
-            raise Exception("Failed to get access token")
+            # Check if we're in backoff
+            if token_manager._is_in_backoff():
+                raise Exception(f"Token manager in backoff period until {token_manager._backoff_until}")
+            else:
+                raise Exception("Failed to get access token - check DB_APP_KEY/DB_APP_SECRET or API quota")
         
         headers = {
             "Authorization": f"Bearer {access_token}"
