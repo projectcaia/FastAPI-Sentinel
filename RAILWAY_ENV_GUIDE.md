@@ -36,6 +36,7 @@ Railway 대시보드에서 다음과 같이 **숫자만** 입력하세요:
 | **LOG_LEVEL** | **INFO** | 로그 레벨 |
 | **ALERT_CAP** | **2000** | 알림 버퍼 크기 |
 | **WATCHER_STATE_PATH** | **./market_state.json** | 상태 파일 경로 |
+| **DBSEC_ENABLE** | **true** | DB증권 모듈 활성화 (true/false) |
 | **DB_APP_KEY** | your-key | DB증권 API 앱 키 |
 | **DB_APP_SECRET** | your-secret | DB증권 API 앱 시크릿 |
 | **DB_API_BASE** | **https://openapi.dbsec.co.kr:8443** | DB증권 API 베이스 URL |

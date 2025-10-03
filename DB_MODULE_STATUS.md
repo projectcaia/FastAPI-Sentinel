@@ -1,51 +1,73 @@
 # 📌 DB증권 모듈 상태
 
-## ⚠️ 현재 상태: **비활성화됨 (DISABLED)**
+## ✅ 모듈 활성화 컨트롤 가능
 
-### 비활성화 이유:
-1. **API 인증 오류** (IGW00105): "유효하지 않은 AppSecret입니다"
-   - DB_APP_KEY 또는 DB_APP_SECRET이 잘못되었거나 만료됨
-   
-2. **API 호출 한도 초과** (IGW00201): "호출 거래건수를 초과하였습니다"
-   - DB증권 API 일일 호출 한도 초과
-   - 추가 호출 시 계정이 차단될 수 있음
+### 환경 변수로 제어:
+- `DBSEC_ENABLE=true` → **실제 API 연동** (Production 모드)
+- `DBSEC_ENABLE=false` → **Mock 모드** (로컬 개발/테스트용)
 
-### 현재 동작:
-- ✅ FastAPI 서버는 정상 작동
-- ✅ 기존 시장 감시 기능 (market_watcher.py) 정상 작동
-- ❌ DB증권 WebSocket 연결 비활성화
-- ❌ K200 선물 실시간 모니터링 중단
-- ⚠️ Mock 토큰 사용 중 (실제 API 호출 없음)
+### 현재 동작 방식:
 
-### 재활성화 방법:
+#### Production 모드 (DBSEC_ENABLE=true):
+- ✅ DB증권 API에서 실제 토큰 획득
+- ✅ WebSocket 연결하여 K200 선물 실시간 모니터링
+- ✅ 변동률 감지 시 MarketWatcher로 이벤트 전송
+- ✅ 23시간마다 자동 토큰 갱신
+- ⚠️ **주의**: 올바른 DB_APP_KEY와 DB_APP_SECRET 필요
 
-1. **올바른 API 자격 증명 확인**
-   ```bash
-   # Railway 환경변수에서 확인
-   DB_APP_KEY=정확한_앱키_입력
-   DB_APP_SECRET=정확한_앱시크릿_입력
-   ```
+#### Mock 모드 (DBSEC_ENABLE=false):
+- ✅ Mock 토큰 사용 (API 호출 없음)
+- ✅ WebSocket 연결 시도하지 않음
+- ✅ 서버는 정상 작동하나 DB증권 데이터 없음
+- ✅ API 한도 걱정 없이 개발 가능
 
-2. **API 한도 확인**
-   - DB증권 개발자 포털에서 일일 호출 한도 확인
-   - 필요시 한도 증량 신청
+### Railway 설정:
 
-3. **모듈 재활성화**
-   - `utils/token_manager.py`의 원본 버전 복구
-   - `services/dbsec_ws.py`의 원본 버전 복구
-   - 서버 재시작
+```bash
+# Production (실제 운영)
+DBSEC_ENABLE=true
+DB_APP_KEY=실제_앱_키
+DB_APP_SECRET=실제_앱_시크릿
 
-### API 엔드포인트 상태:
-- `/sentinel/dbsec/health` - ✅ 작동 (DISABLED 상태 표시)
-- `/sentinel/dbsec/stream` - ✅ 작동 (빈 데이터 반환)
-- `/sentinel/dbsec/config` - ✅ 작동
-- 기타 엔드포인트 - ✅ 작동 (제한된 기능)
+# Development (개발/테스트)
+DBSEC_ENABLE=false
+# API 키는 선택사항
+```
 
-### 권장사항:
-1. DB증권 개발자 포털에서 API 키 재발급
-2. 다음날 (API 한도 리셋 후) 재시도
-3. 테스트 시 호출 횟수 제한 (분당 1회 이하)
+### API 엔드포인트:
+- `/sentinel/dbsec/health` - 모듈 상태 확인
+- `/sentinel/dbsec/stream` - 실시간 틱 데이터
+- `/sentinel/dbsec/config` - 설정 확인
+- `/sentinel/dbsec/sessions` - 거래 세션 정보
+
+### 로그 확인:
+시작 시 로그에서 모드 확인 가능:
+```
+[INFO] [DB증권] Token Manager initialized in PRODUCTION mode
+[INFO] [DB증권] K200 Futures monitoring started in PRODUCTION mode
+```
+또는
+```
+[INFO] [DB증권] Module DISABLED by DBSEC_ENABLE=false
+[INFO] [DB증권] Token Manager initialized in MOCK mode
+```
+
+### 문제 해결:
+
+#### API 인증 오류 (IGW00105):
+- DB_APP_KEY 또는 DB_APP_SECRET 확인
+- DB증권 개발자 포털에서 키 재발급
+
+#### API 한도 초과 (IGW00201):
+- 일일 API 호출 한도 초과
+- 다음날 재시도 또는 한도 증량 신청
+- 임시로 DBSEC_ENABLE=false로 전환 가능
+
+### 권장 설정:
+- **Production**: DBSEC_ENABLE=true (실제 데이터 필요 시)
+- **Development**: DBSEC_ENABLE=false (개발/테스트 시)
+- **API 문제 시**: DBSEC_ENABLE=false (임시 비활성화)
 
 ---
 
-**참고**: 이 비활성화는 임시 조치이며, 올바른 자격 증명과 API 한도가 확보되면 즉시 재활성화 가능합니다.
+**참고**: DBSEC_ENABLE 설정으로 언제든지 실제 모드와 Mock 모드를 전환할 수 있습니다.
