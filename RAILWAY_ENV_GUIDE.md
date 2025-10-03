@@ -36,6 +36,13 @@ Railway 대시보드에서 다음과 같이 **숫자만** 입력하세요:
 | **LOG_LEVEL** | **INFO** | 로그 레벨 |
 | **ALERT_CAP** | **2000** | 알림 버퍼 크기 |
 | **WATCHER_STATE_PATH** | **./market_state.json** | 상태 파일 경로 |
+| **DB_APP_KEY** | your-key | DB증권 API 앱 키 |
+| **DB_APP_SECRET** | your-secret | DB증권 API 앱 시크릿 |
+| **DB_API_BASE** | **https://openapi.dbsec.co.kr:8443** | DB증권 API 베이스 URL |
+| **DB_WS_URL** | **wss://openapi.dbsec.co.kr:9443/ws** | DB증권 WebSocket URL |
+| **DB_ALERT_THRESHOLD** | **1.0** | K200 선물 CRITICAL 알림 기준(%) |
+| **DB_WARN_THRESHOLD** | **0.5** | K200 선물 WARN 알림 기준(%) |
+| **DB_BUFFER_SIZE** | **100** | 실시간 데이터 버퍼 크기 |
 
 ## 🔧 Railway에서 설정하는 방법
 
@@ -89,6 +96,12 @@ BOLL_K_SIGMA          2.0σ            ❌ 틀림!
 - **LV2**: ±7% 이상
 - **LV3**: ±10% 이상
 - **스마트 필터**: 지수 변동이 0.8% 미만일 때 VIX 알림 무시
+
+### KOSPI200 선물 (K200_FUT)
+- **LV1**: ±0.8% 이상
+- **LV2**: ±1.5% 이상  
+- **LV3**: ±2.5% 이상
+- **세션 구분**: DAY(주간) / NIGHT(야간)
 
 ### 볼린저 밴드
 - **비활성화**: 노이즈 감소를 위해 일시적 비활성화
