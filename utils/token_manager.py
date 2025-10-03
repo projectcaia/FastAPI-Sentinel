@@ -210,9 +210,9 @@ class DBSecTokenManager:
                                 
                                 logger.info(f"Token refreshed successfully with format {i+1} on {endpoint}, expires at: {self.expires_at}")
                                 return True
-                        
-                        # Handle specific DB증권 error codes
-                        elif response.status_code == 403:
+                            
+                            # Handle specific DB증권 error codes
+                            elif response.status_code == 403:
                             error_data = {}
                             try:
                                 error_data = response.json()
@@ -236,9 +236,9 @@ class DBSecTokenManager:
                             else:
                                 logger.error(f"Token refresh failed (format {i+1}): {response.status_code} - {error_desc}")
                                 continue
-                            else:
-                                logger.warning(f"Token request format {i+1} on {endpoint} failed: {response.status_code} - {response.text}")
-                                continue
+                        else:
+                            logger.warning(f"Token request format {i+1} on {endpoint} failed: {response.status_code} - {response.text}")
+                            continue
                             
                     except Exception as e:
                         logger.error(f"Token request format {i+1} on {endpoint} error: {e}")
