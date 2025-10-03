@@ -108,78 +108,97 @@ class DBSecTokenManager:
         if not self.enabled:
             logger.debug("[DB증권] Token refresh skipped - mock mode")
             return True
-            
+
         self._last_request_time = datetime.now(timezone.utc)
-        
+
+        attempts = [
+            {
+                "mode": "JSON",
+                "headers": {"Content-Type": "application/json"},
+                "payload_key": "json",
+                "description": "JSON mode",
+            },
+            {
+                "mode": "FORM",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "payload_key": "data",
+                "description": "form-urlencoded mode",
+            },
+        ]
+
+        logger.info(
+            f"[DB증권] Preparing token request with grant_type=client_credentials, "
+            f"appKey length={len(self.app_key)}, appSecret length={len(self.app_secret)}"
+        )
+
+        timeout = httpx.Timeout(30.0)
+
         try:
-            # DB증권 OpenAPI requires strict form-urlencoded format
-            # Field names must be lowercase: appkey, appsecret (not appKey or AppKey)
-            
-            # Prepare form data - must be exactly these field names
-            form_data = {
-                "grant_type": "client_credentials",
-                "appkey": self.app_key,      # Must be lowercase 'appkey'
-                "appsecret": self.app_secret  # Must be lowercase 'appsecret'
-            }
-            
-            # Headers for form-urlencoded
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
-            
-            # Log request info (safely, without exposing secrets)
-            logger.info(f"[DB증권] Sending token request with grant_type=client_credentials, "
-                       f"appkey length={len(self.app_key)}, appsecret length={len(self.app_secret)}")
-            logger.debug(f"[DB증권] Token endpoint: {self.token_url}")
-            logger.debug(f"[DB증권] Request headers: {headers}")
-            
-            timeout = httpx.Timeout(30.0)
-            
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-                # Send as form-encoded data, NOT JSON
-                response = await client.post(
-                    self.token_url,
-                    headers=headers,
-                    data=form_data  # This will be form-encoded automatically
-                )
-                
-                logger.debug(f"[DB증권] Response status: {response.status_code}")
-                logger.debug(f"[DB증권] Response headers: {dict(response.headers)}")
-                
-                if response.status_code == 200:
-                    try:
-                        token_data = response.json()
+                for index, attempt in enumerate(attempts):
+                    payload = {
+                        "grant_type": "client_credentials",
+                        "appKey": self.app_key,
+                        "appSecret": self.app_secret,
+                    }
+                    mode_label = attempt["description"]
+                    is_json_mode = attempt["mode"] == "JSON"
+                    headers = attempt["headers"]
+                    request_kwargs = {attempt["payload_key"]: payload}
+
+                    if is_json_mode:
+                        logger.info("[DB증권] Attempting token request using JSON mode")
+                    else:
+                        logger.info("[DB증권] Token request fallback to form-urlencoded mode")
+
+                    logger.debug(f"[DB증권] Token endpoint: {self.token_url}")
+                    logger.debug(f"[DB증권] Request headers: {headers}")
+
+                    response = await client.post(
+                        self.token_url,
+                        headers=headers,
+                        **request_kwargs,
+                    )
+
+                    logger.debug(f"[DB증권] Response status: {response.status_code}")
+                    logger.debug(f"[DB증권] Response headers: {dict(response.headers)}")
+
+                    if response.status_code == 200:
+                        try:
+                            token_data = response.json()
+                        except json.JSONDecodeError as exc:
+                            logger.error(f"[DB증권] Failed to parse token response: {exc}")
+                            logger.error(f"[DB증권] Response text: {response.text[:500]}")
+                            return False
+
                         self.access_token = token_data.get("access_token")
-                        expires_in = token_data.get("expires_in", 86400)  # Default 24h
+                        expires_in = token_data.get("expires_in", 86400)
                         self.token_type = token_data.get("token_type", "Bearer")
-                        
+
                         if not self.access_token:
                             logger.error("[DB증권] Response missing access_token field")
                             return False
-                        
-                        # Set expiration time
+
                         self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-                        
-                        logger.info(f"[DB증권] Token acquired successfully, expires at: {self.expires_at}")
-                        logger.info(f"[DB증권] Token type: {self.token_type}, expires in: {expires_in}s")
+
+                        logger.info(f"[DB증권] Token request succeeded using {mode_label}")
+                        logger.info(f"[DB증권] Access token acquired, expires in {expires_in}s")
+                        logger.debug(f"[DB증권] Token expires at: {self.expires_at}")
+                        logger.debug(f"[DB증권] Token type: {self.token_type}")
                         return True
-                        
-                    except json.JSONDecodeError as e:
-                        logger.error(f"[DB증권] Failed to parse token response: {e}")
-                        logger.error(f"[DB증권] Response text: {response.text[:500]}")
-                        return False
-                
-                # Handle error responses
-                elif response.status_code == 403:
-                    try:
-                        error_data = response.json()
-                        error_code = error_data.get("error_code", "")
-                        error_desc = error_data.get("error_description", response.text)
-                        
+
+                    if response.status_code == 403:
+                        try:
+                            error_data = response.json()
+                            error_code = error_data.get("error_code", "")
+                            error_desc = error_data.get("error_description", response.text)
+                        except json.JSONDecodeError:
+                            error_code = ""
+                            error_desc = response.text
+
                         if error_code == "IGW00105":
                             logger.error(f"[DB증권] Invalid AppSecret: {error_desc}")
                             logger.error("[DB증권] Please check DB_APP_SECRET environment variable")
-                            logger.error("[DB증권] Make sure the secret is exactly as provided by DB증권")
                         elif error_code == "IGW00103":
                             logger.error(f"[DB증권] Invalid AppKey: {error_desc}")
                             logger.error("[DB증권] Please check DB_APP_KEY environment variable")
@@ -188,36 +207,33 @@ class DBSecTokenManager:
                             logger.error("[DB증권] Wait for quota reset or contact DB증권 support")
                         else:
                             logger.error(f"[DB증권] Auth error {error_code}: {error_desc}")
-                            
-                    except:
-                        logger.error(f"[DB증권] Auth failed with 403: {response.text[:500]}")
-                    
+                    elif response.status_code == 401:
+                        logger.error(f"[DB증권] Authentication failed (401): {response.text[:500]}")
+                        logger.error("[DB증권] Check if API credentials are valid and active")
+                    elif response.status_code == 400:
+                        logger.error(f"[DB증권] Bad request (400): {response.text[:500]}")
+                        logger.error("[DB증권] Check request format - JSON camelCase or form-urlencoded camelCase fields are supported")
+                    else:
+                        logger.warning(f"[DB증권] Unexpected response {response.status_code}: {response.text[:500]}")
+
+                    if index < len(attempts) - 1:
+                        logger.warning(
+                            f"[DB증권] Token request failed using {mode_label} (status {response.status_code}), trying fallback"
+                        )
+                        continue
+
                     return False
-                    
-                elif response.status_code == 401:
-                    logger.error(f"[DB증권] Authentication failed (401): {response.text[:500]}")
-                    logger.error("[DB증권] Check if API credentials are valid and active")
-                    return False
-                    
-                elif response.status_code == 400:
-                    logger.error(f"[DB증권] Bad request (400): {response.text[:500]}")
-                    logger.error("[DB증권] Check request format - should be form-urlencoded")
-                    return False
-                    
-                else:
-                    logger.warning(f"[DB증권] Unexpected response {response.status_code}: {response.text[:500]}")
-                    return False
-                        
+
         except httpx.TimeoutException:
             logger.error("[DB증권] Token request timeout after 30 seconds")
             return False
-        except httpx.RequestError as e:
-            logger.error(f"[DB증권] Network error during token request: {e}")
+        except httpx.RequestError as exc:
+            logger.error(f"[DB증권] Network error during token request: {exc}")
             return False
-        except Exception as e:
-            logger.error(f"[DB증권] Unexpected error during token refresh: {e}")
+        except Exception as exc:
+            logger.error(f"[DB증권] Unexpected error during token refresh: {exc}")
             return False
-    
+
     async def start_auto_refresh(self):
         """Start automatic token refresh task (every 23 hours)"""
         if not self.enabled:
