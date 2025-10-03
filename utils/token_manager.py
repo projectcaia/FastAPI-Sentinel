@@ -22,10 +22,27 @@ class DBSecTokenManager:
         app_secret: str,
         base_url: str = "https://openapi.dbsec.co.kr:8443"
     ):
-        self.app_key = app_key
-        self.app_secret = app_secret
-        self.base_url = base_url.rstrip("/")
+        # Strip all whitespace including newlines from credentials and URL
+        self.app_key = app_key.strip() if app_key else ""
+        self.app_secret = app_secret.strip() if app_secret else ""
+        
+        # Clean and validate base URL
+        cleaned_base_url = base_url.strip().rstrip("/") if base_url else ""
+        if not cleaned_base_url.startswith(("http://", "https://")):
+            raise ValueError(f"Invalid base_url format: {base_url!r}. Must start with http:// or https://")
+        
+        # Check for invalid characters in URL
+        invalid_chars = ['\n', '\r', '\t']
+        for char in invalid_chars:
+            if char in cleaned_base_url:
+                raise ValueError(f"Invalid character in base_url: {char!r} found in {base_url!r}")
+        
+        self.base_url = cleaned_base_url
         self.token_url = f"{self.base_url}/oauth2/token"
+        
+        # Log cleaned values (without secrets)
+        logger.info(f"DB Token Manager initialized with base_url: {self.base_url}")
+        logger.info(f"Token URL: {self.token_url}")
         
         self.access_token: Optional[str] = None
         self.token_type: str = "Bearer"
@@ -154,15 +171,20 @@ def get_token_manager() -> Optional[DBSecTokenManager]:
     global _token_manager
     
     if _token_manager is None:
-        app_key = os.getenv("DB_APP_KEY")
-        app_secret = os.getenv("DB_APP_SECRET")
-        base_url = os.getenv("DB_API_BASE", "https://openapi.dbsec.co.kr:8443")
+        # Strip whitespace and newlines from environment variables
+        app_key = os.getenv("DB_APP_KEY", "").strip()
+        app_secret = os.getenv("DB_APP_SECRET", "").strip()
+        base_url = os.getenv("DB_API_BASE", "https://openapi.dbsec.co.kr:8443").strip()
         
         if not app_key or not app_secret:
             logger.warning("DB_APP_KEY or DB_APP_SECRET not configured")
             return None
         
-        _token_manager = DBSecTokenManager(app_key, app_secret, base_url)
+        try:
+            _token_manager = DBSecTokenManager(app_key, app_secret, base_url)
+        except ValueError as e:
+            logger.error(f"Failed to initialize token manager: {e}")
+            return None
     
     return _token_manager
 

@@ -27,9 +27,22 @@ class KOSPI200FuturesMonitor:
         buffer_size: int = 100,
         ws_url: str = "wss://openapi.dbsec.co.kr:9443/ws"
     ):
-        self.ws_url = ws_url
+        # Strip whitespace and validate WebSocket URL
+        cleaned_ws_url = ws_url.strip() if ws_url else ""
+        if cleaned_ws_url and not cleaned_ws_url.startswith(("ws://", "wss://")):
+            raise ValueError(f"Invalid WebSocket URL format: {ws_url!r}. Must start with ws:// or wss://")
+        
+        # Check for invalid characters in URL
+        invalid_chars = ['\n', '\r', '\t']
+        for char in invalid_chars:
+            if char in cleaned_ws_url:
+                raise ValueError(f"Invalid character in WebSocket URL: {char!r} found in {ws_url!r}")
+        
+        self.ws_url = cleaned_ws_url
         self.alert_threshold = alert_threshold
         self.buffer_size = buffer_size
+        
+        logger.info(f"KOSPI200 Monitor initialized with WebSocket URL: {self.ws_url}")
         
         # Data buffers
         self.tick_buffer: Deque[Dict[str, Any]] = deque(maxlen=buffer_size)
@@ -321,15 +334,20 @@ def get_futures_monitor() -> KOSPI200FuturesMonitor:
     global _futures_monitor
     
     if _futures_monitor is None:
-        alert_threshold = float(os.getenv("DB_ALERT_THRESHOLD", "1.0"))
-        buffer_size = int(os.getenv("DB_BUFFER_SIZE", "100"))
-        ws_url = os.getenv("DB_WS_URL", "wss://openapi.dbsec.co.kr:9443/ws")
-        
-        _futures_monitor = KOSPI200FuturesMonitor(
-            alert_threshold=alert_threshold,
-            buffer_size=buffer_size,
-            ws_url=ws_url
-        )
+        try:
+            alert_threshold = float(os.getenv("DB_ALERT_THRESHOLD", "1.0").strip())
+            buffer_size = int(os.getenv("DB_BUFFER_SIZE", "100").strip())
+            ws_url = os.getenv("DB_WS_URL", "wss://openapi.dbsec.co.kr:9443/ws").strip()
+            
+            _futures_monitor = KOSPI200FuturesMonitor(
+                alert_threshold=alert_threshold,
+                buffer_size=buffer_size,
+                ws_url=ws_url
+            )
+        except (ValueError, TypeError) as e:
+            logger.error(f"Failed to initialize futures monitor: {e}")
+            # Create a default monitor as fallback
+            _futures_monitor = KOSPI200FuturesMonitor()
     
     return _futures_monitor
 
