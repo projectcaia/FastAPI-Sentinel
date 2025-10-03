@@ -111,18 +111,28 @@ class DBSecTokenManager:
 
         self._last_request_time = datetime.now(timezone.utc)
 
+        # Try DB증권-preferred formats in order:
+        # 1) form-urlencoded with lowercase keys (appkey/appsecret)
+        # 2) form-urlencoded with camelCase keys (appKey/appSecret)
+        # 3) JSON with camelCase keys (as a last resort)
         attempts = [
+            {
+                "mode": "FORM-LOWER",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "payload_key": "data",
+                "description": "form-urlencoded lowercase mode",
+            },
+            {
+                "mode": "FORM-CAMEL",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "payload_key": "data",
+                "description": "form-urlencoded camelCase mode",
+            },
             {
                 "mode": "JSON",
                 "headers": {"Content-Type": "application/json"},
                 "payload_key": "json",
                 "description": "JSON mode",
-            },
-            {
-                "mode": "FORM",
-                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                "payload_key": "data",
-                "description": "form-urlencoded mode",
             },
         ]
 
@@ -136,20 +146,31 @@ class DBSecTokenManager:
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
                 for index, attempt in enumerate(attempts):
-                    payload = {
-                        "grant_type": "client_credentials",
-                        "appKey": self.app_key,
-                        "appSecret": self.app_secret,
-                    }
+                    mode = attempt["mode"]
                     mode_label = attempt["description"]
-                    is_json_mode = attempt["mode"] == "JSON"
+                    is_json_mode = mode == "JSON"
                     headers = attempt["headers"]
+                    # Build payload per mode
+                    if mode == "FORM-LOWER":
+                        payload = {
+                            "grant_type": "client_credentials",
+                            "appkey": self.app_key,
+                            "appsecret": self.app_secret,
+                        }
+                    else:
+                        payload = {
+                            "grant_type": "client_credentials",
+                            "appKey": self.app_key,
+                            "appSecret": self.app_secret,
+                        }
                     request_kwargs = {attempt["payload_key"]: payload}
 
-                    if is_json_mode:
-                        logger.info("[DB증권] Attempting token request using JSON mode")
+                    if mode == "FORM-LOWER":
+                        logger.info("[DB증권] Attempting token request using form-urlencoded (lowercase) mode")
+                    elif mode == "FORM-CAMEL":
+                        logger.info("[DB증권] Token request fallback to form-urlencoded (camelCase) mode")
                     else:
-                        logger.info("[DB증권] Token request fallback to form-urlencoded mode")
+                        logger.info("[DB증권] Token request fallback to JSON mode")
 
                     logger.debug(f"[DB증권] Token endpoint: {self.token_url}")
                     logger.debug(f"[DB증권] Request headers: {headers}")
