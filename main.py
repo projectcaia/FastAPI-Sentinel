@@ -97,7 +97,7 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "")  # x-sentinel-key 로 사용
 SENTINEL_ACTIONS_BASE = os.getenv("SENTINEL_ACTIONS_BASE", "https://fastapi-sentinel-production.up.railway.app").strip()
-LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL         = os.getenv("LOG_LEVEL", "DEBUG").upper()  # Changed to DEBUG for detailed logging
 CAIA_VERBOSE      = os.getenv("CAIA_VERBOSE", "0") == "1"   # 0:요약로그, 1:상세로그
 
 # 타임아웃/폴링 ENV (필요 시 조정)

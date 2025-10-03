@@ -38,7 +38,8 @@ class DBSecTokenManager:
                 raise ValueError(f"Invalid character in base_url: {char!r} found in {base_url!r}")
         
         self.base_url = cleaned_base_url
-        self.token_url = f"{self.base_url}/oauth2/token"
+        # DB증권 API는 tokenP 엔드포인트를 사용할 수도 있음
+        self.token_url = f"{self.base_url}/oauth2/tokenP"  # Changed from /oauth2/token to /oauth2/tokenP
         
         # Log cleaned values (without secrets)
         logger.info(f"DB Token Manager initialized with base_url: {self.base_url}")
@@ -109,59 +110,106 @@ class DBSecTokenManager:
         """Refresh access token from DB증권 API"""
         self._last_request_time = datetime.now(timezone.utc)
         
+        # Try both token endpoints
+        token_endpoints = [
+            f"{self.base_url}/oauth2/tokenP",  # DB증권 specific endpoint
+            f"{self.base_url}/oauth2/token",   # Standard OAuth2 endpoint
+        ]
+        
         try:
-            # DB증권 API 토큰 요청 형식 (일반적인 한국 증권사 패턴)
-            headers = {
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0 (compatible; DB-Securities-API-Client)"
-            }
-            
-            # 다양한 토큰 요청 형식 시도
+            # 다양한 토큰 요청 형식 시도 (JSON과 Form-urlencoded 둘 다 시도)
             token_request_formats = [
-                # Format 1: Standard OAuth2 with JSON
+                # Format 1: Form-urlencoded with charset (한국 증권사 표준)
                 {
-                    "grant_type": "client_credentials",
-                    "appkey": self.app_key,
-                    "appsecret": self.app_secret
+                    "headers": {
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "User-Agent": "Mozilla/5.0 (compatible; DB-Securities-API-Client)"
+                    },
+                    "data": {
+                        "grant_type": "client_credentials",
+                        "appkey": self.app_key,
+                        "appsecret": self.app_secret
+                    },
+                    "use_form": True
                 },
-                # Format 2: Alternative field names
+                # Format 2: JSON with charset UTF-8 (일부 증권사 요구)
                 {
-                    "grant_type": "client_credentials", 
-                    "client_id": self.app_key,
-                    "client_secret": self.app_secret
+                    "headers": {
+                        "Content-Type": "application/json; charset=UTF-8",
+                        "User-Agent": "Mozilla/5.0 (compatible; DB-Securities-API-Client)"
+                    },
+                    "data": {
+                        "grant_type": "client_credentials",
+                        "appkey": self.app_key,
+                        "appsecret": self.app_secret
+                    },
+                    "use_form": False
                 },
-                # Format 3: DB증권 specific format
+                # Format 3: JSON format (fallback)
                 {
-                    "appkey": self.app_key,
-                    "secretkey": self.app_secret,
-                    "grant_type": "client_credentials"
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "User-Agent": "Mozilla/5.0 (compatible; DB-Securities-API-Client)"
+                    },
+                    "data": {
+                        "grant_type": "client_credentials",
+                        "appkey": self.app_key,
+                        "appsecret": self.app_secret
+                    },
+                    "use_form": False
+                },
+                # Format 4: Form-urlencoded without grant_type (일부 API에서 사용)
+                {
+                    "headers": {
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": "Mozilla/5.0 (compatible; DB-Securities-API-Client)"
+                    },
+                    "data": {
+                        "appkey": self.app_key,
+                        "appsecret": self.app_secret
+                    },
+                    "use_form": True
                 }
             ]
             
             timeout = httpx.Timeout(30.0)  # Increased timeout
             
-            for i, data in enumerate(token_request_formats):
-                try:
-                    logger.info(f"Attempting token request format {i+1}/3")
-                    
-                    async with httpx.AsyncClient(timeout=timeout) as client:
-                        response = await client.post(
-                            self.token_url,
-                            headers=headers,
-                            json=data  # Try JSON first
-                        )
+            for endpoint in token_endpoints:
+                logger.info(f"Trying endpoint: {endpoint}")
+                
+                for i, format_config in enumerate(token_request_formats):
+                    try:
+                        logger.info(f"Attempting token request format {i+1}/{len(token_request_formats)} on {endpoint}")
                         
-                        if response.status_code == 200:
-                            token_data = response.json()
-                            self.access_token = token_data.get("access_token")
-                            expires_in = token_data.get("expires_in", 86400)  # Default 24h
-                            self.token_type = token_data.get("token_type", "Bearer")
-                            
-                            # Set expiration time
-                            self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-                            
-                            logger.info(f"Token refreshed successfully with format {i+1}, expires at: {self.expires_at}")
-                            return True
+                        async with httpx.AsyncClient(timeout=timeout) as client:
+                            # Use form-urlencoded or JSON based on format configuration
+                            if format_config.get("use_form"):
+                                response = await client.post(
+                                    endpoint,
+                                    headers=format_config["headers"],
+                                    data=format_config["data"]  # form-urlencoded
+                                )
+                            else:
+                                response = await client.post(
+                                    endpoint,
+                                    headers=format_config["headers"],
+                                    json=format_config["data"]  # JSON
+                                )
+                        
+                            if response.status_code == 200:
+                                token_data = response.json()
+                                self.access_token = token_data.get("access_token")
+                                expires_in = token_data.get("expires_in", 86400)  # Default 24h
+                                self.token_type = token_data.get("token_type", "Bearer")
+                                
+                                # Set expiration time
+                                self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                                
+                                # Update the working token URL for future use
+                                self.token_url = endpoint
+                                
+                                logger.info(f"Token refreshed successfully with format {i+1} on {endpoint}, expires at: {self.expires_at}")
+                                return True
                         
                         # Handle specific DB증권 error codes
                         elif response.status_code == 403:
@@ -174,11 +222,12 @@ class DBSecTokenManager:
                             error_code = error_data.get("error_code", "")
                             error_desc = error_data.get("error_description", response.text)
                             
-                            if error_code == "IGW00103":
-                                logger.error(f"Invalid AppKey (format {i+1}): {error_desc}")
-                                if i == len(token_request_formats) - 1:  # Last format failed
-                                    logger.error("All token request formats failed. Please check your DB_APP_KEY.")
-                                    return False
+                            # Log specific error for debugging
+                            logger.debug(f"Response headers: {dict(response.headers)}")
+                            logger.debug(f"Response text: {response.text[:500]}")  # First 500 chars
+                            
+                            if error_code == "IGW00103" or "Content-Type" in error_desc:
+                                logger.error(f"Invalid request format or AppKey (format {i+1} on {endpoint}): {error_desc}")
                                 continue  # Try next format
                             elif error_code == "IGW00201":
                                 logger.error(f"API call limit exceeded: {error_desc}")
@@ -187,19 +236,22 @@ class DBSecTokenManager:
                             else:
                                 logger.error(f"Token refresh failed (format {i+1}): {response.status_code} - {error_desc}")
                                 continue
-                        else:
-                            logger.warning(f"Token request format {i+1} failed: {response.status_code} - {response.text}")
-                            continue
+                            else:
+                                logger.warning(f"Token request format {i+1} on {endpoint} failed: {response.status_code} - {response.text}")
+                                continue
                             
-                except Exception as e:
-                    logger.error(f"Token request format {i+1} error: {e}")
-                    continue
+                    except Exception as e:
+                        logger.error(f"Token request format {i+1} on {endpoint} error: {e}")
+                        continue
+                    
+                    # Add small delay between format attempts
+                    if i < len(token_request_formats) - 1:
+                        await asyncio.sleep(0.5)
                 
-                # Add delay between attempts to avoid rate limiting
-                if i < len(token_request_formats) - 1:
-                    await asyncio.sleep(2)
+                # Add delay between endpoint attempts
+                await asyncio.sleep(1)
             
-            logger.error("All token request formats failed")
+            logger.error("All token request formats on all endpoints failed")
             return False
                     
         except Exception as e:
