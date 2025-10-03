@@ -38,16 +38,16 @@ class DBSecTokenManager:
         
         # Initialize based on enabled state
         if self.enabled:
-            logger.info(f"DB Token Manager ENABLED - will connect to: {self.base_url}")
-            logger.info(f"Token URL: {self.token_url}")
-            logger.info(f"App Key configured: {'Yes' if self.app_key else 'No'} (length: {len(self.app_key) if self.app_key else 0})")
-            logger.info(f"App Secret configured: {'Yes' if self.app_secret else 'No'} (length: {len(self.app_secret) if self.app_secret else 0})")
+            logger.info(f"[DB증권] Token Manager ENABLED - will connect to: {self.base_url}")
+            logger.info(f"[DB증권] Token URL: {self.token_url}")
+            logger.info(f"[DB증권] App Key configured: {'Yes' if self.app_key else 'No'} (length: {len(self.app_key) if self.app_key else 0})")
+            logger.info(f"[DB증권] App Secret configured: {'Yes' if self.app_secret else 'No'} (length: {len(self.app_secret) if self.app_secret else 0})")
             
             self.access_token: Optional[str] = None
             self.token_type: str = "Bearer"
             self.expires_at: Optional[datetime] = None
         else:
-            logger.warning("DB Token Manager DISABLED (mock mode) - no API calls will be made")
+            logger.warning("[DB증권] Token Manager DISABLED (mock mode) - no API calls will be made")
             # Use mock token for disabled mode
             self.access_token: Optional[str] = "MOCK_TOKEN_DISABLED"
             self.token_type: str = "Bearer"
@@ -59,7 +59,7 @@ class DBSecTokenManager:
         # Rate limiting and error tracking (only for enabled mode)
         self._last_request_time: Optional[datetime] = None
         self._consecutive_failures = 0
-        self._backoff_until: Optional[datetime] = None
+        self._backoff_seconds = 60  # Fixed 60 second retry on failure
         
     async def get_token(self) -> Optional[str]:
         """Get current valid access token"""
@@ -67,11 +67,7 @@ class DBSecTokenManager:
             return self.access_token  # Return mock token
             
         async with self._lock:
-            # Check if we're in backoff period
-            if self._is_in_backoff():
-                logger.warning(f"Token refresh in backoff period until {self._backoff_until}")
-                return None
-                
+            # Check if token is still valid
             if self._is_token_valid():
                 return self.access_token
             
@@ -79,21 +75,19 @@ class DBSecTokenManager:
             if self._last_request_time:
                 time_since_last = datetime.now(timezone.utc) - self._last_request_time
                 if time_since_last.total_seconds() < 30:
-                    logger.warning(f"Rate limiting: {30 - time_since_last.total_seconds():.1f}s until next request")
-                    return None
+                    wait_time = 30 - time_since_last.total_seconds()
+                    logger.warning(f"[DB증권] Rate limiting: waiting {wait_time:.1f}s until next request")
+                    await asyncio.sleep(wait_time)
             
             # Token expired or not exists, refresh it
             success = await self._refresh_token()
             if success:
                 self._consecutive_failures = 0
-                self._backoff_until = None
+                logger.info("[DB증권] Token acquired successfully")
             else:
                 self._consecutive_failures += 1
-                # Exponential backoff: 1min, 5min, 15min, 30min, 1hr
-                backoff_minutes = min(60, 1 * (3 ** self._consecutive_failures))
-                self._backoff_until = datetime.now(timezone.utc) + timedelta(minutes=backoff_minutes)
-                logger.error(f"Token refresh failed ({self._consecutive_failures} consecutive failures). "
-                           f"Next attempt in {backoff_minutes} minutes at {self._backoff_until}")
+                logger.error(f"[DB증권] Token refresh failed ({self._consecutive_failures} consecutive failures)")
+                logger.info(f"[DB증권] Will retry in {self._backoff_seconds} seconds")
                 
             return self.access_token
     
@@ -109,159 +103,132 @@ class DBSecTokenManager:
         buffer_time = datetime.now(timezone.utc) + timedelta(minutes=5)
         return self.expires_at > buffer_time
     
-    def _is_in_backoff(self) -> bool:
-        """Check if we're currently in backoff period"""
-        if not self.enabled:
-            return False  # No backoff in mock mode
-            
-        if not self._backoff_until:
-            return False
-        return datetime.now(timezone.utc) < self._backoff_until
-    
     async def _refresh_token(self) -> bool:
         """Refresh access token from DB증권 API"""
         if not self.enabled:
-            logger.debug("Token refresh skipped - mock mode")
+            logger.debug("[DB증권] Token refresh skipped - mock mode")
             return True
             
         self._last_request_time = datetime.now(timezone.utc)
         
         try:
-            # DB증권 API requires specific format based on Korean securities API patterns
-            token_request_formats = [
-                # Format 1: Standard form-urlencoded (most Korean brokers)
-                {
-                    "headers": {
-                        "Content-Type": "application/x-www-form-urlencoded"
-                    },
-                    "data": {
-                        "grant_type": "client_credentials",
-                        "appkey": self.app_key,
-                        "appsecret": self.app_secret
-                    },
-                    "use_form": True
-                },
-                # Format 2: With scope parameter
-                {
-                    "headers": {
-                        "Content-Type": "application/x-www-form-urlencoded"
-                    },
-                    "data": {
-                        "grant_type": "client_credentials",
-                        "appkey": self.app_key,
-                        "appsecret": self.app_secret,
-                        "scope": "oob"
-                    },
-                    "use_form": True
-                },
-                # Format 3: JSON format as fallback
-                {
-                    "headers": {
-                        "Content-Type": "application/json"
-                    },
-                    "data": {
-                        "grant_type": "client_credentials",
-                        "appkey": self.app_key,
-                        "appsecret": self.app_secret
-                    },
-                    "use_form": False
-                }
-            ]
+            # DB증권 OpenAPI requires strict form-urlencoded format
+            # Field names must be lowercase: appkey, appsecret (not appKey or AppKey)
+            
+            # Prepare form data - must be exactly these field names
+            form_data = {
+                "grant_type": "client_credentials",
+                "appkey": self.app_key,      # Must be lowercase 'appkey'
+                "appsecret": self.app_secret  # Must be lowercase 'appsecret'
+            }
+            
+            # Headers for form-urlencoded
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            
+            # Log request info (safely, without exposing secrets)
+            logger.info(f"[DB증권] Sending token request with grant_type=client_credentials, "
+                       f"appkey length={len(self.app_key)}, appsecret length={len(self.app_secret)}")
+            logger.debug(f"[DB증권] Token endpoint: {self.token_url}")
+            logger.debug(f"[DB증권] Request headers: {headers}")
             
             timeout = httpx.Timeout(30.0)
             
-            for i, format_config in enumerate(token_request_formats):
-                try:
-                    logger.info(f"Attempting token request format {i+1}/{len(token_request_formats)}")
-                    logger.debug(f"Request headers: {format_config['headers']}")
-                    logger.debug(f"Request data fields: {list(format_config['data'].keys())}")
-                    
-                    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                        # Use form-urlencoded or JSON based on format configuration
-                        if format_config.get("use_form"):
-                            response = await client.post(
-                                self.token_url,
-                                headers=format_config["headers"],
-                                data=format_config["data"]  # form-urlencoded
-                            )
-                        else:
-                            response = await client.post(
-                                self.token_url,
-                                headers=format_config["headers"],
-                                json=format_config["data"]  # JSON
-                            )
-                        
-                        if response.status_code == 200:
-                            token_data = response.json()
-                            self.access_token = token_data.get("access_token")
-                            expires_in = token_data.get("expires_in", 86400)  # Default 24h
-                            self.token_type = token_data.get("token_type", "Bearer")
-                            
-                            # Set expiration time
-                            self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-                            
-                            logger.info(f"Token refreshed successfully with format {i+1}, expires at: {self.expires_at}")
-                            return True
-                        
-                        # Handle specific DB증권 error codes
-                        elif response.status_code == 403:
-                            error_data = {}
-                            try:
-                                error_data = response.json()
-                            except:
-                                pass
-                                
-                            error_code = error_data.get("error_code", "")
-                            error_desc = error_data.get("error_description", response.text)
-                            
-                            # Log specific error for debugging
-                            logger.debug(f"Response headers: {dict(response.headers)}")
-                            logger.debug(f"Response text: {response.text[:500]}")  # First 500 chars
-                            
-                            if error_code == "IGW00103" or "Content-Type" in error_desc:
-                                logger.error(f"Invalid request format or AppKey (format {i+1}): {error_desc}")
-                                continue  # Try next format
-                            elif error_code == "IGW00105":
-                                logger.error(f"Invalid AppSecret: {error_desc}")
-                                logger.error("Please check DB_APP_SECRET environment variable")
-                                return False  # Don't retry with wrong credentials
-                            elif error_code == "IGW00201":
-                                logger.error(f"API call limit exceeded: {error_desc}")
-                                logger.error("Stopping token refresh attempts to prevent further quota usage")
-                                return False
-                            else:
-                                logger.error(f"Token refresh failed (format {i+1}): {response.status_code} - {error_desc}")
-                                continue
-                        else:
-                            logger.warning(f"Token request format {i+1} failed: {response.status_code} - {response.text}")
-                            continue
-                            
-                except Exception as e:
-                    logger.error(f"Token request format {i+1} error: {e}")
-                    continue
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                # Send as form-encoded data, NOT JSON
+                response = await client.post(
+                    self.token_url,
+                    headers=headers,
+                    data=form_data  # This will be form-encoded automatically
+                )
                 
-                # Add small delay between format attempts
-                if i < len(token_request_formats) - 1:
-                    await asyncio.sleep(1)
-            
-            logger.error("All token request formats failed")
-            return False
+                logger.debug(f"[DB증권] Response status: {response.status_code}")
+                logger.debug(f"[DB증권] Response headers: {dict(response.headers)}")
+                
+                if response.status_code == 200:
+                    try:
+                        token_data = response.json()
+                        self.access_token = token_data.get("access_token")
+                        expires_in = token_data.get("expires_in", 86400)  # Default 24h
+                        self.token_type = token_data.get("token_type", "Bearer")
+                        
+                        if not self.access_token:
+                            logger.error("[DB증권] Response missing access_token field")
+                            return False
+                        
+                        # Set expiration time
+                        self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                        
+                        logger.info(f"[DB증권] Token acquired successfully, expires at: {self.expires_at}")
+                        logger.info(f"[DB증권] Token type: {self.token_type}, expires in: {expires_in}s")
+                        return True
+                        
+                    except json.JSONDecodeError as e:
+                        logger.error(f"[DB증권] Failed to parse token response: {e}")
+                        logger.error(f"[DB증권] Response text: {response.text[:500]}")
+                        return False
+                
+                # Handle error responses
+                elif response.status_code == 403:
+                    try:
+                        error_data = response.json()
+                        error_code = error_data.get("error_code", "")
+                        error_desc = error_data.get("error_description", response.text)
+                        
+                        if error_code == "IGW00105":
+                            logger.error(f"[DB증권] Invalid AppSecret: {error_desc}")
+                            logger.error("[DB증권] Please check DB_APP_SECRET environment variable")
+                            logger.error("[DB증권] Make sure the secret is exactly as provided by DB증권")
+                        elif error_code == "IGW00103":
+                            logger.error(f"[DB증권] Invalid AppKey: {error_desc}")
+                            logger.error("[DB증권] Please check DB_APP_KEY environment variable")
+                        elif error_code == "IGW00201":
+                            logger.error(f"[DB증권] API call limit exceeded: {error_desc}")
+                            logger.error("[DB증권] Wait for quota reset or contact DB증권 support")
+                        else:
+                            logger.error(f"[DB증권] Auth error {error_code}: {error_desc}")
+                            
+                    except:
+                        logger.error(f"[DB증권] Auth failed with 403: {response.text[:500]}")
                     
+                    return False
+                    
+                elif response.status_code == 401:
+                    logger.error(f"[DB증권] Authentication failed (401): {response.text[:500]}")
+                    logger.error("[DB증권] Check if API credentials are valid and active")
+                    return False
+                    
+                elif response.status_code == 400:
+                    logger.error(f"[DB증권] Bad request (400): {response.text[:500]}")
+                    logger.error("[DB증권] Check request format - should be form-urlencoded")
+                    return False
+                    
+                else:
+                    logger.warning(f"[DB증권] Unexpected response {response.status_code}: {response.text[:500]}")
+                    return False
+                        
+        except httpx.TimeoutException:
+            logger.error("[DB증권] Token request timeout after 30 seconds")
+            return False
+        except httpx.RequestError as e:
+            logger.error(f"[DB증권] Network error during token request: {e}")
+            return False
         except Exception as e:
-            logger.error(f"Token refresh error: {e}")
+            logger.error(f"[DB증권] Unexpected error during token refresh: {e}")
             return False
     
     async def start_auto_refresh(self):
         """Start automatic token refresh task (every 23 hours)"""
         if not self.enabled:
-            logger.info("Auto refresh disabled - mock mode")
+            logger.info("[DB증권] Auto refresh disabled - mock mode")
             return
             
         if self._refresh_task and not self._refresh_task.done():
             return
         
         self._refresh_task = asyncio.create_task(self._auto_refresh_loop())
-        logger.info("Auto refresh task started")
+        logger.info("[DB증권] Auto refresh task started")
     
     async def stop_auto_refresh(self):
         """Stop automatic token refresh task"""
@@ -271,7 +238,7 @@ class DBSecTokenManager:
                 await self._refresh_task
             except asyncio.CancelledError:
                 pass
-        logger.info("Auto refresh task stopped")
+        logger.info("[DB증권] Auto refresh task stopped")
     
     async def _auto_refresh_loop(self):
         """Auto refresh loop - runs every 23 hours"""
@@ -280,20 +247,27 @@ class DBSecTokenManager:
             
         try:
             # Initial token fetch
-            await self.get_token()
+            token = await self.get_token()
+            if not token:
+                logger.warning("[DB증권] Initial token fetch failed, will retry")
             
             while True:
-                # Wait 23 hours (23 * 3600 seconds)
-                await asyncio.sleep(23 * 3600)
+                if self._is_token_valid():
+                    # Wait until near expiration (23 hours)
+                    await asyncio.sleep(23 * 3600)
+                else:
+                    # Token invalid, retry after backoff
+                    await asyncio.sleep(self._backoff_seconds)
                 
+                # Try to refresh token
                 async with self._lock:
                     await self._refresh_token()
                     
         except asyncio.CancelledError:
-            logger.info("Auto refresh loop cancelled")
+            logger.info("[DB증권] Auto refresh loop cancelled")
             raise
         except Exception as e:
-            logger.error(f"Auto refresh loop error: {e}")
+            logger.error(f"[DB증권] Auto refresh loop error: {e}")
     
     def get_auth_header(self) -> Dict[str, str]:
         """Get authorization header for API requests"""
@@ -320,9 +294,9 @@ class DBSecTokenManager:
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
             "refresh_task_active": bool(self._refresh_task and not self._refresh_task.done()),
             "consecutive_failures": self._consecutive_failures,
-            "in_backoff": self._is_in_backoff(),
-            "backoff_until": self._backoff_until.isoformat() if self._backoff_until else None,
-            "last_request_time": self._last_request_time.isoformat() if self._last_request_time else None
+            "last_request_time": self._last_request_time.isoformat() if self._last_request_time else None,
+            "app_key_length": len(self.app_key) if self.app_key else 0,
+            "app_secret_length": len(self.app_secret) if self.app_secret else 0
         }
 
 
@@ -348,6 +322,10 @@ def get_token_manager() -> Optional[DBSecTokenManager]:
         elif not app_key or not app_secret:
             logger.warning("[DB증권] Missing DB_APP_KEY or DB_APP_SECRET - using mock mode")
             dbsec_enabled = False
+        else:
+            logger.info(f"[DB증권] Initializing with credentials: "
+                       f"key={app_key[:4]}...{app_key[-4:] if len(app_key) > 8 else 'SHORT'}, "
+                       f"secret={'*' * len(app_secret)}")
         
         try:
             _token_manager = DBSecTokenManager(
@@ -357,7 +335,7 @@ def get_token_manager() -> Optional[DBSecTokenManager]:
                 enabled=dbsec_enabled
             )
         except ValueError as e:
-            logger.error(f"Failed to initialize token manager: {e}")
+            logger.error(f"[DB증권] Failed to initialize token manager: {e}")
             return None
     
     return _token_manager
