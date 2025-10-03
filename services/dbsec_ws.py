@@ -9,8 +9,12 @@ import os
 from collections import deque
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Callable, Deque
-import websockets
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError
+import websocket
+from websocket import WebSocketException
+from websocket._exceptions import (
+    WebSocketConnectionClosedException,
+    WebSocketTimeoutException,
+)
 import httpx
 import requests
 
@@ -54,7 +58,7 @@ class KOSPI200FuturesMonitor:
         self.daily_open_price: Optional[float] = None  # Store daily open for % calculation
         
         # Connection state
-        self.websocket: Optional[websockets.WebSocketServerProtocol] = None
+        self.websocket: Optional[websocket.WebSocket] = None
         self.is_connected: bool = False
         self.reconnect_attempts: int = 0
         self.max_reconnect_attempts: int = 10 if enabled else 0
@@ -88,10 +92,10 @@ class KOSPI200FuturesMonitor:
             try:
                 await self._connect_and_monitor()
                 
-            except (ConnectionClosed, ConnectionClosedError) as e:
+            except (WebSocketConnectionClosedException, WebSocketException) as e:
                 self.reconnect_attempts += 1
                 logger.warning(f"WebSocket connection lost (attempt {self.reconnect_attempts}): {e}")
-                
+
                 if self.reconnect_attempts < self.max_reconnect_attempts:
                     # Exponential backoff: 2^attempt seconds (max 60s)
                     backoff = min(2 ** self.reconnect_attempts, 60)
@@ -139,25 +143,59 @@ class KOSPI200FuturesMonitor:
         
         logger.info(f"Connecting to WebSocket: {self.ws_url}")
         
-        async with websockets.connect(
+        header_list = [f"{k}: {v}" for k, v in headers.items()]
+
+        logger.debug(
+            "Using websocket-client header list for compatibility: %s",
+            header_list,
+        )
+
+        ws = await asyncio.to_thread(
+            websocket.create_connection,
             self.ws_url,
-            extra_headers=headers,
-            ping_interval=30,
-            ping_timeout=10,
-            close_timeout=10
-        ) as websocket:
-            self.websocket = websocket
-            self.is_connected = True
-            self.reconnect_attempts = 0
-            
-            logger.info("WebSocket connected successfully")
-            
+            header=header_list,
+            timeout=30,
+            enable_multithread=True,
+        )
+
+        self.websocket = ws
+        self.is_connected = True
+        self.reconnect_attempts = 0
+
+        logger.info("WebSocket connected successfully")
+
+        # Ensure recv does not block forever
+        await asyncio.to_thread(ws.settimeout, 30)
+
+        try:
             # Subscribe to KOSPI200 futures
             await self._subscribe_futures()
-            
+
             # Listen for messages
-            async for message in websocket:
+            while self.is_connected:
+                try:
+                    message = await asyncio.to_thread(ws.recv)
+                except WebSocketTimeoutException:
+                    # Keep the loop alive if no data arrives in timeout window
+                    continue
+
+                if message is None:
+                    continue
+
+                if isinstance(message, bytes):
+                    message = message.decode("utf-8", "ignore")
+
                 await self._handle_message(message)
+
+        except WebSocketConnectionClosedException as exc:
+            raise exc
+        finally:
+            self.is_connected = False
+            if self.websocket:
+                try:
+                    await asyncio.to_thread(self.websocket.close)
+                finally:
+                    self.websocket = None
                 
     async def _subscribe_futures(self):
         """Subscribe to KOSPI200 futures real-time data"""
@@ -174,7 +212,10 @@ class KOSPI200FuturesMonitor:
             }
         }
         
-        await self.websocket.send(json.dumps(subscribe_msg))
+        if not self.websocket:
+            raise RuntimeError("WebSocket connection is not established")
+
+        await asyncio.to_thread(self.websocket.send, json.dumps(subscribe_msg))
         logger.info("Subscribed to KOSPI200 futures real-time data")
         
     async def _handle_message(self, message: str):
@@ -410,8 +451,10 @@ class KOSPI200FuturesMonitor:
         """Stop WebSocket monitoring"""
         self.is_connected = False
         if self.websocket:
-            await self.websocket.close()
-            self.websocket = None
+            try:
+                await asyncio.to_thread(self.websocket.close)
+            finally:
+                self.websocket = None
         logger.info("WebSocket monitoring stopped")
 
 
