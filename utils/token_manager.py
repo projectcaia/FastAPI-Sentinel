@@ -213,32 +213,32 @@ class DBSecTokenManager:
                             
                             # Handle specific DB증권 error codes
                             elif response.status_code == 403:
-                            error_data = {}
-                            try:
-                                error_data = response.json()
-                            except:
-                                pass
+                                error_data = {}
+                                try:
+                                    error_data = response.json()
+                                except:
+                                    pass
+                                    
+                                error_code = error_data.get("error_code", "")
+                                error_desc = error_data.get("error_description", response.text)
                                 
-                            error_code = error_data.get("error_code", "")
-                            error_desc = error_data.get("error_description", response.text)
-                            
-                            # Log specific error for debugging
-                            logger.debug(f"Response headers: {dict(response.headers)}")
-                            logger.debug(f"Response text: {response.text[:500]}")  # First 500 chars
-                            
-                            if error_code == "IGW00103" or "Content-Type" in error_desc:
-                                logger.error(f"Invalid request format or AppKey (format {i+1} on {endpoint}): {error_desc}")
-                                continue  # Try next format
-                            elif error_code == "IGW00201":
-                                logger.error(f"API call limit exceeded: {error_desc}")
-                                logger.error("Stopping token refresh attempts to prevent further quota usage")
-                                return False
+                                # Log specific error for debugging
+                                logger.debug(f"Response headers: {dict(response.headers)}")
+                                logger.debug(f"Response text: {response.text[:500]}")  # First 500 chars
+                                
+                                if error_code == "IGW00103" or "Content-Type" in error_desc:
+                                    logger.error(f"Invalid request format or AppKey (format {i+1} on {endpoint}): {error_desc}")
+                                    continue  # Try next format
+                                elif error_code == "IGW00201":
+                                    logger.error(f"API call limit exceeded: {error_desc}")
+                                    logger.error("Stopping token refresh attempts to prevent further quota usage")
+                                    return False
+                                else:
+                                    logger.error(f"Token refresh failed (format {i+1}): {response.status_code} - {error_desc}")
+                                    continue
                             else:
-                                logger.error(f"Token refresh failed (format {i+1}): {response.status_code} - {error_desc}")
+                                logger.warning(f"Token request format {i+1} on {endpoint} failed: {response.status_code} - {response.text}")
                                 continue
-                        else:
-                            logger.warning(f"Token request format {i+1} on {endpoint} failed: {response.status_code} - {response.text}")
-                            continue
                             
                     except Exception as e:
                         logger.error(f"Token request format {i+1} on {endpoint} error: {e}")
