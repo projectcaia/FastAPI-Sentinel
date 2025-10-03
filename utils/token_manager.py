@@ -114,22 +114,95 @@ class DBSecTokenManager:
         # Try DB증권 권장 순서대로 인증 시도 (오류 코드에 따라 순차 폴백)
         attempts = [
             {
-                "mode": "FORM-LOWER",
-                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
-                "payload_key": "data",
                 "description": "form-urlencoded lowercase",
-            },
-            {
-                "mode": "JSON",
-                "headers": {"Content-Type": "application/json"},
-                "payload_key": "json",
-                "description": "JSON camelCase",
-            },
-            {
-                "mode": "FORM-CAMEL",
-                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
                 "payload_key": "data",
+                "headers": {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept": "application/json",
+                },
+                "payload_builder": lambda: {
+                    "grant_type": "client_credentials",
+                    "appkey": self.app_key,
+                    "appsecret": self.app_secret,
+                },
+            },
+            {
+                "description": "form-urlencoded lowercase secretKey",
+                "payload_key": "data",
+                "headers": {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept": "application/json",
+                },
+                "payload_builder": lambda: {
+                    "grant_type": "client_credentials",
+                    "appkey": self.app_key,
+                    "appsecretkey": self.app_secret,
+                },
+            },
+            {
                 "description": "form-urlencoded camelCase",
+                "payload_key": "data",
+                "headers": {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept": "application/json",
+                },
+                "payload_builder": lambda: {
+                    "grant_type": "client_credentials",
+                    "appKey": self.app_key,
+                    "appSecret": self.app_secret,
+                },
+            },
+            {
+                "description": "form-urlencoded camelCase secretKey",
+                "payload_key": "data",
+                "headers": {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept": "application/json",
+                },
+                "payload_builder": lambda: {
+                    "grant_type": "client_credentials",
+                    "appKey": self.app_key,
+                    "appSecretKey": self.app_secret,
+                },
+            },
+            {
+                "description": "form-urlencoded client credentials",
+                "payload_key": "data",
+                "headers": {
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "Accept": "application/json",
+                },
+                "payload_builder": lambda: {
+                    "grant_type": "client_credentials",
+                    "client_id": self.app_key,
+                    "client_secret": self.app_secret,
+                },
+            },
+            {
+                "description": "JSON camelCase",
+                "payload_key": "json",
+                "headers": {
+                    "Content-Type": "application/json; charset=UTF-8",
+                    "Accept": "application/json",
+                },
+                "payload_builder": lambda: {
+                    "grant_type": "client_credentials",
+                    "appKey": self.app_key,
+                    "appSecret": self.app_secret,
+                },
+            },
+            {
+                "description": "JSON lowercase",
+                "payload_key": "json",
+                "headers": {
+                    "Content-Type": "application/json; charset=UTF-8",
+                    "Accept": "application/json",
+                },
+                "payload_builder": lambda: {
+                    "grant_type": "client_credentials",
+                    "appkey": self.app_key,
+                    "appsecret": self.app_secret,
+                },
             },
         ]
 
@@ -143,31 +216,17 @@ class DBSecTokenManager:
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
                 for index, attempt in enumerate(attempts):
-                    mode = attempt["mode"]
-                    headers = attempt["headers"]
+                    headers = dict(attempt["headers"])
+                    # Some DB증권 samples expect appkey/appsecret headers as well
+                    headers.setdefault("appkey", self.app_key)
+                    headers.setdefault("appsecret", self.app_secret)
+
+                    payload = attempt["payload_builder"]()
                     payload_key = attempt["payload_key"]
 
-                    if mode == "FORM-LOWER":
-                        payload = {
-                            "grant_type": "client_credentials",
-                            "appkey": self.app_key,
-                            "appsecret": self.app_secret,
-                        }
-                        logger.info("[DB증권] Attempting token request using form-urlencoded (lowercase) mode")
-                    elif mode == "FORM-CAMEL":
-                        payload = {
-                            "grant_type": "client_credentials",
-                            "appKey": self.app_key,
-                            "appSecret": self.app_secret,
-                        }
-                        logger.info("[DB증권] Token request fallback to form-urlencoded (camelCase) mode")
-                    else:  # JSON
-                        payload = {
-                            "grant_type": "client_credentials",
-                            "appKey": self.app_key,
-                            "appSecret": self.app_secret,
-                        }
-                        logger.info("[DB증권] Token request fallback to JSON mode")
+                    logger.info(
+                        f"[DB증권] Attempting token request using {attempt['description']}"
+                    )
 
                     request_kwargs = {payload_key: payload}
 
