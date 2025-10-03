@@ -111,14 +111,26 @@ class DBSecTokenManager:
 
         self._last_request_time = datetime.now(timezone.utc)
 
-        # Try DB증권 권장 순서대로 인증 시도
-        # 1) JSON (camelCase) with explicit charset
-        # 2) form-urlencoded lowercase (appkey/appsecret)
-        # 3) form-urlencoded camelCase (appKey/appSecret)
+        # Try DB증권 권장 순서대로 인증 시도 (오류 코드에 따라 순차 폴백)
         attempts = [
-            "JSON",
-            "FORM-LOWER",
-            "FORM-CAMEL",
+            {
+                "mode": "FORM-LOWER",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "payload_key": "data",
+                "description": "form-urlencoded lowercase",
+            },
+            {
+                "mode": "JSON",
+                "headers": {"Content-Type": "application/json"},
+                "payload_key": "json",
+                "description": "JSON camelCase",
+            },
+            {
+                "mode": "FORM-CAMEL",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+                "payload_key": "data",
+                "description": "form-urlencoded camelCase",
+            },
         ]
 
         logger.info(
@@ -130,45 +142,32 @@ class DBSecTokenManager:
 
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
-                for index, mode in enumerate(attempts):
-                    is_json_mode = mode == "JSON"
+                for index, attempt in enumerate(attempts):
+                    mode = attempt["mode"]
+                    headers = attempt["headers"]
+                    payload_key = attempt["payload_key"]
 
-                    if mode == "JSON":
-                        headers = {
-                            "Content-Type": "application/json; charset=UTF-8",
-                            "Accept": "application/json",
-                        }
-                        payload = {
-                            "grant_type": "client_credentials",
-                            "appKey": self.app_key,
-                            "appSecret": self.app_secret,
-                        }
-                        payload_key = "json"
-                        logger.info("[DB증권] Attempting token request using JSON mode")
-                    elif mode == "FORM-LOWER":
-                        headers = {
-                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                            "Accept": "application/json",
-                        }
+                    if mode == "FORM-LOWER":
                         payload = {
                             "grant_type": "client_credentials",
                             "appkey": self.app_key,
                             "appsecret": self.app_secret,
                         }
-                        payload_key = "data"
-                        logger.info("[DB증권] Token request fallback to form-urlencoded (lowercase) mode")
-                    else:  # FORM-CAMEL
-                        headers = {
-                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                            "Accept": "application/json",
-                        }
+                        logger.info("[DB증권] Attempting token request using form-urlencoded (lowercase) mode")
+                    elif mode == "FORM-CAMEL":
                         payload = {
                             "grant_type": "client_credentials",
                             "appKey": self.app_key,
                             "appSecret": self.app_secret,
                         }
-                        payload_key = "data"
                         logger.info("[DB증권] Token request fallback to form-urlencoded (camelCase) mode")
+                    else:  # JSON
+                        payload = {
+                            "grant_type": "client_credentials",
+                            "appKey": self.app_key,
+                            "appSecret": self.app_secret,
+                        }
+                        logger.info("[DB증권] Token request fallback to JSON mode")
 
                     request_kwargs = {payload_key: payload}
 
@@ -202,7 +201,7 @@ class DBSecTokenManager:
 
                         self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-                        logger.info(f"[DB증권] Token request succeeded using {mode}")
+                        logger.info(f"[DB증권] Token request succeeded using {attempt['description']}")
                         logger.info(f"[DB증권] Access token acquired, expires in {expires_in}s")
                         logger.debug(f"[DB증권] Token expires at: {self.expires_at}")
                         logger.debug(f"[DB증권] Token type: {self.token_type}")
@@ -239,7 +238,7 @@ class DBSecTokenManager:
 
                     if index < len(attempts) - 1:
                         logger.warning(
-                            f"[DB증권] Token request failed using {mode} (status {response.status_code}), trying fallback"
+                            f"[DB증권] Token request failed using {attempt['description']} (status {response.status_code}), trying fallback"
                         )
                         continue
 
