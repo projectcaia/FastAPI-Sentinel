@@ -138,6 +138,12 @@ def within_dedup(idx: str, lvl: str) -> bool:
     _last_fired[k] = now
     return False
 
+# ── DB증권 Router Integration ────────────────────────────────────────
+from routers.dbsec import router as dbsec_router
+
+# Include DB증권 router
+app.include_router(dbsec_router)
+
 # ── Utils ────────────────────────────────────────────────────────────
 
 def _oai_headers() -> Dict[str, str]:

@@ -6,5 +6,7 @@ python-dotenv==1.0.*   # (선택) 로컬 .env 사용 시
 yfinance>=0.2.40
 httpx
 pydantic
+websockets>=12.0       # DB증권 WebSocket client
+pytz>=2023.3          # Timezone handling for trading sessions
 
 holidays>=0.57
