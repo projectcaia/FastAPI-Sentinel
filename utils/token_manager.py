@@ -210,3 +210,22 @@ def get_token_manager() -> DBSecTokenManager:
         base_url = os.getenv("DB_API_BASE", "https://openapi.dbsec.co.kr:8443")
         _token_manager = DBSecTokenManager(app_key, app_secret, base_url, scope, enabled)
     return _token_manager
+
+async def init_token_manager():
+    """Initialize and start the global token manager"""
+    manager = get_token_manager()
+    if manager:
+        await manager.start_auto_refresh()
+        if manager.enabled:
+            logger.info("[DBSEC] Token Manager initialized in PRODUCTION mode")
+        else:
+            logger.info("[DBSEC] Token Manager initialized in MOCK mode")
+
+
+async def shutdown_token_manager():
+    """Shutdown the global token manager"""
+    global _token_manager
+    if _token_manager:
+        await _token_manager.stop_auto_refresh()
+        _token_manager = None
+        logger.info("[DBSEC] Token Manager shutdown")
