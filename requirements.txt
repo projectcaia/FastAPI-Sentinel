@@ -1,12 +1,10 @@
 fastapi==0.110.*
 uvicorn[standard]==0.29.*
-pydantic==2.*
+pydantic==2.*                 # 최신 v2 유지
 requests==2.32.*
-python-dotenv==1.0.*   # (선택) 로컬 .env 사용 시
+python-dotenv==1.0.*          # (선택) 로컬 .env 사용 시
 yfinance>=0.2.40
-httpx
-pydantic
-websocket-client>=1.5.0  # DB증권 WebSocket client
-pytz>=2023.3          # Timezone handling for trading sessions
-
-holidays>=0.57
+httpx==0.27.0                 # 버전 통일 (권장 안정판)
+websocket-client>=1.5.0       # DB증권 WebSocket client (extra_headers 지원)
+pytz>=2023.3                  # Timezone handling for trading sessions
+holidays>=0.57                # 휴일 처리 라이브러리
