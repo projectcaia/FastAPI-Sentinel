@@ -8,15 +8,18 @@ import logging
 import os
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Callable, Deque
+from typing import Optional, Dict, Any, Callable, Deque, Sequence
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
 import websocket
 from websocket import WebSocketException
 from websocket._exceptions import (
     WebSocketConnectionClosedException,
     WebSocketTimeoutException,
 )
-import httpx
 import requests
+import holidays
+import pytz
 
 from utils.token_manager import get_token_manager
 
@@ -31,13 +34,14 @@ class KOSPI200FuturesMonitor:
         alert_threshold: float = 1.0,  # 1% change threshold for CRITICAL
         warn_threshold: float = 0.5,   # 0.5% change threshold for WARN
         buffer_size: int = 100,
-        ws_url: str = "wss://openapi.dbsec.co.kr:9443/ws",
+        ws_url: Optional[str] = None,
         enabled: bool = True
     ):
         self.enabled = enabled
         
         # Strip whitespace and validate WebSocket URL
-        cleaned_ws_url = ws_url.strip() if ws_url else ""
+        resolved_ws_url = ws_url or os.getenv("DB_WS_URL", "wss://openapi.dbsec.co.kr:9443/ws")
+        cleaned_ws_url = resolved_ws_url.strip() if resolved_ws_url else ""
         if enabled and cleaned_ws_url and not cleaned_ws_url.startswith(("ws://", "wss://")):
             raise ValueError(f"Invalid WebSocket URL format: {ws_url!r}. Must start with ws:// or wss://")
         
@@ -56,7 +60,7 @@ class KOSPI200FuturesMonitor:
         self.last_price: Optional[float] = None
         self.last_alert_time: Optional[datetime] = None
         self.daily_open_price: Optional[float] = None  # Store daily open for % calculation
-        
+
         # Connection state
         self.websocket: Optional[websocket.WebSocket] = None
         self.is_connected: bool = False
@@ -68,7 +72,9 @@ class KOSPI200FuturesMonitor:
         
         # Session tracking
         self.current_session: str = "UNKNOWN"  # DAY or NIGHT
-        
+        self.krx_holidays = holidays.KR()
+        self.kst = pytz.timezone("Asia/Seoul")
+
         # MarketWatcher integration endpoint (uses main Sentinel URL)
         self.sentinel_base_url = os.getenv("SENTINEL_BASE_URL", "").strip()
         self.sentinel_key = os.getenv("SENTINEL_KEY", "").strip()
@@ -137,22 +143,32 @@ class KOSPI200FuturesMonitor:
             else:
                 raise Exception("Failed to get access token - check DB_APP_KEY/DB_APP_SECRET or API quota")
         
-        headers = {
-            "Authorization": f"Bearer {access_token}"
-        }
-        
-        logger.info(f"Connecting to WebSocket: {self.ws_url}")
-        
-        header_list = [f"{k}: {v}" for k, v in headers.items()]
+        app_key = getattr(token_manager, "app_key", "").strip()
+        if not app_key:
+            raise Exception("DB_APP_KEY is not configured - check environment variables")
 
-        logger.debug(
-            "Using websocket-client header list for compatibility: %s",
-            header_list,
-        )
+        parsed_url = urlparse(self.ws_url)
+        query_params = dict(parse_qsl(parsed_url.query))
+        query_params.update({
+            "appkey": app_key,
+            "token": access_token,
+        })
+        ws_url = urlunparse(parsed_url._replace(query=urlencode(query_params)))
+
+        logger.info(f"Connecting to WebSocket: {ws_url}")
+
+        headers: Dict[str, str] = {}
+        send_auth_header = os.getenv("DBSEC_WS_SEND_AUTH_HEADER", "false").lower() in ("1", "true", "yes")
+        if send_auth_header:
+            token_type = getattr(token_manager, "token_type", "Bearer")
+            headers["Authorization"] = f"{token_type} {access_token}"
+            logger.debug("Including Authorization header for WebSocket handshake")
+
+        header_list = [f"{k}: {v}" for k, v in headers.items()]
 
         ws = await asyncio.to_thread(
             websocket.create_connection,
-            self.ws_url,
+            ws_url,
             header=header_list,
             timeout=30,
             enable_multithread=True,
@@ -199,79 +215,103 @@ class KOSPI200FuturesMonitor:
                 
     async def _subscribe_futures(self):
         """Subscribe to KOSPI200 futures real-time data"""
-        # DB증권 API specific subscription message
-        # This is a placeholder - actual format depends on DB증권 API specification
+        # DB증권 API 실시간 선물 구독 명세 기반 메시지 구성
+        tr_id = os.getenv("DB_FUTURES_TR_ID", "H0IFCNI0").strip() or "H0IFCNI0"
+        custtype = os.getenv("DB_FUTURES_CUSTTYPE", "P").strip() or "P"
+        tr_key = os.getenv("DB_FUTURES_TR_KEY", "101QC000").strip() or "101QC000"
+        tr_type = os.getenv("DB_FUTURES_TR_TYPE", "1").strip() or "1"
+
         subscribe_msg = {
             "header": {
-                "tr_type": "1",  # 실시간 등록
-                "tr_key": "K200_FUT"  # KOSPI200 선물
+                "tr_id": tr_id,        # 실시간 구독 TR ID (선물 체결가)
+                "custtype": custtype,  # 고객 구분 P=개인, B=법인
             },
             "body": {
-                "rt_cd": "S3_",  # 선물 실시간 코드 (예시)
-                "ivno": "101P3000"  # KOSPI200 선물 종목번호 (예시)
+                "input": {
+                    "tr_key": tr_key,  # 선물 종목코드 (예: 101QC000 K200 최근월)
+                    "tr_type": tr_type  # 1=구독, 2=해지
+                }
             }
         }
-        
+
         if not self.websocket:
             raise RuntimeError("WebSocket connection is not established")
 
-        await asyncio.to_thread(self.websocket.send, json.dumps(subscribe_msg))
-        logger.info("Subscribed to KOSPI200 futures real-time data")
-        
+        await asyncio.to_thread(self.websocket.send, json.dumps(subscribe_msg, ensure_ascii=False))
+        logger.info("Sent subscribe_msg for K200 Futures: %s", json.dumps(subscribe_msg, ensure_ascii=False))
+
     async def _handle_message(self, message: str):
         """Handle incoming WebSocket message"""
         try:
             data = json.loads(message)
-            
+
+            logger.debug("[DB증권] Raw message: %s", message)
+
             # Parse futures data (format depends on DB증권 API)
             tick_data = await self._parse_tick_data(data)
             if not tick_data:
                 return
-                
+
             # Add to buffer
             self.tick_buffer.append(tick_data)
-            
+
             # Check for anomalies
             await self._check_anomaly(tick_data)
-            
+
+            logger.info("[DB증권] K200 Futures tick: %s", json.dumps(tick_data, ensure_ascii=False))
+
         except Exception as e:
             logger.error(f"Message handling error: {e}")
-            
+
     async def _parse_tick_data(self, raw_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Parse raw WebSocket data into standardized tick format"""
         try:
-            # This is a placeholder parsing logic
-            # Actual implementation depends on DB증권 API response format
-            
-            # Example parsing (to be updated based on actual API spec):
             body = raw_data.get("body", {})
-            
-            current_price = float(body.get("stck_prpr", 0))  # 현재가
-            if current_price <= 0:
+            output = body.get("output") or body.get("body") or body
+
+            # DB증권 실시간 선물 체결 데이터에서 사용 가능한 가격 필드 후보
+            price_fields = [
+                "futs_prpr",  # 선물 현재가
+                "stck_prpr",  # 주식 현재가 (fallback)
+                "last",       # 일반화된 현재가
+            ]
+            open_fields = [
+                "futs_oprc",
+                "stck_oprc",
+                "open",
+            ]
+            volume_fields = [
+                "cntg_vol",
+                "acml_vol",
+                "volume",
+            ]
+
+            current_price = self._extract_numeric(output, price_fields)
+            if current_price is None or current_price <= 0:
                 return None
-            
-            # Store daily open price for % calculation
+
             if not self.daily_open_price:
-                self.daily_open_price = float(body.get("stck_oprc", current_price))  # 시가
-                
+                open_price = self._extract_numeric(output, open_fields)
+                self.daily_open_price = open_price if open_price and open_price > 0 else current_price
+
             # Determine trading session
             session = self._determine_session()
-            
+
             # Calculate change rate from daily open
             change_rate = 0.0
             if self.daily_open_price and self.daily_open_price > 0:
                 change_rate = ((current_price - self.daily_open_price) / self.daily_open_price) * 100
-            
+
             tick = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "symbol": "K200_FUT",
                 "price": current_price,
-                "volume": int(body.get("cntg_vol", 0)),  # 체결량
+                "volume": int(self._extract_numeric(output, volume_fields) or 0),  # 체결량
                 "session": session,
                 "change_rate": change_rate,
                 "raw_data": raw_data
             }
-            
+
             self.last_price = current_price
             self.current_session = session
             
@@ -284,32 +324,47 @@ class KOSPI200FuturesMonitor:
     def _determine_session(self) -> str:
         """Determine if current time is DAY or NIGHT session"""
         from datetime import datetime, time
-        import pytz
-        
-        # Korean timezone
-        kst = pytz.timezone('Asia/Seoul')
-        now = datetime.now(kst)
+
+        now = datetime.now(self.kst)
         current_time = now.time()
-        
+
         # KOSPI200 futures trading hours (KST)
         # Day session: 09:00 - 15:45 (includes closing auction)
-        # Night session: 18:00 - 05:00 (next day)
-        
+        # Night session: 18:00 - 06:00 (next day)
+
         day_start = time(9, 0)   # 09:00
         day_end = time(15, 45)   # 15:45
         night_start = time(18, 0) # 18:00
-        night_end = time(5, 0)    # 05:00 (next day)
-        
+        night_end = time(6, 0)    # 06:00 (next day)
+
+        # 휴장일 확인
+        if now.date() in self.krx_holidays:
+            return "CLOSED"
+
         # Reset daily open at session start
         if current_time == day_start or current_time == night_start:
             self.daily_open_price = None
-        
+
         if day_start <= current_time <= day_end:
             return "DAY"
         elif current_time >= night_start or current_time <= night_end:
             return "NIGHT"
         else:
             return "CLOSED"
+
+    def _extract_numeric(self, payload: Dict[str, Any], keys: Sequence[str]) -> Optional[float]:
+        """Safely extract numeric value from payload using preferred key order."""
+        for key in keys:
+            if key in payload:
+                try:
+                    value = payload[key]
+                    if isinstance(value, (int, float)):
+                        return float(value)
+                    if isinstance(value, str) and value.strip():
+                        return float(value.replace(",", ""))
+                except (TypeError, ValueError):
+                    continue
+        return None
             
     async def _check_anomaly(self, tick: Dict[str, Any]):
         """Check for price anomalies and trigger alerts"""
