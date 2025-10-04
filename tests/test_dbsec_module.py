@@ -312,7 +312,7 @@ class TestSecretMasking:
         secret = "abcd1234ef"
         masked = mask_secret(secret)
 
-        assert masked == "abcd***ef"
+        assert masked == secret[:4] + "***" + secret[-2:]
 
     def test_mask_secret_with_short_value(self):
         """Ensure short secrets remain fully masked."""
