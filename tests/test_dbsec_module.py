@@ -23,8 +23,8 @@ from utils.token_manager import DBSecTokenManager, get_token_manager
 from services.dbsec_ws import (
     KOSPI200FuturesMonitor,
     get_futures_monitor,
-    mask_secret,
 )
+from utils.masking import mask_secret
 from app.utils import determine_trading_session
 
 
