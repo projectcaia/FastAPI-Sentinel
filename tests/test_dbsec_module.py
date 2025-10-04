@@ -21,6 +21,7 @@ from utils.token_manager import DBSecTokenManager, get_token_manager
 from services.dbsec_ws import (
     KOSPI200FuturesMonitor,
     get_futures_monitor,
+    is_trading_session,
     mask_secret,
 )
 
@@ -132,7 +133,25 @@ class TestKOSPI200FuturesMonitor:
             # Note: This test would need more complex mocking for pytz
             # For now, we just verify the method exists
             assert hasattr(monitor, '_determine_session')
-    
+
+    def test_is_trading_session_helper(self):
+        """Test trading session helper respects KST time and holidays"""
+        # Regular weekday during day session (2024-01-03 09:30 KST)
+        day_session_utc = datetime(2024, 1, 3, 0, 30, tzinfo=timezone.utc)
+        assert is_trading_session(day_session_utc) is True
+
+        # Weekend should be closed (2024-01-06 Saturday)
+        weekend_utc = datetime(2024, 1, 5, 15, 0, tzinfo=timezone.utc)
+        assert is_trading_session(weekend_utc) is False
+
+        # After day session ends but before night session starts (15:50 KST)
+        after_close_utc = datetime(2024, 1, 3, 6, 50, tzinfo=timezone.utc)
+        assert is_trading_session(after_close_utc) is False
+
+        # Night session (2024-01-03 20:00 KST)
+        night_session_utc = datetime(2024, 1, 3, 11, 0, tzinfo=timezone.utc)
+        assert is_trading_session(night_session_utc) is True
+
     @pytest.mark.asyncio
     async def test_parse_tick_data(self):
         """Test parsing of tick data"""

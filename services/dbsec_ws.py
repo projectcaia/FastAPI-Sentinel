@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time
 from typing import Optional, Dict, Any, Callable, Deque
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -18,11 +18,21 @@ from websocket._exceptions import (
     WebSocketTimeoutException,
 )
 import requests
+import holidays
+import pytz
 
 from utils.masking import redact_headers, redact_ws_url, redact_dict
 from utils.token_manager import get_token_manager
 
 logger = logging.getLogger(__name__)
+
+
+KST = pytz.timezone("Asia/Seoul")
+KR_HOLIDAYS = holidays.KR()
+DAY_SESSION_START = time(9, 0)
+DAY_SESSION_END = time(15, 45)
+NIGHT_SESSION_START = time(18, 0)
+NIGHT_SESSION_END = time(5, 0)
 
 
 def mask_secret(value: Optional[str]) -> str:
@@ -52,6 +62,44 @@ def mask_secret(value: Optional[str]) -> str:
         return mask_token
 
     return f"{cleaned[:head_visible]}{mask_token}{cleaned[-tail_visible:]}"
+
+
+def _ensure_kst(now: Optional[datetime] = None) -> datetime:
+    """Normalize datetime to Asia/Seoul timezone."""
+    if now is None:
+        return datetime.now(KST)
+
+    if now.tzinfo is None:
+        return KST.localize(now)
+
+    return now.astimezone(KST)
+
+
+def _resolve_session(now: Optional[datetime] = None) -> tuple[str, datetime]:
+    """Resolve trading session and normalized KST datetime."""
+    now_kst = _ensure_kst(now)
+
+    if now_kst.weekday() >= 5:
+        return "CLOSED", now_kst
+
+    if now_kst.date() in KR_HOLIDAYS:
+        return "CLOSED", now_kst
+
+    current_time = now_kst.time()
+
+    if DAY_SESSION_START <= current_time <= DAY_SESSION_END:
+        return "DAY", now_kst
+
+    if current_time >= NIGHT_SESSION_START or current_time <= NIGHT_SESSION_END:
+        return "NIGHT", now_kst
+
+    return "CLOSED", now_kst
+
+
+def is_trading_session(now: Optional[datetime] = None) -> bool:
+    """Return True if current time is within an active trading session."""
+    session, _ = _resolve_session(now)
+    return session != "CLOSED"
 
 
 class KOSPI200FuturesMonitor:
@@ -123,6 +171,11 @@ class KOSPI200FuturesMonitor:
         logger.info("[DB증권] Starting K200 Futures monitoring")
         
         while self.reconnect_attempts < self.max_reconnect_attempts:
+            if not is_trading_session():
+                logger.info("[DBSEC] 휴장일/비거래 시간 → WebSocket 연결 skip")
+                await asyncio.sleep(60)
+                continue
+
             try:
                 await self._connect_and_monitor()
                 
@@ -362,33 +415,23 @@ class KOSPI200FuturesMonitor:
             
     def _determine_session(self) -> str:
         """Determine if current time is DAY or NIGHT session"""
-        from datetime import datetime, time
-        import pytz
-        
-        # Korean timezone
-        kst = pytz.timezone('Asia/Seoul')
-        now = datetime.now(kst)
-        current_time = now.time()
-        
-        # KOSPI200 futures trading hours (KST)
-        # Day session: 09:00 - 15:45 (includes closing auction)
-        # Night session: 18:00 - 05:00 (next day)
-        
-        day_start = time(9, 0)   # 09:00
-        day_end = time(15, 45)   # 15:45
-        night_start = time(18, 0) # 18:00
-        night_end = time(5, 0)    # 05:00 (next day)
-        
-        # Reset daily open at session start
-        if current_time == day_start or current_time == night_start:
-            self.daily_open_price = None
-        
-        if day_start <= current_time <= day_end:
-            return "DAY"
-        elif current_time >= night_start or current_time <= night_end:
-            return "NIGHT"
-        else:
-            return "CLOSED"
+        session, now_kst = _resolve_session()
+        current_time = now_kst.time()
+
+        if session == "DAY":
+            if (
+                current_time.hour == DAY_SESSION_START.hour
+                and current_time.minute == DAY_SESSION_START.minute
+            ):
+                self.daily_open_price = None
+        elif session == "NIGHT":
+            if (
+                current_time.hour == NIGHT_SESSION_START.hour
+                and current_time.minute == NIGHT_SESSION_START.minute
+            ):
+                self.daily_open_price = None
+
+        return session
             
     async def _check_anomaly(self, tick: Dict[str, Any]):
         """Check for price anomalies and trigger alerts"""
