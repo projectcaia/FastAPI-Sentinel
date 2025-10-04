@@ -105,7 +105,8 @@ class KOSPI200FuturesMonitor:
         self.alert_callback: Optional[Callable] = None
         
         # Session tracking
-        self.current_session: str = "UNKNOWN"  # DAY or NIGHT
+        self.current_session: Optional[str] = None
+        self.previous_session: Optional[str] = None
         
         # MarketWatcher integration endpoint (uses main Sentinel URL)
         self.sentinel_base_url = os.getenv("SENTINEL_BASE_URL", "").strip()
@@ -148,29 +149,36 @@ class KOSPI200FuturesMonitor:
             target = target.replace(tzinfo=timezone.utc)
         return target.astimezone(KST).strftime("%Y-%m-%d %H:%M %Z")
 
+    def _log_closed_wait(self) -> None:
+        """Emit standardized debug log for closed market waits."""
+        logger.debug("[DBSEC] 휴장일/비거래 시간, 30분 후 재확인")
+
     async def _sleep_until_poll(self):
-        """Sleep for the configured poll interval with debug progress logs."""
+        """Sleep for the configured poll interval with a single debug log."""
         total_seconds = max(1, int(self.poll_minutes * 60))
-        logger.debug(
-            "[DBSEC] CLOSED 비거래 시간 - %s분 뒤 다시 확인 (총 %s초)",
-            self.poll_minutes,
-            total_seconds,
-        )
+        self._log_closed_wait()
 
-        remaining = total_seconds
-        step = min(60, total_seconds)
+        try:
+            await asyncio.wait_for(asyncio.sleep(total_seconds), timeout=total_seconds)
+        except asyncio.TimeoutError:
+            logger.warning("[DBSEC] WebSocket timeout, retrying...")
 
-        while remaining > 0:
-            segment = min(step, remaining)
-            try:
-                await asyncio.wait_for(asyncio.sleep(segment), timeout=segment)
-            except asyncio.TimeoutError:
-                logger.warning("[DBSEC] WebSocket timeout, retrying...")
-                return
+    def _update_session_state(self, session: Optional[str]) -> None:
+        """Track session transitions and emit informational logs on changes."""
+        if not session:
+            return
 
-            remaining -= segment
-            if remaining > 0:
-                logger.debug("[DBSEC] 다음 세션 확인까지 %s초 남음", remaining)
+        if session != self.current_session:
+            previous = self.current_session
+            self.previous_session = previous
+            self.current_session = session
+
+            if session in {"DAY", "NIGHT", "CLOSED"}:
+                logger.info(
+                    "[DBSEC] Trading session changed from %s to %s",
+                    previous or "UNKNOWN",
+                    session,
+                )
 
     def _calculate_backoff_delay(self, base: int = 2, cap: int = 60) -> int:
         """Compute exponential backoff delay with configurable base and cap."""
@@ -213,6 +221,7 @@ class KOSPI200FuturesMonitor:
         while True:
             status = determine_trading_session()
             session = status.get("session")
+            self._update_session_state(session)
             is_holiday = bool(status.get("is_holiday"))
 
             if session == "CLOSED":
@@ -229,6 +238,7 @@ class KOSPI200FuturesMonitor:
                             )
                             self._last_holiday_notice = next_open
 
+                        self._log_closed_wait()
                         await sleep_until(next_open, self.sleep_cap_hours)
                         continue
 
@@ -237,9 +247,6 @@ class KOSPI200FuturesMonitor:
                 continue
 
             self._last_holiday_notice = None
-
-            if session in {"DAY", "NIGHT"} and session != self.current_session:
-                self.current_session = session
 
             try:
                 await self._connect_and_monitor()

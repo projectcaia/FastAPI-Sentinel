@@ -5,6 +5,7 @@ Tests token manager, WebSocket service, and MarketWatcher integration
 import pytest
 import asyncio
 import json
+import logging
 from unittest.mock import Mock, patch, MagicMock, AsyncMock
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -178,7 +179,35 @@ class TestKOSPI200FuturesMonitor:
         weekend_open = utils.compute_next_open_kst(datetime(2024, 1, 6, 7, 0, tzinfo=tz))
         assert weekend_open.weekday() == 0
         assert weekend_open.hour == 9
-    
+
+    def test_session_transition_logs_closed_to_day(self, caplog):
+        """Ensure session transitions emit DBSEC info logs."""
+        monitor = KOSPI200FuturesMonitor()
+
+        with caplog.at_level(logging.INFO):
+            monitor._update_session_state("CLOSED")
+            monitor._update_session_state("DAY")
+
+        messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+        assert "[DBSEC] Trading session changed from UNKNOWN to CLOSED" in messages
+        assert "[DBSEC] Trading session changed from CLOSED to DAY" in messages
+
+    @pytest.mark.asyncio
+    async def test_closed_wait_debug_log_once(self, caplog, monkeypatch):
+        """Verify closed wait helper emits the standardized debug log."""
+        monitor = KOSPI200FuturesMonitor()
+
+        async def immediate_sleep(duration):
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", immediate_sleep)
+
+        with caplog.at_level(logging.DEBUG):
+            await monitor._sleep_until_poll()
+
+        debug_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.DEBUG]
+        assert debug_messages.count("[DBSEC] 휴장일/비거래 시간, 30분 후 재확인") == 1
+
     @pytest.mark.asyncio
     async def test_parse_tick_data(self):
         """Test parsing of tick data"""
