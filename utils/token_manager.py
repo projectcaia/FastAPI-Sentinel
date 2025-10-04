@@ -13,6 +13,8 @@ from typing import Optional, Dict, Any
 import httpx
 import json
 
+from utils.masking import mask_secret, redact_dict
+
 logger = logging.getLogger(__name__)
 
 
@@ -136,7 +138,7 @@ class DBSecTokenManager:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 for attempt in attempts:
                     mode = attempt["mode"]
-                    logger.info(f"[DBSEC] Trying token request mode={mode}")
+                    logger.info("[DBSEC] Trying token request mode=%s", mode)
                     resp = await client.post(attempt["url"], **attempt["kwargs"])
 
                     if resp.status_code == 200:
@@ -145,19 +147,29 @@ class DBSecTokenManager:
                         self.token_type = token_data.get("token_type", "Bearer")
                         exp = token_data.get("expires_in", 86400)
                         self.expires_at = datetime.now(timezone.utc) + timedelta(seconds=exp)
-                        logger.info(f"[DBSEC] Token success (mode={mode}), expires_in={exp}s")
+                        logger.info("[DBSEC] Token success (mode=%s), expires_in=%ss", mode, exp)
                         return True
                     else:
                         try:
                             err = resp.json()
-                            logger.error(f"[DBSEC] {mode} failed {resp.status_code} {err}")
-                        except:
-                            logger.error(f"[DBSEC] {mode} failed {resp.status_code} {resp.text}")
+                            logger.error(
+                                "[DBSEC] %s failed %s %s",
+                                mode,
+                                resp.status_code,
+                                redact_dict(err),
+                            )
+                        except json.JSONDecodeError:
+                            logger.error(
+                                "[DBSEC] %s failed %s %s",
+                                mode,
+                                resp.status_code,
+                                mask_secret(resp.text),
+                            )
 
             return False
 
         except Exception as e:
-            logger.error(f"[DBSEC] Token refresh exception: {e}")
+            logger.error("[DBSEC] Token refresh exception: %s", e)
             return False
 
     async def start_auto_refresh(self):

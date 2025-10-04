@@ -1,8 +1,11 @@
 """Utility helpers for masking sensitive values in logs and telemetry."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+logger = logging.getLogger(__name__)
 
 # 민감한 키 식별을 위한 기준 목록
 SENSITIVE_KEYS: Sequence[str] = (
@@ -30,23 +33,38 @@ def _is_sensitive_key(key: str) -> bool:
     return any(sensitive in key_lower for sensitive in SENSITIVE_KEYS)
 
 
-def mask_secret(value: Any, visible: int = 4) -> str:
-    """Mask a sensitive value while leaving a limited prefix/suffix visible."""
+def mask_secret(value: Any, visible: int = 4, suffix_visible: int | None = None) -> str:
+    """Mask sensitive credentials for safe logging."""
     if value is None:
-        return ""
+        return "***"
 
-    # 문자열화 후 마스킹 처리
-    value_str = str(value)
-    if value_str == "":
-        return ""
+    try:
+        # bytes → 문자열 변환 처리
+        if isinstance(value, bytes):
+            normalized = value.decode("utf-8", "ignore")
+        elif isinstance(value, str):
+            normalized = value
+        else:
+            normalized = str(value)
+    except Exception as error:  # pragma: no cover - 방어적 로깅
+        logger.warning("Failed to normalize secret for masking: %s", error)
+        return "***"
 
-    if visible <= 0 or len(value_str) <= visible * 2:
-        return "*" * len(value_str)
+    cleaned = normalized.strip()
+    if not cleaned:
+        return "***"
 
-    prefix = value_str[:visible]
-    suffix = value_str[-visible:]
-    masked_length = max(len(value_str) - (visible * 2), 0)
-    return f"{prefix}{'*' * masked_length}{suffix}"
+    # 접두/접미 노출 길이 산정 (기본 4 / 2 문자)
+    prefix_length = max(visible, 0)
+    suffix_length = max(2 if suffix_visible is None else suffix_visible, 0)
+    threshold = max(prefix_length + suffix_length, 6)
+
+    if len(cleaned) <= threshold:
+        return "***"
+
+    prefix = cleaned[:prefix_length] if prefix_length else ""
+    suffix = cleaned[-suffix_length:] if suffix_length else ""
+    return f"{prefix}***{suffix}"
 
 
 def redact_kv(key: str, value: Any, visible: int = 4) -> Any:

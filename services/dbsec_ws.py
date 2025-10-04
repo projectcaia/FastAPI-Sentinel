@@ -19,36 +19,10 @@ from websocket._exceptions import (
 )
 import requests
 
-from utils.masking import redact_headers, redact_ws_url
+from utils.masking import mask_secret, redact_headers, redact_ws_url
 from utils.token_manager import get_token_manager
 
 logger = logging.getLogger(__name__)
-
-
-def mask_secret(value: Optional[str]) -> str:
-    """Mask sensitive credentials for safe logging."""
-    # 입력 값이 비어 있으면 완전 마스킹 처리
-    if value is None:
-        return "***"
-
-    try:
-        if isinstance(value, bytes):
-            value = value.decode("utf-8", "ignore")
-        elif not isinstance(value, str):
-            value = str(value)
-    except Exception as error:  # pragma: no cover - 방어적 로깅
-        logger.warning("Failed to normalize secret for masking: %s", error)
-        return "***"
-
-    cleaned = value.strip()
-    if not cleaned:
-        return "***"
-
-    if len(cleaned) > 6:
-        return f"{cleaned[:4]}***{cleaned[-2:]}"
-    return "***"
-
-
 class KOSPI200FuturesMonitor:
     """KOSPI200 Futures real-time monitor with anomaly detection"""
     
