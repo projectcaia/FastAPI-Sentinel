@@ -11,19 +11,96 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Callable, Deque, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import holidays
+import pytz
+import requests
 import websocket
 from websocket import WebSocketException
 from websocket._exceptions import (
     WebSocketConnectionClosedException,
     WebSocketTimeoutException,
 )
-import requests
-import holidays
-import pytz
 
 from utils.token_manager import get_token_manager
 
 logger = logging.getLogger(__name__)
+
+
+SENSITIVE_KEYS = {"token", "appkey", "app_secret", "appsecret", "authorization"}
+
+
+def mask_secret(value: str, head: int = 4, tail: int = 4) -> str:
+    """Mask a sensitive string while preserving leading and trailing characters."""
+    if not isinstance(value, str):
+        return value
+    if len(value) <= head + tail:
+        return "*" * len(value)
+    return f"{value[:head]}{'*' * (len(value) - head - tail)}{value[-tail:]}"
+
+
+def redact_kv(key: str, value: Any) -> str:
+    """Redact sensitive key-value pairs based on known key names."""
+    try:
+        key_lower = key.lower()
+    except AttributeError:
+        key_lower = str(key).lower()
+    if key_lower in SENSITIVE_KEYS:
+        return mask_secret(str(value))
+    return str(value)
+
+
+def redact_ws_url(url: str) -> str:
+    """Redact sensitive query parameters in a WebSocket URL."""
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        redacted_query = [(k, redact_kv(k, v)) for k, v in query_pairs]
+        return urlunparse(parsed._replace(query=urlencode(redacted_query)))
+    except Exception:
+        return "<redacted-url>"
+
+
+def redact_headers(headers: Any) -> Any:
+    """Redact sensitive values inside WebSocket headers."""
+    try:
+        if isinstance(headers, list):
+            sanitized = []
+            for line in headers:
+                if ":" not in line:
+                    sanitized.append(line)
+                    continue
+                key, value = line.split(":", 1)
+                prefix = " " if value.startswith(" ") else ""
+                sanitized.append(f"{key}:{prefix}{redact_kv(key.strip(), value.strip())}")
+            return sanitized
+        if isinstance(headers, dict):
+            return {k: redact_kv(k, v) for k, v in headers.items()}
+    except Exception:
+        return headers
+    return headers
+
+
+def redact_dict(obj: Any) -> Any:
+    """Recursively redact sensitive values within dictionaries and lists."""
+    try:
+        if isinstance(obj, dict):
+            redacted: Dict[Any, Any] = {}
+            for key, value in obj.items():
+                key_lower = str(key).lower()
+                if key_lower in SENSITIVE_KEYS:
+                    redacted[key] = mask_secret(str(value))
+                elif isinstance(value, (dict, list)):
+                    redacted[key] = redact_dict(value)
+                else:
+                    redacted[key] = value
+            return redacted
+        if isinstance(obj, list):
+            return [redact_dict(item) if isinstance(item, (dict, list)) else item for item in obj]
+    except Exception:
+        return obj
+    return obj
 
 
 class KOSPI200FuturesMonitor:
@@ -51,7 +128,10 @@ class KOSPI200FuturesMonitor:
         self.buffer_size = buffer_size
         
         if self.enabled:
-            logger.info(f"[DB증권] K200 Futures Monitor ENABLED - WebSocket URL: {self.ws_url}")
+            logger.info(
+                "[DB증권] K200 Futures Monitor ENABLED - WebSocket URL: %s",
+                redact_ws_url(self.ws_url),
+            )
         else:
             logger.warning("[DB증권] K200 Futures Monitor DISABLED (mock mode) - no WebSocket connection")
         
@@ -66,6 +146,7 @@ class KOSPI200FuturesMonitor:
         self.is_connected: bool = False
         self.reconnect_attempts: int = 0
         self.max_reconnect_attempts: int = 10 if enabled else 0
+        self.last_safe_ws_url: Optional[str] = None
         
         # Event handlers
         self.alert_callback: Optional[Callable] = None
@@ -100,12 +181,16 @@ class KOSPI200FuturesMonitor:
                 
             except (WebSocketConnectionClosedException, WebSocketException) as e:
                 self.reconnect_attempts += 1
-                logger.warning(f"WebSocket connection lost (attempt {self.reconnect_attempts}): {e}")
+                logger.warning(
+                    "WebSocket connection lost (attempt %s): %s",
+                    self.reconnect_attempts,
+                    e,
+                )
 
                 if self.reconnect_attempts < self.max_reconnect_attempts:
                     # Exponential backoff: 2^attempt seconds (max 60s)
                     backoff = min(2 ** self.reconnect_attempts, 60)
-                    logger.info(f"Reconnecting in {backoff} seconds...")
+                    logger.info("Reconnecting in %s seconds...", backoff)
                     await asyncio.sleep(backoff)
                 else:
                     logger.error("Max reconnection attempts exceeded")
@@ -113,14 +198,21 @@ class KOSPI200FuturesMonitor:
                     
             except Exception as e:
                 error_msg = str(e)
-                logger.error(f"Monitoring error: {error_msg}")
+                logger.error(
+                    "Monitoring error: %s (url=%s)",
+                    error_msg,
+                    self.last_safe_ws_url or redact_ws_url(self.ws_url),
+                )
                 
                 # Handle token-related errors with longer backoff
                 if "token" in error_msg.lower() or "access" in error_msg.lower():
                     self.reconnect_attempts += 1
                     # Longer backoff for token issues: 60s, 120s, 300s, etc.
                     backoff = min(60 * (2 ** (self.reconnect_attempts - 1)), 1800)  # Max 30min
-                    logger.warning(f"Token-related error, waiting {backoff}s before retry...")
+                    logger.warning(
+                        "Token-related error, waiting %ss before retry...",
+                        backoff,
+                    )
                     await asyncio.sleep(backoff)
                 else:
                     self.reconnect_attempts += 1
@@ -149,13 +241,17 @@ class KOSPI200FuturesMonitor:
 
         parsed_url = urlparse(self.ws_url)
         query_params = dict(parse_qsl(parsed_url.query))
-        query_params.update({
-            "appkey": app_key,
-            "token": access_token,
-        })
+        query_params.update(
+            {
+                "appkey": app_key,
+                "token": access_token,
+            }
+        )
         ws_url = urlunparse(parsed_url._replace(query=urlencode(query_params)))
+        safe_ws_url = redact_ws_url(ws_url)
 
-        logger.info(f"Connecting to WebSocket: {ws_url}")
+        self.last_safe_ws_url = safe_ws_url
+        logger.info("Connecting to WebSocket: %s", safe_ws_url)
 
         headers: Dict[str, str] = {}
         send_auth_header = os.getenv("DBSEC_WS_SEND_AUTH_HEADER", "false").lower() in ("1", "true", "yes")
@@ -166,13 +262,20 @@ class KOSPI200FuturesMonitor:
 
         header_list = [f"{k}: {v}" for k, v in headers.items()]
 
-        ws = await asyncio.to_thread(
-            websocket.create_connection,
-            ws_url,
-            header=header_list,
-            timeout=30,
-            enable_multithread=True,
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("WS headers: %s", redact_headers(header_list))
+
+        try:
+            ws = await asyncio.to_thread(
+                websocket.create_connection,
+                ws_url,
+                header=header_list,
+                timeout=30,
+                enable_multithread=True,
+            )
+        except Exception as exc:
+            logger.error("WS connect failed: %s url=%s", exc, safe_ws_url)
+            raise
 
         self.websocket = ws
         self.is_connected = True
@@ -237,15 +340,22 @@ class KOSPI200FuturesMonitor:
         if not self.websocket:
             raise RuntimeError("WebSocket connection is not established")
 
-        await asyncio.to_thread(self.websocket.send, json.dumps(subscribe_msg, ensure_ascii=False))
-        logger.info("Sent subscribe_msg for K200 Futures: %s", json.dumps(subscribe_msg, ensure_ascii=False))
+        payload = json.dumps(subscribe_msg, ensure_ascii=False)
+        await asyncio.to_thread(self.websocket.send, payload)
+        logger.info("[DB증권] Sent subscribe_msg(tr_id=%s, tr_key=%s)", tr_id, tr_key)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[DB증권] Subscribe payload: %s", payload)
 
     async def _handle_message(self, message: str):
         """Handle incoming WebSocket message"""
         try:
             data = json.loads(message)
-
-            logger.debug("[DB증권] Raw message: %s", message)
+            if logger.isEnabledFor(logging.DEBUG):
+                safe_debug_payload = redact_dict(data)
+                logger.debug(
+                    "[DB증권] Raw message: %s",
+                    json.dumps(safe_debug_payload, ensure_ascii=False),
+                )
 
             # Parse futures data (format depends on DB증권 API)
             tick_data = await self._parse_tick_data(data)
@@ -258,10 +368,32 @@ class KOSPI200FuturesMonitor:
             # Check for anomalies
             await self._check_anomaly(tick_data)
 
-            logger.info("[DB증권] K200 Futures tick: %s", json.dumps(tick_data, ensure_ascii=False))
+            safe_tick = redact_dict(tick_data)
+            logger.info(
+                "[DB증권] K200 Futures tick: %s",
+                json.dumps(safe_tick, ensure_ascii=False),
+            )
 
         except Exception as e:
-            logger.error(f"Message handling error: {e}")
+            logger.error("Message handling error: %s", e)
+            if logger.isEnabledFor(logging.DEBUG):
+                safe_snapshot = None
+                try:
+                    if isinstance(message, str):
+                        safe_snapshot = json.dumps(
+                            redact_dict(json.loads(message)),
+                            ensure_ascii=False,
+                        )
+                    elif isinstance(message, (dict, list)):
+                        safe_snapshot = json.dumps(
+                            redact_dict(message),
+                            ensure_ascii=False,
+                        )
+                except Exception:
+                    safe_snapshot = None
+
+                if safe_snapshot:
+                    logger.debug("[DB증권] Last message snapshot: %s", safe_snapshot)
 
     async def _parse_tick_data(self, raw_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Parse raw WebSocket data into standardized tick format"""
@@ -318,7 +450,7 @@ class KOSPI200FuturesMonitor:
             return tick
             
         except Exception as e:
-            logger.error(f"Tick parsing error: {e}")
+            logger.error("Tick parsing error: %s", e)
             return None
             
     def _determine_session(self) -> str:
@@ -399,7 +531,12 @@ class KOSPI200FuturesMonitor:
                 "level": alert_level
             }
             
-            logger.warning(f"ANOMALY DETECTED: K200_FUT {tick['change_rate']:.2f}% change in {tick['session']} session - Level: {alert_level}")
+            logger.warning(
+                "ANOMALY DETECTED: K200_FUT %.2f%% change in %s session - Level: %s",
+                tick.get("change_rate", 0.0),
+                tick.get("session", "UNKNOWN"),
+                alert_level,
+            )
             
             # Send to MarketWatcher via Sentinel alert endpoint
             await self._send_to_market_watcher(alert_payload)
@@ -409,7 +546,7 @@ class KOSPI200FuturesMonitor:
                 try:
                     self.alert_callback(alert_payload)
                 except Exception as e:
-                    logger.error(f"Alert callback error: {e}")
+                    logger.error("Alert callback error: %s", e)
                     
     async def _send_to_market_watcher(self, payload: Dict[str, Any]):
         """Send alert to MarketWatcher via Sentinel alert endpoint"""
@@ -450,12 +587,19 @@ class KOSPI200FuturesMonitor:
             )
             
             if response.ok:
-                logger.info(f"Alert sent to MarketWatcher: Level {market_alert['level']}")
+                logger.info(
+                    "Alert sent to MarketWatcher: Level %s",
+                    market_alert.get("level"),
+                )
             else:
-                logger.error(f"MarketWatcher error: {response.status_code} - {response.text}")
+                logger.error(
+                    "MarketWatcher error: %s - %s",
+                    response.status_code,
+                    response.text,
+                )
                     
         except Exception as e:
-            logger.error(f"Failed to send alert to MarketWatcher: {e}")
+            logger.error("Failed to send alert to MarketWatcher: %s", e)
     
     def _grade_level(self, change_pct: float) -> str:
         """Grade alert level based on change percentage (same logic as market_watcher)"""
@@ -542,7 +686,7 @@ def get_futures_monitor() -> KOSPI200FuturesMonitor:
                 enabled=dbsec_enabled
             )
         except (ValueError, TypeError) as e:
-            logger.error(f"Failed to initialize futures monitor: {e}")
+            logger.error("Failed to initialize futures monitor: %s", e)
             # Create a default monitor as fallback
             _futures_monitor = KOSPI200FuturesMonitor(enabled=False)
     
