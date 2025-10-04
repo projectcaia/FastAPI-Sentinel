@@ -62,7 +62,7 @@ def is_krx_trading_day(day: dt_module.date) -> bool:
     return day.weekday() < 5
 
 
-def determine_trading_session(now: Optional[datetime] = None) -> str:
+def determine_trading_session(now: datetime | None = None) -> str:
     """Return trading session name for simplified KRX futures schedule."""
     if now is None:
         now_kst = datetime.now(KST)
