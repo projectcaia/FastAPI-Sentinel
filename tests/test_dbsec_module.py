@@ -283,7 +283,7 @@ class TestWebSocketReconnection:
             mock_tm._is_in_backoff.return_value = False
             mock_token_mgr.return_value = mock_tm
 
-            with patch('services.dbsec_ws.is_trading_session', return_value=True), \
+            with patch('services.dbsec_ws.determine_trading_session', return_value="DAY"), \
                  patch('services.dbsec_ws.websocket.create_connection') as mock_ws:
                 # Simulate connection error then success
                 mock_ws.side_effect = [

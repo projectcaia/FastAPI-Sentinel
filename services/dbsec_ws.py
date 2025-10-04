@@ -134,12 +134,16 @@ class KOSPI200FuturesMonitor:
         logger.info("[DB증권] Starting K200 Futures monitoring")
         
         while True:
-            if not is_trading_session():
-                logger.info("[DBSEC] 휴장일/비거래 시간 → WebSocket 연결 skip (대기)")
+            session = determine_trading_session()
+            if session == "CLOSED":
+                logger.info("[DBSEC] 휴장일/비거래 시간 → WebSocket 연결 skip (30분 후 재확인)")
                 self.is_connected = False
                 self.reconnect_attempts = 0
-                await asyncio.sleep(60)
+                await asyncio.sleep(1800)
                 continue
+
+            if session in {"DAY", "NIGHT"} and session != self.current_session:
+                self.current_session = session
 
             try:
                 await self._connect_and_monitor()
