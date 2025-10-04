@@ -1,5 +1,5 @@
 from datetime import datetime, time, timedelta
-from typing import Optional
+from typing import Optional, Dict
 
 from zoneinfo import ZoneInfo
 
@@ -62,8 +62,8 @@ def is_krx_trading_day(day: dt_module.date) -> bool:
     return day.weekday() < 5
 
 
-def determine_trading_session(now: Optional[datetime] = None) -> str:
-    """Return trading session name for simplified KRX futures schedule."""
+def compute_next_open_kst(now: Optional[datetime] = None) -> Optional[datetime]:
+    """Return the next expected market open in KST based on the simplified schedule."""
     if now is None:
         now_kst = datetime.now(KST)
     elif now.tzinfo is None:
@@ -72,18 +72,63 @@ def determine_trading_session(now: Optional[datetime] = None) -> str:
         now_kst = now.astimezone(KST)
 
     current_time = now_kst.time()
+    today = now_kst.date()
+
+    if current_time < DAY_SESSION_START and is_krx_trading_day(today):
+        return datetime.combine(today, DAY_SESSION_START, tzinfo=KST)
+
+    if DAY_SESSION_END < current_time < NIGHT_SESSION_START and is_krx_trading_day(today):
+        return datetime.combine(today, NIGHT_SESSION_START, tzinfo=KST)
+
+    if current_time <= NIGHT_SESSION_END and is_krx_trading_day(today):
+        return datetime.combine(today, DAY_SESSION_START, tzinfo=KST)
+
+    for offset in range(1, 15):
+        candidate = today + timedelta(days=offset)
+        if is_krx_trading_day(candidate):
+            return datetime.combine(candidate, DAY_SESSION_START, tzinfo=KST)
+
+    return None
+
+
+def determine_trading_session(now: Optional[datetime] = None) -> Dict[str, object]:
+    """Return session metadata for the simplified KRX futures schedule."""
+    if now is None:
+        now_kst = datetime.now(KST)
+    elif now.tzinfo is None:
+        now_kst = now.replace(tzinfo=KST)
+    else:
+        now_kst = now.astimezone(KST)
+
+    current_time = now_kst.time()
+    session = "CLOSED"
+    is_holiday = False
 
     if DAY_SESSION_START <= current_time <= DAY_SESSION_END:
-        return "DAY" if is_krx_trading_day(now_kst.date()) else "CLOSED"
-
-    if current_time >= NIGHT_SESSION_START or current_time <= NIGHT_SESSION_END:
+        if is_krx_trading_day(now_kst.date()):
+            session = "DAY"
+        else:
+            is_holiday = True
+    elif current_time >= NIGHT_SESSION_START or current_time <= NIGHT_SESSION_END:
         reference_date = now_kst.date()
         if current_time <= NIGHT_SESSION_END:
             reference_date = reference_date - timedelta(days=1)
 
-        return "NIGHT" if is_krx_trading_day(reference_date) else "CLOSED"
+        if is_krx_trading_day(reference_date):
+            session = "NIGHT"
+        else:
+            is_holiday = True
+    else:
+        if not is_krx_trading_day(now_kst.date()):
+            is_holiday = True
 
-    return "CLOSED"
+    next_open = compute_next_open_kst(now_kst)
+
+    return {
+        "session": session,
+        "is_holiday": bool(session == "CLOSED" and is_holiday),
+        "next_open": next_open,
+    }
 
 
 def is_market_open() -> bool:

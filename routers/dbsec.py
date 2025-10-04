@@ -319,8 +319,9 @@ async def get_trading_sessions():
     from app.utils import determine_trading_session
 
     # 세션 정보는 공용 헬퍼로 판정
-    current_session = determine_trading_session()
-    
+    session_info = determine_trading_session()
+    current_session = session_info.get("session")
+
     return {
         "current_session": current_session,
         "sessions": {
