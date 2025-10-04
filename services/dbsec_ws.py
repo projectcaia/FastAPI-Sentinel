@@ -261,7 +261,15 @@ class KOSPI200FuturesMonitor:
             }
 
             logger.info(
-                "[DBSEC] K200 Futures tick: %s",
+                "[DBSEC] K200 Futures tick: price=%s change_rate=%s volume=%s session=%s",
+                tick_summary.get("price"),
+                tick_summary.get("change_rate"),
+                tick_summary.get("volume"),
+                tick_summary.get("session"),
+            )
+
+            logger.debug(
+                "[DBSEC] Tick summary (redacted): %s",
                 redact_dict(tick_summary),
             )
 
