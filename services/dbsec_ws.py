@@ -44,9 +44,14 @@ def mask_secret(value: Optional[str]) -> str:
     if not cleaned:
         return "***"
 
-    if len(cleaned) > 6:
-        return f"{cleaned[:4]}***{cleaned[-2:]}"
-    return "***"
+    head_visible = 4
+    tail_visible = 2
+    mask_token = "***"
+
+    if len(cleaned) <= head_visible + tail_visible + len(mask_token):
+        return mask_token
+
+    return f"{cleaned[:head_visible]}{mask_token}{cleaned[-tail_visible:]}"
 
 
 class KOSPI200FuturesMonitor:

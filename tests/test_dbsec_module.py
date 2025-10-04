@@ -321,6 +321,13 @@ class TestSecretMasking:
 
         assert masked == "***"
 
+    def test_mask_secret_threshold_behaviour(self):
+        """Ensure secrets at the visibility threshold stay hidden."""
+        secret = "abcd123xy"  # length 9 == 4 + 2 + 3
+        masked = mask_secret(secret)
+
+        assert masked == "***"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
