@@ -269,7 +269,7 @@ class KOSPI200FuturesMonitor:
             raise RuntimeError("WebSocket connection is not established")
 
         await asyncio.to_thread(self.websocket.send, json.dumps(subscribe_msg))
-        logger.info(" [DBSEC] Sent subscribe_msg for K200 Futures")
+        logger.info("[DBSEC] Sent subscribe_msg for K200 Futures")
         
     async def _handle_message(self, message: str):
         """Handle incoming WebSocket message"""
@@ -284,12 +284,16 @@ class KOSPI200FuturesMonitor:
             # Add to buffer
             self.tick_buffer.append(tick_data)
 
+            tick_summary = {
+                "price": tick_data.get("price"),
+                "change_rate": tick_data.get("change_rate"),
+                "volume": tick_data.get("volume"),
+                "session": tick_data.get("session"),
+            }
+
             logger.info(
-                "[DBSEC] K200 Futures tick: price=%s change=%.2f%% volume=%s session=%s",
-                tick_data.get("price"),
-                tick_data.get("change_rate"),
-                tick_data.get("volume"),
-                tick_data.get("session"),
+                "[DBSEC] K200 Futures tick: %s",
+                redact_dict(tick_summary),
             )
 
             if logger.isEnabledFor(logging.DEBUG):
