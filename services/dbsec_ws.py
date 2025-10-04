@@ -271,7 +271,7 @@ class KOSPI200FuturesMonitor:
             # Add to buffer
             self.tick_buffer.append(tick_data)
 
-            logger.info("[DBSEC] K200 Futures tick: update received")
+            logger.info("[DBSEC] K200 Futures tick: update processed")
 
             if logger.isEnabledFor(logging.DEBUG):
                 tick_summary = {
