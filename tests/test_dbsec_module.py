@@ -157,7 +157,7 @@ class TestKOSPI200FuturesMonitor:
     async def test_parse_tick_data(self):
         """Test parsing of tick data"""
         monitor = KOSPI200FuturesMonitor()
-        
+
         # Sample tick data (DB증권 API format)
         raw_data = {
             "body": {
@@ -175,7 +175,34 @@ class TestKOSPI200FuturesMonitor:
         assert tick["volume"] == 12345
         assert "timestamp" in tick
         assert "session" in tick
-    
+
+    @pytest.mark.asyncio
+    async def test_session_change_resets_open_price(self, monkeypatch):
+        """Ensure session transitions reset the cached open price."""
+        monitor = KOSPI200FuturesMonitor()
+        monitor.daily_open_price = 345.0
+        monitor.current_session = "DAY"
+
+        raw_data = {
+            "body": {
+                "stck_prpr": "360.00",
+                "stck_oprc": "358.00",
+                "cntg_vol": "1000",
+            }
+        }
+
+        monkeypatch.setattr(
+            "services.dbsec_ws.determine_trading_session",
+            lambda: "NIGHT",
+        )
+
+        tick = await monitor._parse_tick_data(raw_data)
+
+        assert monitor.current_session == "NIGHT"
+        assert monitor.daily_open_price == pytest.approx(358.0)
+        assert tick["session"] == "NIGHT"
+        assert tick["change_rate"] == pytest.approx(((360.0 - 358.0) / 358.0) * 100)
+
     @pytest.mark.asyncio
     async def test_anomaly_detection(self):
         """Test anomaly detection and alert generation"""

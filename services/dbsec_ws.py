@@ -322,12 +322,16 @@ class KOSPI200FuturesMonitor:
             if current_price <= 0:
                 return None
             
+            # Determine trading session
+            session = determine_trading_session()
+
+            if session in {"DAY", "NIGHT"} and session != self.current_session:
+                # 세션 전환 시 일중 기준가 리셋
+                self.daily_open_price = None
+
             # Store daily open price for % calculation
             if not self.daily_open_price:
                 self.daily_open_price = float(body.get("stck_oprc", current_price))  # 시가
-                
-            # Determine trading session
-            session = self._determine_session()
             
             # Calculate change rate from daily open
             change_rate = 0.0
@@ -352,16 +356,6 @@ class KOSPI200FuturesMonitor:
         except Exception as e:
             logger.error(f"Tick parsing error: {e}")
             return None
-            
-    def _determine_session(self) -> str:
-        """Determine if current time is DAY or NIGHT session"""
-        session = determine_trading_session()
-
-        if session in {"DAY", "NIGHT"} and session != self.current_session:
-            # 세션 전환 시 일중 기준가 리셋
-            self.daily_open_price = None
-
-        return session
             
     async def _check_anomaly(self, tick: Dict[str, Any]):
         """Check for price anomalies and trigger alerts"""
