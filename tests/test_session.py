@@ -33,35 +33,40 @@ class TestDetermineTradingSession:
         trading_calendar({date(2024, 1, 2)})
         now = datetime(2024, 1, 2, 9, 0, tzinfo=KST)
 
-        assert utils.determine_trading_session(now) == "DAY"
+        result = utils.determine_trading_session(now)
+        assert result["session"] == "DAY"
 
     def test_evening_night_session(self, trading_calendar):
         """Ensure evening times shift into the NIGHT session."""
         trading_calendar({date(2024, 1, 2)})
         now = datetime(2024, 1, 2, 18, 30, tzinfo=KST)
 
-        assert utils.determine_trading_session(now) == "NIGHT"
+        result = utils.determine_trading_session(now)
+        assert result["session"] == "NIGHT"
 
     def test_early_morning_night_session(self, trading_calendar):
         """Ensure post-midnight times still map to NIGHT for prior trading days."""
         trading_calendar({date(2024, 1, 2)})
         now = datetime(2024, 1, 3, 2, 0, tzinfo=KST)
 
-        assert utils.determine_trading_session(now) == "NIGHT"
+        result = utils.determine_trading_session(now)
+        assert result["session"] == "NIGHT"
 
     def test_closed_on_weekend(self, trading_calendar):
         """Ensure weekends are treated as closed regardless of time."""
         trading_calendar({date(2024, 1, 5)})
         now = datetime(2024, 1, 6, 10, 0, tzinfo=KST)
 
-        assert utils.determine_trading_session(now) == "CLOSED"
+        result = utils.determine_trading_session(now)
+        assert result["session"] == "CLOSED"
 
     def test_closed_on_holiday(self, trading_calendar):
         """Ensure holidays remain closed despite being within session hours."""
         trading_calendar({date(2024, 1, 2)})
         now = datetime(2024, 1, 1, 9, 30, tzinfo=KST)
 
-        assert utils.determine_trading_session(now) == "CLOSED"
+        result = utils.determine_trading_session(now)
+        assert result["session"] == "CLOSED"
 
 
 class TestComputeNextOpen:

@@ -62,35 +62,6 @@ def is_krx_trading_day(day: dt_module.date) -> bool:
     return day.weekday() < 5
 
 
-def compute_next_open_kst(now: Optional[datetime] = None) -> Optional[datetime]:
-    """Return the next expected market open in KST based on the simplified schedule."""
-    if now is None:
-        now_kst = datetime.now(KST)
-    elif now.tzinfo is None:
-        now_kst = now.replace(tzinfo=KST)
-    else:
-        now_kst = now.astimezone(KST)
-
-    current_time = now_kst.time()
-    today = now_kst.date()
-
-    if current_time < DAY_SESSION_START and is_krx_trading_day(today):
-        return datetime.combine(today, DAY_SESSION_START, tzinfo=KST)
-
-    if DAY_SESSION_END < current_time < NIGHT_SESSION_START and is_krx_trading_day(today):
-        return datetime.combine(today, NIGHT_SESSION_START, tzinfo=KST)
-
-    if current_time <= NIGHT_SESSION_END and is_krx_trading_day(today):
-        return datetime.combine(today, DAY_SESSION_START, tzinfo=KST)
-
-    for offset in range(1, 15):
-        candidate = today + timedelta(days=offset)
-        if is_krx_trading_day(candidate):
-            return datetime.combine(candidate, DAY_SESSION_START, tzinfo=KST)
-
-    return None
-
-
 def determine_trading_session(now: Optional[datetime] = None) -> Dict[str, object]:
     """Return session metadata for the simplified KRX futures schedule."""
     if now is None:
@@ -143,21 +114,38 @@ def compute_next_open_kst(now: Optional[datetime] = None) -> datetime:
 
     def _next_trading_day(start: dt_module.date) -> dt_module.date:
         candidate = start
-        # 다음 거래일까지 순차적으로 탐색
-        while not is_krx_trading_day(candidate):
+        # 다음 거래일까지 순차적으로 탐색 (최대 60일)
+        for _ in range(60):
+            if is_krx_trading_day(candidate):
+                return candidate
             candidate += timedelta(days=1)
         return candidate
-
-    now_kst = _ensure_kst(now)
-    current_time = now_kst.time()
-    today = now_kst.date()
-    session = determine_trading_session(now_kst)
-    today_is_trading = is_krx_trading_day(today)
 
     def _combine(target_day: dt_module.date, session_start: time) -> datetime:
         return datetime.combine(target_day, session_start, tzinfo=KST)
 
-    if session == "DAY":
+    now_kst = _ensure_kst(now)
+    current_time = now_kst.time()
+    today = now_kst.date()
+    today_is_trading = is_krx_trading_day(today)
+
+    in_day_session = (
+        today_is_trading
+        and DAY_SESSION_START <= current_time <= DAY_SESSION_END
+    )
+
+    in_night_session = False
+    if current_time >= NIGHT_SESSION_START:
+        in_night_session = is_krx_trading_day(today)
+    elif current_time <= NIGHT_SESSION_END:
+        previous_trading_day = today - timedelta(days=1)
+        for _ in range(14):
+            if is_krx_trading_day(previous_trading_day):
+                break
+            previous_trading_day -= timedelta(days=1)
+        in_night_session = is_krx_trading_day(previous_trading_day)
+
+    if in_day_session:
         target_day = _next_trading_day(today)
         next_open = _combine(target_day, NIGHT_SESSION_START)
         if next_open <= now_kst:
@@ -165,7 +153,7 @@ def compute_next_open_kst(now: Optional[datetime] = None) -> datetime:
             return _combine(next_day, DAY_SESSION_START)
         return next_open
 
-    if session == "NIGHT":
+    if in_night_session:
         if current_time >= NIGHT_SESSION_START:
             next_day = _next_trading_day(today + timedelta(days=1))
             return _combine(next_day, DAY_SESSION_START)

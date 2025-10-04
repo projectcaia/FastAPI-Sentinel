@@ -172,6 +172,33 @@ class KOSPI200FuturesMonitor:
             if remaining > 0:
                 logger.debug("[DBSEC] 다음 세션 확인까지 %s초 남음", remaining)
 
+    def _calculate_backoff_delay(self, base: int = 2, cap: int = 60) -> int:
+        """Compute exponential backoff delay with configurable base and cap."""
+        exponent = max(0, self.reconnect_attempts - 1)
+        delay = base * (2 ** exponent)
+        return min(cap, delay)
+
+    async def _apply_backoff(
+        self,
+        reason: str,
+        *,
+        base: int = 2,
+        cap: int = 60,
+        log_level: int = logging.WARNING,
+    ) -> None:
+        """Increment attempts, log, and sleep for the computed backoff delay."""
+        self.reconnect_attempts += 1
+        delay = self._calculate_backoff_delay(base=base, cap=cap)
+
+        logger.log(
+            log_level,
+            "[DBSEC] %s (attempt %s) — %ss backoff",
+            reason,
+            self.reconnect_attempts,
+            delay,
+        )
+        await asyncio.sleep(delay)
+
     async def start_monitoring(self):
         """Start WebSocket monitoring with auto-reconnect"""
         if not self.enabled:
@@ -187,25 +214,26 @@ class KOSPI200FuturesMonitor:
             status = determine_trading_session()
             session = status.get("session")
             is_holiday = bool(status.get("is_holiday"))
-            next_open = status.get("next_open") or compute_next_open_kst()
 
             if session == "CLOSED":
                 self.is_connected = False
                 self.reconnect_attempts = 0
 
-                if is_holiday and next_open:
-                    if self._last_holiday_notice != next_open:
-                        logger.info(
-                            "[DBSEC] 휴장일 → 다음 개장 %s 까지 대기",
-                            self._format_kst(next_open),
-                        )
-                        self._last_holiday_notice = next_open
+                if is_holiday:
+                    next_open = compute_next_open_kst()
+                    if next_open:
+                        if self._last_holiday_notice != next_open:
+                            logger.info(
+                                "[DBSEC] 휴장일 → 다음 개장 %s 까지 대기",
+                                self._format_kst(next_open),
+                            )
+                            self._last_holiday_notice = next_open
 
-                    await sleep_until(next_open, self.sleep_cap_hours)
-                else:
-                    self._last_holiday_notice = None
-                    await self._sleep_until_poll()
+                        await sleep_until(next_open, self.sleep_cap_hours)
+                        continue
 
+                self._last_holiday_notice = None
+                await self._sleep_until_poll()
                 continue
 
             self._last_holiday_notice = None
@@ -217,35 +245,33 @@ class KOSPI200FuturesMonitor:
                 await self._connect_and_monitor()
 
             except asyncio.TimeoutError:
-                logger.warning("[DBSEC] WebSocket timeout, retrying...")
                 self.is_connected = False
-                await asyncio.sleep(5)
+                await self._apply_backoff("WebSocket timeout", base=2, cap=60)
                 continue
 
-            except (WebSocketConnectionClosedException, WebSocketException) as e:
-                self.reconnect_attempts += 1
-                logger.warning(f"WebSocket connection lost (attempt {self.reconnect_attempts}): {e}")
-
-                backoff = min(2 ** self.reconnect_attempts, 60)
-                logger.info(f"Reconnecting in {backoff} seconds...")
-                await asyncio.sleep(backoff)
+            except (WebSocketConnectionClosedException, WebSocketException) as exc:
+                self.is_connected = False
+                await self._apply_backoff(
+                    f"WebSocket connection lost: {exc}",
+                    base=2,
+                    cap=60,
+                )
 
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                error_msg = str(e)
+            except Exception as exc:
+                self.is_connected = False
+                error_msg = str(exc)
                 logger.error(f"Monitoring error: {error_msg}")
 
-                # Handle token-related errors with longer backoff
                 if "token" in error_msg.lower() or "access" in error_msg.lower():
-                    self.reconnect_attempts += 1
-                    # Longer backoff for token issues: 60s, 120s, 300s, etc.
-                    backoff = min(60 * (2 ** (self.reconnect_attempts - 1)), 1800)  # Max 30min
-                    logger.warning(f"Token-related error, waiting {backoff}s before retry...")
-                    await asyncio.sleep(backoff)
+                    await self._apply_backoff(
+                        "Token-related error",
+                        base=60,
+                        cap=1800,
+                    )
                 else:
-                    self.reconnect_attempts += 1
-                    await asyncio.sleep(5)
+                    await self._apply_backoff("Unexpected monitoring error", base=2, cap=60)
         
     async def _connect_and_monitor(self):
         """Connect to WebSocket and start monitoring"""
