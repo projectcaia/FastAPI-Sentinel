@@ -1,8 +1,11 @@
 """Utility helpers for masking sensitive values in logs and telemetry."""
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+logger = logging.getLogger(__name__)
 
 # 민감한 키 식별을 위한 기준 목록
 SENSITIVE_KEYS: Sequence[str] = (
@@ -41,7 +44,8 @@ def mask_secret(value: Any, prefix_visible: int = 4, suffix_visible: int = 2) ->
             value_str = value.decode("utf-8", "ignore")
         else:
             value_str = str(value)
-    except Exception:  # pragma: no cover - 방어적 처리
+    except Exception as error:  # pragma: no cover - 방어적 로깅
+        logger.warning("Failed to normalize secret for masking: %s", error)
         return "***"
 
     cleaned = value_str.strip()
