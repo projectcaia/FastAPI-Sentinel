@@ -30,33 +30,54 @@ def _is_sensitive_key(key: str) -> bool:
     return any(sensitive in key_lower for sensitive in SENSITIVE_KEYS)
 
 
-def mask_secret(value: Any, visible: int = 4) -> str:
-    """Mask a sensitive value while leaving a limited prefix/suffix visible."""
+def mask_secret(value: Any, prefix_visible: int = 4, suffix_visible: int = 2) -> str:
+    """Mask sensitive values using a 4-***-2 style pattern."""
     if value is None:
-        return ""
+        return "***"
 
-    # 문자열화 후 마스킹 처리
-    value_str = str(value)
-    if value_str == "":
-        return ""
+    try:
+        # 문자열화 후 마스킹 처리
+        if isinstance(value, bytes):
+            value_str = value.decode("utf-8", "ignore")
+        else:
+            value_str = str(value)
+    except Exception:  # pragma: no cover - 방어적 처리
+        return "***"
 
-    if visible <= 0 or len(value_str) <= visible * 2:
-        return "*" * len(value_str)
+    cleaned = value_str.strip()
+    if not cleaned:
+        return "***"
 
-    prefix = value_str[:visible]
-    suffix = value_str[-visible:]
-    masked_length = max(len(value_str) - (visible * 2), 0)
-    return f"{prefix}{'*' * masked_length}{suffix}"
+    if prefix_visible <= 0 or suffix_visible <= 0:
+        return "***"
+
+    if len(cleaned) <= prefix_visible + suffix_visible:
+        return "***"
+
+    return f"{cleaned[:prefix_visible]}***{cleaned[-suffix_visible:]}"
 
 
-def redact_kv(key: str, value: Any, visible: int = 4) -> Any:
+def redact_kv(
+    key: str,
+    value: Any,
+    prefix_visible: int = 4,
+    suffix_visible: int = 2,
+) -> Any:
     """Redact the provided key/value pair when the key is sensitive."""
     if _is_sensitive_key(key):
-        return mask_secret(value, visible=visible)
+        return mask_secret(
+            value,
+            prefix_visible=prefix_visible,
+            suffix_visible=suffix_visible,
+        )
     return value
 
 
-def redact_ws_url(url: str, visible: int = 4) -> str:
+def redact_ws_url(
+    url: str,
+    prefix_visible: int = 4,
+    suffix_visible: int = 2,
+) -> str:
     """Redact sensitive query parameters contained in a WebSocket URL."""
     if not url:
         return url
@@ -67,33 +88,86 @@ def redact_ws_url(url: str, visible: int = 4) -> str:
 
     # 쿼리 파라미터 마스킹
     redacted_params = [
-        (key, redact_kv(key, value, visible=visible))
+        (
+            key,
+            redact_kv(
+                key,
+                value,
+                prefix_visible=prefix_visible,
+                suffix_visible=suffix_visible,
+            ),
+        )
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
     ]
     redacted_query = urlencode(redacted_params)
     return urlunparse(parsed._replace(query=redacted_query))
 
 
-def redact_headers(headers: Mapping[str, Any], visible: int = 4) -> Dict[str, Any]:
+def redact_headers(
+    headers: Mapping[str, Any],
+    prefix_visible: int = 4,
+    suffix_visible: int = 2,
+) -> Dict[str, Any]:
     """Return a copy of headers with sensitive values masked."""
-    return {key: redact_kv(key, value, visible=visible) for key, value in headers.items()}
+    return {
+        key: redact_kv(
+            key,
+            value,
+            prefix_visible=prefix_visible,
+            suffix_visible=suffix_visible,
+        )
+        for key, value in headers.items()
+    }
 
 
-def redact_dict(data: Any, visible: int = 4) -> Any:
+def redact_dict(
+    data: Any,
+    prefix_visible: int = 4,
+    suffix_visible: int = 2,
+) -> Any:
     """Recursively redact sensitive keys within a mapping or iterable structure."""
     if isinstance(data, Mapping):
         return {
-            key: redact_dict(value, visible=visible)
+            key: redact_dict(
+                value,
+                prefix_visible=prefix_visible,
+                suffix_visible=suffix_visible,
+            )
             if not _is_sensitive_key(key)
-            else mask_secret(value, visible=visible)
+            else mask_secret(
+                value,
+                prefix_visible=prefix_visible,
+                suffix_visible=suffix_visible,
+            )
             for key, value in data.items()
         }
     if isinstance(data, list):
-        return [redact_dict(item, visible=visible) for item in data]
+        return [
+            redact_dict(
+                item,
+                prefix_visible=prefix_visible,
+                suffix_visible=suffix_visible,
+            )
+            for item in data
+        ]
     if isinstance(data, tuple):
-        return tuple(redact_dict(item, visible=visible) for item in data)
+        return tuple(
+            redact_dict(
+                item,
+                prefix_visible=prefix_visible,
+                suffix_visible=suffix_visible,
+            )
+            for item in data
+        )
     if isinstance(data, set):
-        return {redact_dict(item, visible=visible) for item in data}
+        return {
+            redact_dict(
+                item,
+                prefix_visible=prefix_visible,
+                suffix_visible=suffix_visible,
+            )
+            for item in data
+        }
     return data
 
 
