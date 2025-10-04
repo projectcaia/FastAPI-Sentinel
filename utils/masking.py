@@ -30,9 +30,14 @@ def _is_sensitive_key(key: str) -> bool:
     return any(sensitive in key_lower for sensitive in SENSITIVE_KEYS)
 
 
-def mask_secret(value: Any, head: int = 4, tail: int = 2) -> str:
+MASK_TOKEN = "***"
+VISIBLE_PREFIX = 4
+VISIBLE_SUFFIX = 2
+
+
+def mask_secret(value: Any, head: int = VISIBLE_PREFIX, tail: int = VISIBLE_SUFFIX) -> str:
     """Mask sensitive values using a fixed 4-***-2 visibility pattern."""
-    mask_token = "***"
+    mask_token = MASK_TOKEN
 
     if value is None:
         return mask_token
@@ -59,8 +64,8 @@ def mask_secret(value: Any, head: int = 4, tail: int = 2) -> str:
         return mask_token
 
     # 길이가 충분한 경우에도 4-***-2 고정 패턴 적용
-    prefix = cleaned[:4]
-    suffix = cleaned[-2:]
+    prefix = cleaned[:VISIBLE_PREFIX]
+    suffix = cleaned[-VISIBLE_SUFFIX:]
     return f"{prefix}{mask_token}{suffix}"
 
 
