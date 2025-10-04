@@ -19,7 +19,7 @@ from websocket._exceptions import (
 )
 import requests
 
-from utils.masking import redact_headers, redact_ws_url
+from utils.masking import redact_headers, redact_ws_url, redact_dict
 from utils.token_manager import get_token_manager
 
 logger = logging.getLogger(__name__)
@@ -264,7 +264,7 @@ class KOSPI200FuturesMonitor:
             raise RuntimeError("WebSocket connection is not established")
 
         await asyncio.to_thread(self.websocket.send, json.dumps(subscribe_msg))
-        logger.info("Subscribed to KOSPI200 futures real-time data")
+        logger.info(" [DBSEC] Sent subscribe_msg for K200 Futures")
         
     async def _handle_message(self, message: str):
         """Handle incoming WebSocket message"""
@@ -278,7 +278,33 @@ class KOSPI200FuturesMonitor:
                 
             # Add to buffer
             self.tick_buffer.append(tick_data)
-            
+
+            logger.info(
+                "[DBSEC] K200 Futures tick: price=%s change=%.2f%% volume=%s session=%s",
+                tick_data.get("price"),
+                tick_data.get("change_rate"),
+                tick_data.get("volume"),
+                tick_data.get("session"),
+            )
+
+            if logger.isEnabledFor(logging.DEBUG):
+                debug_snapshot = {
+                    key: value
+                    for key, value in tick_data.items()
+                    if key != "raw_data"
+                }
+                logger.debug(
+                    "[DBSEC] Tick snapshot (redacted): %s",
+                    redact_dict(debug_snapshot),
+                )
+
+                raw_payload = tick_data.get("raw_data")
+                if isinstance(raw_payload, dict):
+                    logger.debug(
+                        "[DBSEC] Raw tick payload (redacted): %s",
+                        redact_dict(raw_payload),
+                    )
+
             # Check for anomalies
             await self._check_anomaly(tick_data)
             
