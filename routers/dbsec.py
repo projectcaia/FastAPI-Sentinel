@@ -316,18 +316,17 @@ async def get_trading_sessions():
     Returns:
         Trading session information and current status
     """
-    from services.dbsec_ws import KOSPI200FuturesMonitor
-    
-    # Create temporary monitor to get session info
-    temp_monitor = KOSPI200FuturesMonitor()
-    current_session = temp_monitor._determine_session()
+    from app.utils import determine_trading_session
+
+    # 세션 정보는 공용 헬퍼로 판정
+    current_session = determine_trading_session()
     
     return {
         "current_session": current_session,
         "sessions": {
             "DAY": {
                 "name": "주간거래",
-                "hours": "09:00 - 15:15 KST",
+                "hours": "09:00 - 15:30 KST",
                 "description": "Regular trading session"
             },
             "NIGHT": {
