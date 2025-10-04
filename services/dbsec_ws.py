@@ -25,6 +25,9 @@ from app.utils import determine_trading_session, compute_next_open_kst, KST
 
 logger = logging.getLogger(__name__)
 
+SUBSCRIBE_INFO_MESSAGE = "[DBSEC] Sent subscribe_msg for K200 Futures"
+TICK_INFO_PREFIX = "[DBSEC] K200 Futures tick:"
+
 async def sleep_until(target: datetime, max_cap_hours: Optional[int] = None) -> None:
     """Sleep asynchronously until the target datetime with optional capping."""
     if target.tzinfo is None:
@@ -358,7 +361,7 @@ class KOSPI200FuturesMonitor:
             raise RuntimeError("WebSocket connection is not established")
 
         await asyncio.to_thread(self.websocket.send, json.dumps(subscribe_msg))
-        logger.info("[DBSEC] Sent subscribe_msg for K200 Futures")
+        logger.info(SUBSCRIBE_INFO_MESSAGE)
         
     async def _handle_message(self, message: str):
         """Handle incoming WebSocket message"""
@@ -373,7 +376,7 @@ class KOSPI200FuturesMonitor:
             # Add to buffer
             self.tick_buffer.append(tick_data)
 
-            logger.info("[DBSEC] K200 Futures tick: update processed")
+            logger.info("%s update processed", TICK_INFO_PREFIX)
 
             if logger.isEnabledFor(logging.DEBUG):
                 tick_summary = {
@@ -384,7 +387,8 @@ class KOSPI200FuturesMonitor:
                 }
 
                 logger.debug(
-                    "[DBSEC] Tick summary (redacted): %s",
+                    "%s summary (redacted): %s",
+                    TICK_INFO_PREFIX,
                     redact_dict(tick_summary),
                 )
 
@@ -394,14 +398,16 @@ class KOSPI200FuturesMonitor:
                     if key != "raw_data"
                 }
                 logger.debug(
-                    "[DBSEC] Tick snapshot (redacted): %s",
+                    "%s snapshot (redacted): %s",
+                    TICK_INFO_PREFIX,
                     redact_dict(debug_snapshot),
                 )
 
                 raw_payload = tick_data.get("raw_data")
                 if isinstance(raw_payload, dict):
                     logger.debug(
-                        "[DBSEC] Raw tick payload (redacted): %s",
+                        "%s raw payload (redacted): %s",
+                        TICK_INFO_PREFIX,
                         redact_dict(raw_payload),
                     )
 
