@@ -19,7 +19,8 @@ from websocket._exceptions import (
 )
 import requests
 
-from utils.masking import mask_secret, redact_headers, redact_ws_url, redact_dict
+# Re-export masking helpers for downstream modules and tests.
+from utils.masking import mask_secret, redact_headers, redact_ws_url, redact_dict  # noqa: F401
 from utils.token_manager import get_token_manager
 
 logger = logging.getLogger(__name__)

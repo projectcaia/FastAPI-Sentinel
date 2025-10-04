@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-# 민감한 키 식별을 위한 기준 목록
+# 민감한 키에 대한 공통 기준 목록 유지
 SENSITIVE_KEYS: Sequence[str] = (
     "secret",
     "token",
@@ -25,20 +25,20 @@ SENSITIVE_KEYS: Sequence[str] = (
 
 
 def _is_sensitive_key(key: str) -> bool:
-    """Return True when the provided key represents a sensitive value."""
+    """Return True when the provided key likely stores a sensitive value."""
     key_lower = key.lower()
     return any(sensitive in key_lower for sensitive in SENSITIVE_KEYS)
 
 
 def mask_secret(value: Any, head: int = 4, tail: int = 2) -> str:
-    """Mask sensitive values with a 4-***-2 visibility rule."""
+    """Mask sensitive values using a 4-***-2 visibility rule."""
     mask_token = "***"
 
     if value is None:
         return mask_token
 
     try:
-        # 문자열화 후 마스킹 처리
+        # 문자열로 정규화 후 마스킹 처리
         if isinstance(value, bytes):
             value_str = value.decode("utf-8", "ignore")
         else:
@@ -93,7 +93,7 @@ def redact_ws_url(
     if not parsed.query:
         return url
 
-    # 쿼리 파라미터 마스킹
+    # 쿼리 파라미터 값에 대해 마스킹 적용
     redacted_params = [
         (
             key,
@@ -132,7 +132,7 @@ def redact_dict(
     prefix_visible: int = 4,
     suffix_visible: int = 2,
 ) -> Any:
-    """Recursively redact sensitive keys within a mapping or iterable structure."""
+    """Recursively redact sensitive keys within a mapping or iterable."""
     if isinstance(data, Mapping):
         return {
             key: redact_dict(
@@ -148,6 +148,7 @@ def redact_dict(
             )
             for key, value in data.items()
         }
+
     if isinstance(data, list):
         return [
             redact_dict(
@@ -157,6 +158,7 @@ def redact_dict(
             )
             for item in data
         ]
+
     if isinstance(data, tuple):
         return tuple(
             redact_dict(
@@ -166,6 +168,7 @@ def redact_dict(
             )
             for item in data
         )
+
     if isinstance(data, set):
         return {
             redact_dict(
@@ -175,6 +178,7 @@ def redact_dict(
             )
             for item in data
         }
+
     return data
 
 

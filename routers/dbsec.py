@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
+from utils.masking import redact_dict
 from utils.token_manager import get_token_manager, init_token_manager, shutdown_token_manager
 from services.dbsec_ws import get_futures_monitor, start_futures_monitoring, stop_futures_monitoring
 
@@ -347,7 +348,7 @@ def alert_callback(alert_data: Dict[str, Any]):
     
     This can be used to integrate with existing Sentinel alert mechanisms
     """
-    logger.info(f"DB증권 Alert callback triggered: {alert_data}")
+    logger.info("DB증권 Alert callback triggered: %s", redact_dict(alert_data))
     
     # Here you could add integration with existing Sentinel alert system
     # For example, sending to Telegram, Discord, etc.
@@ -362,7 +363,7 @@ def alert_callback(alert_data: Dict[str, Any]):
         "source": "dbsec"
     }
     
-    logger.info(f"Formatted Sentinel alert: {sentinel_alert}")
+    logger.info("Formatted Sentinel alert: %s", redact_dict(sentinel_alert))
 
 
 # Initialize alert callback

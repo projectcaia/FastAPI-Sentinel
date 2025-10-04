@@ -13,6 +13,8 @@ from typing import Optional, Dict, Any
 import httpx
 import json
 
+from utils.masking import mask_secret, redact_dict
+
 logger = logging.getLogger(__name__)
 
 
@@ -150,9 +152,19 @@ class DBSecTokenManager:
                     else:
                         try:
                             err = resp.json()
-                            logger.error(f"[DBSEC] {mode} failed {resp.status_code} {err}")
+                            logger.error(
+                                "[DBSEC] %s failed %s %s",
+                                mode,
+                                resp.status_code,
+                                redact_dict(err),
+                            )
                         except:
-                            logger.error(f"[DBSEC] {mode} failed {resp.status_code} {resp.text}")
+                            logger.error(
+                                "[DBSEC] %s failed %s %s",
+                                mode,
+                                resp.status_code,
+                                mask_secret(resp.text),
+                            )
 
             return False
 
