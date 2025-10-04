@@ -26,7 +26,15 @@ from utils.token_manager import get_token_manager
 logger = logging.getLogger(__name__)
 
 
-SENSITIVE_KEYS = {"token", "appkey", "app_secret", "appsecret", "authorization"}
+SENSITIVE_KEYS = {
+    "token",
+    "access_token",
+    "refresh_token",
+    "appkey",
+    "app_secret",
+    "appsecret",
+    "authorization",
+}
 
 
 def mask_secret(value: str, head: int = 4, tail: int = 4) -> str:
