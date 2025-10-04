@@ -18,7 +18,11 @@ os.environ['SENTINEL_BASE_URL'] = 'https://test.sentinel.com'
 os.environ['SENTINEL_KEY'] = 'test_sentinel_key'
 
 from utils.token_manager import DBSecTokenManager, get_token_manager
-from services.dbsec_ws import KOSPI200FuturesMonitor, get_futures_monitor
+from services.dbsec_ws import (
+    KOSPI200FuturesMonitor,
+    get_futures_monitor,
+    mask_secret,
+)
 
 
 class TestTokenManager:
@@ -298,6 +302,24 @@ class TestWebSocketReconnection:
                 
                 # Verify reconnection was attempted
                 assert monitor.reconnect_attempts > 0
+
+
+class TestSecretMasking:
+    """Test masking utility for sensitive secrets."""
+
+    def test_mask_secret_with_long_value(self):
+        """Ensure long secrets reveal prefix and suffix only."""
+        secret = "abcd1234ef"
+        masked = mask_secret(secret)
+
+        assert masked == "abcd***ef"
+
+    def test_mask_secret_with_short_value(self):
+        """Ensure short secrets remain fully masked."""
+        secret = "12345"
+        masked = mask_secret(secret)
+
+        assert masked == "***"
 
 
 if __name__ == "__main__":
