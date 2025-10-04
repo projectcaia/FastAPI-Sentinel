@@ -17,6 +17,7 @@ logging.basicConfig(
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from utils.masking import mask_secret, redact_dict
 from utils.token_manager import DBSecTokenManager
 
 
@@ -41,8 +42,8 @@ async def test_token_request():
         return
     
     print(f"📍 Base URL: {base_url}")
-    print(f"🔑 App Key: {app_key[:4]}...{app_key[-4:] if len(app_key) > 8 else 'SHORT'}")
-    print(f"🔒 Secret: {'*' * len(app_secret)} (length: {len(app_secret)})")
+    print(f"🔑 App Key: {mask_secret(app_key)}")
+    print(f"🔒 Secret: {mask_secret(app_secret)} (length: {len(app_secret)})")
     print("="*60)
     
     # Create token manager
@@ -63,7 +64,7 @@ async def test_token_request():
     
     if token:
         print("\n✅ SUCCESS! Token acquired")
-        print(f"📝 Token: {token[:20]}...")
+        print(f"📝 Token: {mask_secret(token, visible=6)}")
         print(f"🕐 Expires at: {manager.expires_at}")
         print(f"📋 Type: {manager.token_type}")
     else:
@@ -74,8 +75,9 @@ async def test_token_request():
     
     # Health check
     health = await manager.health_check()
+    redacted_health = redact_dict(health)
     print("\n📊 Health Check:")
-    for key, value in health.items():
+    for key, value in redacted_health.items():
         print(f"   {key}: {value}")
     
     print("="*60)

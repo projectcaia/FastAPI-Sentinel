@@ -19,6 +19,7 @@ from websocket._exceptions import (
 )
 import requests
 
+from utils.masking import redact_headers, redact_ws_url
 from utils.token_manager import get_token_manager
 
 logger = logging.getLogger(__name__)
@@ -72,7 +73,10 @@ class KOSPI200FuturesMonitor:
         self.buffer_size = buffer_size
         
         if self.enabled:
-            logger.info(f"[DB증권] K200 Futures Monitor ENABLED - WebSocket URL: {self.ws_url}")
+            logger.info(
+                "[DB증권] K200 Futures Monitor ENABLED - WebSocket URL: %s",
+                redact_ws_url(self.ws_url),
+            )
         else:
             logger.warning("[DB증권] K200 Futures Monitor DISABLED (mock mode) - no WebSocket connection")
         
@@ -174,14 +178,17 @@ class KOSPI200FuturesMonitor:
         })
         ws_url = urlunparse(parsed_url._replace(query=urlencode(query_params)))
 
-        logger.info(f"Connecting to WebSocket: {ws_url}")
+        logger.info("Connecting to WebSocket: %s", redact_ws_url(ws_url))
 
         headers: Dict[str, str] = {}
         send_auth_header = os.getenv("DBSEC_WS_SEND_AUTH_HEADER", "false").lower() in ("1", "true", "yes")
         if send_auth_header:
             token_type = getattr(token_manager, "token_type", "Bearer")
             headers["Authorization"] = f"{token_type} {access_token}"
-            logger.debug("Including Authorization header for WebSocket handshake")
+            logger.debug(
+                "Including Authorization header for WebSocket handshake: %s",
+                redact_headers(headers),
+            )
 
         header_list = [f"{k}: {v}" for k, v in headers.items()]
 
