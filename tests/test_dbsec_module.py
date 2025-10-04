@@ -129,14 +129,21 @@ class TestKOSPI200FuturesMonitor:
 
         tz = ZoneInfo("Asia/Seoul")
 
+        monkeypatch.setattr(utils, "compute_next_open_kst", lambda now=None: None)
+
         # 주간 세션 판정
         monkeypatch.setattr(utils, "is_krx_trading_day", lambda _: True)
-        assert determine_trading_session(datetime(2024, 1, 2, 9, 0, tzinfo=tz)) == "DAY"
-        assert determine_trading_session(datetime(2024, 1, 2, 15, 30, tzinfo=tz)) == "DAY"
+        status = determine_trading_session(datetime(2024, 1, 2, 9, 0, tzinfo=tz))
+        assert status["session"] == "DAY"
+        assert status["is_holiday"] is False
+
+        status = determine_trading_session(datetime(2024, 1, 2, 15, 30, tzinfo=tz))
+        assert status["session"] == "DAY"
 
         # 야간 세션 판정 (당일 저녁)
         monkeypatch.setattr(utils, "is_krx_trading_day", lambda _: True)
-        assert determine_trading_session(datetime(2024, 1, 2, 18, 0, tzinfo=tz)) == "NIGHT"
+        status = determine_trading_session(datetime(2024, 1, 2, 18, 0, tzinfo=tz))
+        assert status["session"] == "NIGHT"
 
         # 익일 새벽에는 전일 기준 휴장 여부 확인
         call_args = []
@@ -146,12 +153,31 @@ class TestKOSPI200FuturesMonitor:
             return True
 
         monkeypatch.setattr(utils, "is_krx_trading_day", tracker)
-        assert determine_trading_session(datetime(2024, 1, 3, 2, 0, tzinfo=tz)) == "NIGHT"
-        assert call_args[-1].isoformat() == "2024-01-02"
+        status = determine_trading_session(datetime(2024, 1, 3, 2, 0, tzinfo=tz))
+        assert status["session"] == "NIGHT"
+        assert call_args[0].isoformat() == "2024-01-02"
 
         # 휴장일에는 CLOSED 반환
         monkeypatch.setattr(utils, "is_krx_trading_day", lambda _: False)
-        assert determine_trading_session(datetime(2024, 1, 2, 10, 0, tzinfo=tz)) == "CLOSED"
+        status = determine_trading_session(datetime(2024, 1, 2, 10, 0, tzinfo=tz))
+        assert status["session"] == "CLOSED"
+        assert status["is_holiday"] is True
+
+    def test_compute_next_open_helper(self, monkeypatch):
+        """Ensure next open helper returns KST-aware timestamps."""
+        import app.utils as utils
+
+        tz = ZoneInfo("Asia/Seoul")
+
+        monkeypatch.setattr(utils, "is_krx_trading_day", lambda day: day.weekday() < 5)
+
+        next_open = utils.compute_next_open_kst(datetime(2024, 1, 2, 16, 0, tzinfo=tz))
+        assert next_open.hour == 18
+        assert next_open.tzinfo.key == "Asia/Seoul"
+
+        weekend_open = utils.compute_next_open_kst(datetime(2024, 1, 6, 7, 0, tzinfo=tz))
+        assert weekend_open.weekday() == 0
+        assert weekend_open.hour == 9
     
     @pytest.mark.asyncio
     async def test_parse_tick_data(self):
@@ -300,8 +326,8 @@ class TestWebSocketReconnection:
             mock_tm._is_in_backoff.return_value = False
             mock_token_mgr.return_value = mock_tm
 
-            with patch('services.dbsec_ws.determine_trading_session', return_value="DAY"), \
-                 patch('services.dbsec_ws.websocket.create_connection') as mock_ws:
+        with patch('services.dbsec_ws.determine_trading_session', return_value={"session": "DAY", "is_holiday": False, "next_open": None}), \
+             patch('services.dbsec_ws.websocket.create_connection') as mock_ws:
                 # Simulate connection error then success
                 mock_ws.side_effect = [
                     WebSocketException("Connection lost"),
@@ -311,8 +337,10 @@ class TestWebSocketReconnection:
                 # Run monitoring (will attempt reconnect)
                 task = asyncio.create_task(monitor.start_monitoring())
 
-                # Give it time to attempt reconnection
-                await asyncio.sleep(0.1)
+                for _ in range(10):
+                    if monitor.reconnect_attempts > 0:
+                        break
+                    await asyncio.sleep(0.05)
 
                 # Cancel the task
                 task.cancel()

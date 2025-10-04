@@ -21,13 +21,40 @@ import requests
 
 from utils.masking import mask_secret, redact_headers, redact_ws_url, redact_dict
 from utils.token_manager import get_token_manager
-from app.utils import determine_trading_session
+from app.utils import determine_trading_session, compute_next_open_kst, KST
 
 logger = logging.getLogger(__name__)
 
+async def sleep_until(target: datetime, max_cap_hours: Optional[int] = None) -> None:
+    """Sleep asynchronously until the target datetime with optional capping."""
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=timezone.utc)
+
+    now = datetime.now(target.tzinfo)
+    wait_seconds = (target - now).total_seconds()
+
+    if max_cap_hours is not None and max_cap_hours > 0:
+        wait_seconds = min(wait_seconds, max_cap_hours * 3600)
+
+    if wait_seconds <= 0:
+        return
+
+    logger.debug(
+        "[DBSEC] 휴장 대기 - %.0f초 동안 슬립 (캡 %s시간)",
+        wait_seconds,
+        max_cap_hours,
+    )
+
+    try:
+        await asyncio.wait_for(asyncio.sleep(wait_seconds), timeout=wait_seconds)
+    except asyncio.TimeoutError:
+        logger.warning("[DBSEC] WebSocket timeout, retrying...")
+
+
 def is_trading_session(now: Optional[datetime] = None) -> bool:
     """Return True when KOSPI200 futures trading is active."""
-    return determine_trading_session(now) in {"DAY", "NIGHT"}
+    status = determine_trading_session(now)
+    return status.get("session") in {"DAY", "NIGHT"}
 class KOSPI200FuturesMonitor:
     """KOSPI200 Futures real-time monitor with anomaly detection"""
     
@@ -80,11 +107,68 @@ class KOSPI200FuturesMonitor:
         # MarketWatcher integration endpoint (uses main Sentinel URL)
         self.sentinel_base_url = os.getenv("SENTINEL_BASE_URL", "").strip()
         self.sentinel_key = os.getenv("SENTINEL_KEY", "").strip()
+
+        poll_minutes_env = os.getenv("DBSEC_POLL_MINUTES", "").strip()
+        self.poll_minutes: int = 30
+        if poll_minutes_env:
+            try:
+                self.poll_minutes = max(1, int(poll_minutes_env))
+            except ValueError:
+                logger.warning(
+                    "Invalid DBSEC_POLL_MINUTES value %s, using default 30 minutes",
+                    poll_minutes_env,
+                )
+
+        sleep_cap_env = os.getenv("DBSEC_SLEEP_CAP_HOURS", "").strip()
+        self.sleep_cap_hours: Optional[int] = None
+        if sleep_cap_env:
+            try:
+                parsed_hours = int(sleep_cap_env)
+                if parsed_hours > 0:
+                    self.sleep_cap_hours = parsed_hours
+            except ValueError:
+                logger.warning(
+                    "Invalid DBSEC_SLEEP_CAP_HOURS value %s, ignoring cap",
+                    sleep_cap_env,
+                )
+
+        self._last_holiday_notice: Optional[datetime] = None
         
     def set_alert_callback(self, callback: Callable[[Dict[str, Any]], None]):
         """Set callback function for alert notifications"""
         self.alert_callback = callback
-        
+
+    @staticmethod
+    def _format_kst(target: datetime) -> str:
+        """Format datetime in KST for user-facing logs."""
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        return target.astimezone(KST).strftime("%Y-%m-%d %H:%M %Z")
+
+    async def _sleep_until_poll(self):
+        """Sleep for the configured poll interval with debug progress logs."""
+        total_seconds = max(1, int(self.poll_minutes * 60))
+        logger.debug(
+            "[DBSEC] CLOSED 비거래 시간 - %s분 뒤 다시 확인 (총 %s초)",
+            self.poll_minutes,
+            total_seconds,
+        )
+
+        remaining = total_seconds
+        step = min(60, total_seconds)
+
+        while remaining > 0:
+            segment = min(step, remaining)
+            try:
+                await asyncio.wait_for(asyncio.sleep(segment), timeout=segment)
+            except asyncio.TimeoutError:
+                logger.warning("[DBSEC] WebSocket timeout, retrying...")
+                return
+
+            remaining -= segment
+            if remaining > 0:
+                logger.debug("[DBSEC] 다음 세션 확인까지 %s초 남음", remaining)
+
     async def start_monitoring(self):
         """Start WebSocket monitoring with auto-reconnect"""
         if not self.enabled:
@@ -97,13 +181,31 @@ class KOSPI200FuturesMonitor:
         logger.info("[DB증권] Starting K200 Futures monitoring")
         
         while True:
-            session = determine_trading_session()
+            status = determine_trading_session()
+            session = status.get("session")
+            is_holiday = bool(status.get("is_holiday"))
+            next_open = status.get("next_open") or compute_next_open_kst()
+
             if session == "CLOSED":
-                logger.info("[DBSEC] 휴장일/비거래 시간 → WebSocket 연결 skip (30분 후 재확인)")
                 self.is_connected = False
                 self.reconnect_attempts = 0
-                await asyncio.sleep(1800)
+
+                if is_holiday and next_open:
+                    if self._last_holiday_notice != next_open:
+                        logger.info(
+                            "[DBSEC] 휴장일 → 다음 개장 %s 까지 대기",
+                            self._format_kst(next_open),
+                        )
+                        self._last_holiday_notice = next_open
+
+                    await sleep_until(next_open, self.sleep_cap_hours)
+                else:
+                    self._last_holiday_notice = None
+                    await self._sleep_until_poll()
+
                 continue
+
+            self._last_holiday_notice = None
 
             if session in {"DAY", "NIGHT"} and session != self.current_session:
                 self.current_session = session
@@ -355,7 +457,8 @@ class KOSPI200FuturesMonitor:
             
     def _determine_session(self) -> str:
         """Determine if current time is DAY or NIGHT session"""
-        session = determine_trading_session()
+        status = determine_trading_session()
+        session = status.get("session")
 
         if session in {"DAY", "NIGHT"} and session != self.current_session:
             # 세션 전환 시 일중 기준가 리셋
