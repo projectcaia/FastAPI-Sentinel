@@ -21,17 +21,34 @@ import requests
 
 from utils.masking import mask_secret, redact_headers, redact_ws_url, redact_dict
 from utils.token_manager import get_token_manager
-from app.utils import determine_trading_session, compute_next_open_kst, KST
+from app.utils import (
+    determine_trading_session,
+    compute_next_open_kst,
+    is_krx_trading_day,
+    KST,
+)
 
 logger = logging.getLogger(__name__)
 
-async def sleep_until(target: datetime, max_cap_hours: Optional[int] = None) -> None:
-    """Sleep asynchronously until the target datetime with optional capping."""
-    if target.tzinfo is None:
-        target = target.replace(tzinfo=timezone.utc)
+async def sleep_until(target: Optional[datetime], max_cap_hours: Optional[int] = None) -> None:
+    """Sleep until the supplied time, defaulting to the next session when needed."""
+    if target is None:
+        target = compute_next_open_kst()
+        if target is None:
+            return
 
-    now = datetime.now(target.tzinfo)
-    wait_seconds = (target - now).total_seconds()
+    if target.tzinfo is None:
+        target_kst = target.replace(tzinfo=KST)
+    else:
+        target_kst = target.astimezone(KST)
+
+    now_kst = datetime.now(KST)
+    if target_kst <= now_kst:
+        target_kst = compute_next_open_kst(now_kst)
+        if target_kst is None or target_kst <= now_kst:
+            return
+
+    wait_seconds = (target_kst - now_kst).total_seconds()
 
     if max_cap_hours is not None and max_cap_hours > 0:
         wait_seconds = min(wait_seconds, max_cap_hours * 3600)
@@ -40,9 +57,10 @@ async def sleep_until(target: datetime, max_cap_hours: Optional[int] = None) -> 
         return
 
     logger.debug(
-        "[DBSEC] 휴장 대기 - %.0f초 동안 슬립 (캡 %s시간)",
+        "[DBSEC] 휴장 대기 - %.0f초 동안 슬립 (캡 %s시간, 목표 %s)",
         wait_seconds,
         max_cap_hours,
+        target_kst.strftime("%Y-%m-%d %H:%M %Z"),
     )
 
     try:
@@ -53,8 +71,7 @@ async def sleep_until(target: datetime, max_cap_hours: Optional[int] = None) -> 
 
 def is_trading_session(now: Optional[datetime] = None) -> bool:
     """Return True when KOSPI200 futures trading is active."""
-    status = determine_trading_session(now)
-    return status.get("session") in {"DAY", "NIGHT"}
+    return determine_trading_session(now) in {"DAY", "NIGHT"}
 class KOSPI200FuturesMonitor:
     """KOSPI200 Futures real-time monitor with anomaly detection"""
     
@@ -181,10 +198,10 @@ class KOSPI200FuturesMonitor:
         logger.info("[DB증권] Starting K200 Futures monitoring")
         
         while True:
-            status = determine_trading_session()
-            session = status.get("session")
-            is_holiday = bool(status.get("is_holiday"))
-            next_open = status.get("next_open") or compute_next_open_kst()
+            now_kst = datetime.now(KST)
+            session = determine_trading_session(now_kst)
+            next_open = compute_next_open_kst(now_kst)
+            is_holiday = session == "CLOSED" and not is_krx_trading_day(now_kst.date())
 
             if session == "CLOSED":
                 self.is_connected = False
@@ -429,7 +446,10 @@ class KOSPI200FuturesMonitor:
                 self.daily_open_price = float(body.get("stck_oprc", current_price))  # 시가
                 
             # Determine trading session
-            session = self._determine_session()
+            session = determine_trading_session()
+            if session in {"DAY", "NIGHT"} and session != self.current_session:
+                # 세션 변경 시 일중 기준가 초기화
+                self.daily_open_price = None
             
             # Calculate change rate from daily open
             change_rate = 0.0
@@ -454,17 +474,6 @@ class KOSPI200FuturesMonitor:
         except Exception as e:
             logger.error(f"Tick parsing error: {e}")
             return None
-            
-    def _determine_session(self) -> str:
-        """Determine if current time is DAY or NIGHT session"""
-        status = determine_trading_session()
-        session = status.get("session")
-
-        if session in {"DAY", "NIGHT"} and session != self.current_session:
-            # 세션 전환 시 일중 기준가 리셋
-            self.daily_open_price = None
-
-        return session
             
     async def _check_anomaly(self, tick: Dict[str, Any]):
         """Check for price anomalies and trigger alerts"""
