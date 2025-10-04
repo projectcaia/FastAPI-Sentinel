@@ -304,21 +304,21 @@ class KOSPI200FuturesMonitor:
             # Add to buffer
             self.tick_buffer.append(tick_data)
 
-            tick_summary = {
-                "price": tick_data.get("price"),
-                "change_rate": tick_data.get("change_rate"),
-                "volume": tick_data.get("volume"),
-                "session": tick_data.get("session"),
-            }
-
             logger.info("[DBSEC] K200 Futures tick: update received")
 
-            logger.debug(
-                "[DBSEC] Tick summary (redacted): %s",
-                redact_dict(tick_summary),
-            )
-
             if logger.isEnabledFor(logging.DEBUG):
+                tick_summary = {
+                    "price": tick_data.get("price"),
+                    "change_rate": tick_data.get("change_rate"),
+                    "volume": tick_data.get("volume"),
+                    "session": tick_data.get("session"),
+                }
+
+                logger.debug(
+                    "[DBSEC] Tick summary (redacted): %s",
+                    redact_dict(tick_summary),
+                )
+
                 debug_snapshot = {
                     key: value
                     for key, value in tick_data.items()
