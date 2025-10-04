@@ -51,10 +51,12 @@ def mask_secret(value: Any, prefix_visible: int = 4, suffix_visible: int = 2) ->
     if prefix_visible <= 0 or suffix_visible <= 0:
         return "***"
 
-    if len(cleaned) <= prefix_visible + suffix_visible:
-        return "***"
+    mask_token = "***"
 
-    return f"{cleaned[:prefix_visible]}***{cleaned[-suffix_visible:]}"
+    if len(cleaned) <= prefix_visible + suffix_visible + len(mask_token):
+        return mask_token
+
+    return f"{cleaned[:prefix_visible]}{mask_token}{cleaned[-suffix_visible:]}"
 
 
 def redact_kv(
