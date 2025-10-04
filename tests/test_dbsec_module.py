@@ -25,7 +25,7 @@ from services.dbsec_ws import (
     get_futures_monitor,
 )
 from utils.masking import mask_secret
-from app.utils import determine_trading_session
+from app.utils import determine_trading_session, KST
 
 
 class TestTokenManager:
@@ -312,7 +312,7 @@ class TestMarketWatcherIntegration:
 
 class TestWebSocketReconnection:
     """Test WebSocket reconnection and error handling"""
-    
+
     @pytest.mark.asyncio
     async def test_reconnect_on_connection_lost(self):
         """Test automatic reconnection on connection loss"""
@@ -351,6 +351,42 @@ class TestWebSocketReconnection:
 
                 # Verify reconnection was attempted
                 assert monitor.reconnect_attempts > 0
+
+
+class TestTradingSessionHandling:
+    """Verify session-aware monitoring behaviours."""
+
+    @pytest.mark.asyncio
+    async def test_holiday_sleep_until_next_open(self, monkeypatch):
+        """Ensure holidays trigger sleep_until with computed next open."""
+        monitor = KOSPI200FuturesMonitor()
+
+        target_open = datetime(2024, 1, 1, 9, 0, tzinfo=KST)
+        captured = {}
+        sleep_event = asyncio.Event()
+
+        async def fake_sleep_until(timestamp, cap):
+            captured["timestamp"] = timestamp
+            captured["cap"] = cap
+            sleep_event.set()
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(
+            "services.dbsec_ws.determine_trading_session",
+            lambda: {"session": "CLOSED", "is_holiday": True, "next_open": None},
+        )
+        monkeypatch.setattr("services.dbsec_ws.compute_next_open_kst", lambda: target_open)
+        monkeypatch.setattr("services.dbsec_ws.sleep_until", fake_sleep_until)
+
+        task = asyncio.create_task(monitor.start_monitoring())
+
+        await asyncio.wait_for(sleep_event.wait(), timeout=1.0)
+        assert captured["timestamp"] == target_open
+        assert captured["cap"] == monitor.sleep_cap_hours
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
 
 class TestSecretMasking:
