@@ -127,3 +127,15 @@ class TestComputeNextOpen:
 
         expected = datetime(2024, 1, 8, 9, 0, tzinfo=KST)
         assert utils.compute_next_open_kst(now) == expected
+
+    def test_session_helpers_no_recursion(self, trading_calendar):
+        """Ensure helper functions cooperate without recursive loops."""
+        trading_calendar({date(2024, 1, 2), date(2024, 1, 3)})
+        now = datetime(2024, 1, 2, 14, 0, tzinfo=KST)
+
+        status = utils.determine_trading_session(now)
+        assert status["session"] == "DAY"
+        assert status["next_open"] == datetime(2024, 1, 2, 18, 0, tzinfo=KST)
+
+        follow_up_open = utils.compute_next_open_kst(status["next_open"])
+        assert follow_up_open == datetime(2024, 1, 3, 9, 0, tzinfo=KST)
