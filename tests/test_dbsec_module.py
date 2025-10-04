@@ -6,7 +6,7 @@ import pytest
 import asyncio
 import json
 from unittest.mock import Mock, patch, MagicMock, AsyncMock
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 from websocket import WebSocketException
 
@@ -129,39 +129,53 @@ class TestKOSPI200FuturesMonitor:
 
         tz = ZoneInfo("Asia/Seoul")
 
-        monkeypatch.setattr(utils, "compute_next_open_kst", lambda now=None: None)
+        trading_days = set()
+
+        def set_trading_days(*days):
+            trading_days.clear()
+            trading_days.update(days)
+
+        def fake_is_trading(day):
+            return day in trading_days
+
+        monkeypatch.setattr(utils, "is_krx_trading_day", fake_is_trading)
 
         # 주간 세션 판정
-        monkeypatch.setattr(utils, "is_krx_trading_day", lambda _: True)
+        set_trading_days(date(2024, 1, 2), date(2024, 1, 3))
         status = determine_trading_session(datetime(2024, 1, 2, 9, 0, tzinfo=tz))
         assert status["session"] == "DAY"
         assert status["is_holiday"] is False
+        assert status["next_open"] == datetime(2024, 1, 2, 18, 0, tzinfo=tz)
 
         status = determine_trading_session(datetime(2024, 1, 2, 15, 30, tzinfo=tz))
         assert status["session"] == "DAY"
+        assert status["next_open"] == datetime(2024, 1, 2, 18, 0, tzinfo=tz)
 
         # 야간 세션 판정 (당일 저녁)
-        monkeypatch.setattr(utils, "is_krx_trading_day", lambda _: True)
         status = determine_trading_session(datetime(2024, 1, 2, 18, 0, tzinfo=tz))
         assert status["session"] == "NIGHT"
+        assert status["next_open"] == datetime(2024, 1, 3, 9, 0, tzinfo=tz)
 
         # 익일 새벽에는 전일 기준 휴장 여부 확인
         call_args = []
 
         def tracker(day):
             call_args.append(day)
-            return True
+            return fake_is_trading(day)
 
         monkeypatch.setattr(utils, "is_krx_trading_day", tracker)
         status = determine_trading_session(datetime(2024, 1, 3, 2, 0, tzinfo=tz))
         assert status["session"] == "NIGHT"
         assert call_args[0].isoformat() == "2024-01-02"
+        assert status["next_open"] == datetime(2024, 1, 3, 9, 0, tzinfo=tz)
 
         # 휴장일에는 CLOSED 반환
-        monkeypatch.setattr(utils, "is_krx_trading_day", lambda _: False)
+        monkeypatch.setattr(utils, "is_krx_trading_day", fake_is_trading)
+        set_trading_days(date(2024, 1, 3))
         status = determine_trading_session(datetime(2024, 1, 2, 10, 0, tzinfo=tz))
         assert status["session"] == "CLOSED"
         assert status["is_holiday"] is True
+        assert status["next_open"] == datetime(2024, 1, 3, 9, 0, tzinfo=tz)
 
     def test_compute_next_open_helper(self, monkeypatch):
         """Ensure next open helper returns KST-aware timestamps."""
