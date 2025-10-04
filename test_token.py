@@ -64,7 +64,7 @@ async def test_token_request():
     
     if token:
         print("\n✅ SUCCESS! Token acquired")
-        print(f"📝 Token: {mask_secret(token, visible=6)}")
+        print(f"📝 Token: {mask_secret(token)}")
         print(f"🕐 Expires at: {manager.expires_at}")
         print(f"📋 Type: {manager.token_type}")
     else:
