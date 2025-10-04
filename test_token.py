@@ -8,6 +8,10 @@ import os
 import logging
 import sys
 
+import pytest
+
+pytestmark = pytest.mark.skip(reason="Manual DB증권 token test is excluded from automated pytest runs.")
+
 # Setup logging
 logging.basicConfig(
     level=logging.DEBUG,
