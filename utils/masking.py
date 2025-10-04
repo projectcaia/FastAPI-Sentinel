@@ -51,21 +51,23 @@ def mask_secret(value: Any, head: int = VISIBLE_PREFIX, tail: int = VISIBLE_SUFF
     except Exception:  # pragma: no cover - 방어적 처리
         return mask_token
 
-    cleaned = value_str.strip()
-    if not cleaned:
+    if not value_str:
         return mask_token
 
     if head < 0 or tail < 0:
         return mask_token
 
-    threshold = max(head, 0) + max(tail, 0) + len(mask_token)
-
-    if len(cleaned) <= threshold:
+    if not value_str.strip():
         return mask_token
 
-    # 길이가 충분한 경우에도 4-***-2 고정 패턴 적용
-    prefix = cleaned[:VISIBLE_PREFIX]
-    suffix = cleaned[-VISIBLE_SUFFIX:]
+    threshold = head + tail + len(mask_token)
+
+    if len(value_str) <= threshold:
+        return mask_token
+
+    # 길이가 충분한 경우 4-***-2 고정 패턴 적용
+    prefix = value_str[:VISIBLE_PREFIX]
+    suffix = value_str[-VISIBLE_SUFFIX:]
     return f"{prefix}{mask_token}{suffix}"
 
 
