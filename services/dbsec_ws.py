@@ -7,10 +7,9 @@ import json
 import logging
 import os
 from collections import deque
-from datetime import datetime, timezone, time, timedelta
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Callable, Deque
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-from zoneinfo import ZoneInfo
 
 import websocket
 from websocket import WebSocketException
@@ -22,45 +21,9 @@ import requests
 
 from utils.masking import mask_secret, redact_headers, redact_ws_url, redact_dict
 from utils.token_manager import get_token_manager
-from app.utils import is_krx_trading_day
+from app.utils import determine_trading_session
 
 logger = logging.getLogger(__name__)
-
-KST = ZoneInfo("Asia/Seoul")
-DAY_SESSION_START = time(9, 0)
-DAY_SESSION_END = time(15, 45)
-NIGHT_SESSION_START = time(18, 0)
-NIGHT_SESSION_END = time(5, 0)
-
-
-def _ensure_kst(now: Optional[datetime] = None) -> datetime:
-    """Normalize input datetime to Asia/Seoul timezone."""
-    if now is None:
-        return datetime.now(KST)
-
-    if now.tzinfo is None:
-        return now.replace(tzinfo=KST)
-
-    return now.astimezone(KST)
-
-
-def determine_trading_session(now: Optional[datetime] = None) -> str:
-    """Return the current trading session label (DAY/NIGHT/CLOSED)."""
-    now_kst = _ensure_kst(now)
-    current_time = now_kst.time()
-
-    if DAY_SESSION_START <= current_time <= DAY_SESSION_END:
-        return "DAY" if is_krx_trading_day(now_kst.date()) else "CLOSED"
-
-    if current_time >= NIGHT_SESSION_START or current_time <= NIGHT_SESSION_END:
-        reference_date = now_kst.date()
-        if current_time <= NIGHT_SESSION_END:
-            reference_date = reference_date - timedelta(days=1)
-
-        return "NIGHT" if is_krx_trading_day(reference_date) else "CLOSED"
-
-    return "CLOSED"
-
 
 def is_trading_session(now: Optional[datetime] = None) -> bool:
     """Return True when KOSPI200 futures trading is active."""

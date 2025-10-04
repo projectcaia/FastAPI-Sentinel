@@ -7,6 +7,7 @@ import asyncio
 import json
 from unittest.mock import Mock, patch, MagicMock, AsyncMock
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from websocket import WebSocketException
 
 # Mock environment variables before importing modules
@@ -24,6 +25,7 @@ from services.dbsec_ws import (
     get_futures_monitor,
     mask_secret,
 )
+from app.utils import determine_trading_session
 
 
 class TestTokenManager:
@@ -121,20 +123,35 @@ class TestKOSPI200FuturesMonitor:
         assert monitor.ws_url == expected_ws_url
         assert len(monitor.tick_buffer) == 0
     
-    def test_session_determination(self):
-        """Test trading session determination"""
-        monitor = KOSPI200FuturesMonitor()
-        
-        with patch('services.dbsec_ws.datetime') as mock_datetime:
-            # Mock DAY session (10:00 KST)
-            mock_dt = Mock()
-            mock_dt.time.return_value.hour = 10
-            mock_dt.time.return_value.minute = 0
-            mock_datetime.now.return_value = mock_dt
-            
-            # Note: This test would need more complex mocking for pytz
-            # For now, we just verify the method exists
-            assert hasattr(monitor, '_determine_session')
+    def test_determine_trading_session_helper(self, monkeypatch):
+        """Verify the shared trading session helper covers day/night windows."""
+        import app.utils as utils
+
+        tz = ZoneInfo("Asia/Seoul")
+
+        # 주간 세션 판정
+        monkeypatch.setattr(utils, "is_krx_trading_day", lambda _: True)
+        assert determine_trading_session(datetime(2024, 1, 2, 9, 0, tzinfo=tz)) == "DAY"
+        assert determine_trading_session(datetime(2024, 1, 2, 15, 30, tzinfo=tz)) == "DAY"
+
+        # 야간 세션 판정 (당일 저녁)
+        monkeypatch.setattr(utils, "is_krx_trading_day", lambda _: True)
+        assert determine_trading_session(datetime(2024, 1, 2, 18, 0, tzinfo=tz)) == "NIGHT"
+
+        # 익일 새벽에는 전일 기준 휴장 여부 확인
+        call_args = []
+
+        def tracker(day):
+            call_args.append(day)
+            return True
+
+        monkeypatch.setattr(utils, "is_krx_trading_day", tracker)
+        assert determine_trading_session(datetime(2024, 1, 3, 2, 0, tzinfo=tz)) == "NIGHT"
+        assert call_args[-1].isoformat() == "2024-01-02"
+
+        # 휴장일에는 CLOSED 반환
+        monkeypatch.setattr(utils, "is_krx_trading_day", lambda _: False)
+        assert determine_trading_session(datetime(2024, 1, 2, 10, 0, tzinfo=tz)) == "CLOSED"
     
     @pytest.mark.asyncio
     async def test_parse_tick_data(self):
