@@ -1,7 +1,8 @@
 """Utility helpers for masking sensitive values in logs and telemetry."""
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Sequence
+from collections.abc import Mapping, Sequence, Set as AbstractSet
+from typing import Any, Dict
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 # 민감한 키 식별을 위한 기준 목록
@@ -21,6 +22,8 @@ SENSITIVE_KEYS: Sequence[str] = (
     "signature",
     "sentinel_key",
     "connector_secret",
+    "client_secret",
+    "refresh_token",
 )
 
 
@@ -155,8 +158,8 @@ def redact_dict(
             )
             for key, value in data.items()
         }
-    if isinstance(data, list):
-        return [
+    if isinstance(data, Sequence) and not isinstance(data, (str, bytes, bytearray)):
+        redacted_sequence = [
             redact_dict(
                 item,
                 prefix_visible=prefix_visible,
@@ -164,8 +167,21 @@ def redact_dict(
             )
             for item in data
         ]
-    if isinstance(data, tuple):
-        return tuple(
+
+        if isinstance(data, tuple):
+            return tuple(redacted_sequence)
+        if isinstance(data, list):
+            return redacted_sequence
+
+        # For other sequence types (e.g., deque), reconstruct via the original type
+        try:
+            return type(data)(redacted_sequence)
+        except TypeError:
+            # Fallback to list when the type expects additional constructor args
+            return redacted_sequence
+
+    if isinstance(data, AbstractSet):
+        return type(data)(
             redact_dict(
                 item,
                 prefix_visible=prefix_visible,
@@ -173,15 +189,6 @@ def redact_dict(
             )
             for item in data
         )
-    if isinstance(data, set):
-        return {
-            redact_dict(
-                item,
-                prefix_visible=prefix_visible,
-                suffix_visible=suffix_visible,
-            )
-            for item in data
-        }
     return data
 
 
