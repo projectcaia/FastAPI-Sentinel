@@ -30,10 +30,12 @@ def _is_sensitive_key(key: str) -> bool:
     return any(sensitive in key_lower for sensitive in SENSITIVE_KEYS)
 
 
-def mask_secret(value: Any, prefix_visible: int = 4, suffix_visible: int = 2) -> str:
-    """Mask sensitive values using a 4-***-2 style pattern."""
+def mask_secret(value: Any, head: int = 4, tail: int = 2) -> str:
+    """Mask sensitive values with a 4-***-2 visibility rule."""
+    mask_token = "***"
+
     if value is None:
-        return "***"
+        return mask_token
 
     try:
         # 문자열화 후 마스킹 처리
@@ -42,21 +44,24 @@ def mask_secret(value: Any, prefix_visible: int = 4, suffix_visible: int = 2) ->
         else:
             value_str = str(value)
     except Exception:  # pragma: no cover - 방어적 처리
-        return "***"
+        return mask_token
 
     cleaned = value_str.strip()
     if not cleaned:
-        return "***"
-
-    if prefix_visible <= 0 or suffix_visible <= 0:
-        return "***"
-
-    mask_token = "***"
-
-    if len(cleaned) <= prefix_visible + suffix_visible + len(mask_token):
         return mask_token
 
-    return f"{cleaned[:prefix_visible]}{mask_token}{cleaned[-suffix_visible:]}"
+    if head < 0 or tail < 0:
+        return mask_token
+
+    visible_head = head if head > 0 else 0
+    visible_tail = tail if tail > 0 else 0
+
+    if len(cleaned) <= visible_head + visible_tail + len(mask_token):
+        return mask_token
+
+    prefix = cleaned[:visible_head] if visible_head else ""
+    suffix = cleaned[-visible_tail:] if visible_tail else ""
+    return f"{prefix}{mask_token}{suffix}"
 
 
 def redact_kv(
@@ -69,8 +74,8 @@ def redact_kv(
     if _is_sensitive_key(key):
         return mask_secret(
             value,
-            prefix_visible=prefix_visible,
-            suffix_visible=suffix_visible,
+            head=prefix_visible,
+            tail=suffix_visible,
         )
     return value
 
@@ -138,8 +143,8 @@ def redact_dict(
             if not _is_sensitive_key(key)
             else mask_secret(
                 value,
-                prefix_visible=prefix_visible,
-                suffix_visible=suffix_visible,
+                head=prefix_visible,
+                tail=suffix_visible,
             )
             for key, value in data.items()
         }
