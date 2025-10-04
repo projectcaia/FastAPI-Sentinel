@@ -9,13 +9,14 @@ import os
 from collections import deque
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Callable, Deque
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
 import websocket
 from websocket import WebSocketException
 from websocket._exceptions import (
     WebSocketConnectionClosedException,
     WebSocketTimeoutException,
 )
-import httpx
 import requests
 
 from utils.token_manager import get_token_manager
@@ -137,22 +138,32 @@ class KOSPI200FuturesMonitor:
             else:
                 raise Exception("Failed to get access token - check DB_APP_KEY/DB_APP_SECRET or API quota")
         
-        headers = {
-            "Authorization": f"Bearer {access_token}"
-        }
-        
-        logger.info(f"Connecting to WebSocket: {self.ws_url}")
-        
-        header_list = [f"{k}: {v}" for k, v in headers.items()]
+        app_key = getattr(token_manager, "app_key", "").strip()
+        if not app_key:
+            raise Exception("DB_APP_KEY is not configured - check environment variables")
 
-        logger.debug(
-            "Using websocket-client header list for compatibility: %s",
-            header_list,
-        )
+        parsed_url = urlparse(self.ws_url)
+        query_params = dict(parse_qsl(parsed_url.query))
+        query_params.update({
+            "appkey": app_key,
+            "token": access_token,
+        })
+        ws_url = urlunparse(parsed_url._replace(query=urlencode(query_params)))
+
+        logger.info(f"Connecting to WebSocket: {ws_url}")
+
+        headers: Dict[str, str] = {}
+        send_auth_header = os.getenv("DBSEC_WS_SEND_AUTH_HEADER", "false").lower() in ("1", "true", "yes")
+        if send_auth_header:
+            token_type = getattr(token_manager, "token_type", "Bearer")
+            headers["Authorization"] = f"{token_type} {access_token}"
+            logger.debug("Including Authorization header for WebSocket handshake")
+
+        header_list = [f"{k}: {v}" for k, v in headers.items()]
 
         ws = await asyncio.to_thread(
             websocket.create_connection,
-            self.ws_url,
+            ws_url,
             header=header_list,
             timeout=30,
             enable_multithread=True,
@@ -199,19 +210,25 @@ class KOSPI200FuturesMonitor:
                 
     async def _subscribe_futures(self):
         """Subscribe to KOSPI200 futures real-time data"""
-        # DB증권 API specific subscription message
-        # This is a placeholder - actual format depends on DB증권 API specification
+        # DB증권 API 실시간 선물 구독 명세 기반 메시지 구성
+        symbol = os.getenv("DB_FUTURES_SYMBOL", "K200").strip() or "K200"
+        exchange = os.getenv("DB_FUTURES_EXCHANGE", "FUT").strip() or "FUT"
+        tr_id = os.getenv("DB_FUTURES_TR_ID", "HDFSCNT0").strip() or "HDFSCNT0"
+
         subscribe_msg = {
             "header": {
-                "tr_type": "1",  # 실시간 등록
-                "tr_key": "K200_FUT"  # KOSPI200 선물
+                "tr_type": "1",          # 1: 실시간 등록, 2: 실시간 해제
+                "content_type": "utf-8",  # 명세에 따른 인코딩 정보
             },
             "body": {
-                "rt_cd": "S3_",  # 선물 실시간 코드 (예시)
-                "ivno": "101P3000"  # KOSPI200 선물 종목번호 (예시)
+                "input": {
+                    "tr_id": tr_id,
+                    "symbol": symbol,
+                    "exchange": exchange,
+                }
             }
         }
-        
+
         if not self.websocket:
             raise RuntimeError("WebSocket connection is not established")
 
