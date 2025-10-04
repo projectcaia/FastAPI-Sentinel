@@ -144,6 +144,12 @@ class KOSPI200FuturesMonitor:
             try:
                 await self._connect_and_monitor()
 
+            except asyncio.TimeoutError:
+                logger.warning("[DBSEC] WebSocket timeout, retrying...")
+                self.is_connected = False
+                await asyncio.sleep(5)
+                continue
+
             except (WebSocketConnectionClosedException, WebSocketException) as e:
                 self.reconnect_attempts += 1
                 logger.warning(f"WebSocket connection lost (attempt {self.reconnect_attempts}): {e}")
