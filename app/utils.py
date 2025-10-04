@@ -86,6 +86,59 @@ def determine_trading_session(now: Optional[datetime] = None) -> str:
     return "CLOSED"
 
 
+def compute_next_open_kst(now: Optional[datetime] = None) -> datetime:
+    """Compute the next market open time in KST considering trading sessions."""
+
+    def _ensure_kst(target: Optional[datetime]) -> datetime:
+        if target is None:
+            return datetime.now(KST)
+        if target.tzinfo is None:
+            return target.replace(tzinfo=KST)
+        return target.astimezone(KST)
+
+    def _next_trading_day(start: dt_module.date) -> dt_module.date:
+        candidate = start
+        # 다음 거래일까지 순차적으로 탐색
+        while not is_krx_trading_day(candidate):
+            candidate += timedelta(days=1)
+        return candidate
+
+    now_kst = _ensure_kst(now)
+    current_time = now_kst.time()
+    today = now_kst.date()
+    session = determine_trading_session(now_kst)
+    today_is_trading = is_krx_trading_day(today)
+
+    def _combine(target_day: dt_module.date, session_start: time) -> datetime:
+        return datetime.combine(target_day, session_start, tzinfo=KST)
+
+    if session == "DAY":
+        target_day = _next_trading_day(today)
+        next_open = _combine(target_day, NIGHT_SESSION_START)
+        if next_open <= now_kst:
+            next_day = _next_trading_day(target_day + timedelta(days=1))
+            return _combine(next_day, DAY_SESSION_START)
+        return next_open
+
+    if session == "NIGHT":
+        if current_time >= NIGHT_SESSION_START:
+            next_day = _next_trading_day(today + timedelta(days=1))
+            return _combine(next_day, DAY_SESSION_START)
+
+        early_session_day = _next_trading_day(today)
+        return _combine(early_session_day, DAY_SESSION_START)
+
+    if today_is_trading:
+        if current_time <= NIGHT_SESSION_END or current_time < DAY_SESSION_START:
+            return _combine(today, DAY_SESSION_START)
+        if DAY_SESSION_END < current_time < NIGHT_SESSION_START:
+            return _combine(today, NIGHT_SESSION_START)
+
+    start_day = today if not today_is_trading else today + timedelta(days=1)
+    next_day = _next_trading_day(start_day)
+    return _combine(next_day, DAY_SESSION_START)
+
+
 def is_market_open() -> bool:
     """Return True if today is a Korean trading day."""
     today = dt_module.date.today()
