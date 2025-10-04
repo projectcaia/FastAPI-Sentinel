@@ -7,9 +7,10 @@ import json
 import logging
 import os
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time, timedelta
 from typing import Optional, Dict, Any, Callable, Deque
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from zoneinfo import ZoneInfo
 
 import websocket
 from websocket import WebSocketException
@@ -21,8 +22,49 @@ import requests
 
 from utils.masking import mask_secret, redact_headers, redact_ws_url, redact_dict
 from utils.token_manager import get_token_manager
+from app.utils import is_krx_trading_day
 
 logger = logging.getLogger(__name__)
+
+KST = ZoneInfo("Asia/Seoul")
+DAY_SESSION_START = time(9, 0)
+DAY_SESSION_END = time(15, 45)
+NIGHT_SESSION_START = time(18, 0)
+NIGHT_SESSION_END = time(5, 0)
+
+
+def _ensure_kst(now: Optional[datetime] = None) -> datetime:
+    """Normalize input datetime to Asia/Seoul timezone."""
+    if now is None:
+        return datetime.now(KST)
+
+    if now.tzinfo is None:
+        return now.replace(tzinfo=KST)
+
+    return now.astimezone(KST)
+
+
+def determine_trading_session(now: Optional[datetime] = None) -> str:
+    """Return the current trading session label (DAY/NIGHT/CLOSED)."""
+    now_kst = _ensure_kst(now)
+    current_time = now_kst.time()
+
+    if DAY_SESSION_START <= current_time <= DAY_SESSION_END:
+        return "DAY" if is_krx_trading_day(now_kst.date()) else "CLOSED"
+
+    if current_time >= NIGHT_SESSION_START or current_time <= NIGHT_SESSION_END:
+        reference_date = now_kst.date()
+        if current_time <= NIGHT_SESSION_END:
+            reference_date = reference_date - timedelta(days=1)
+
+        return "NIGHT" if is_krx_trading_day(reference_date) else "CLOSED"
+
+    return "CLOSED"
+
+
+def is_trading_session(now: Optional[datetime] = None) -> bool:
+    """Return True when KOSPI200 futures trading is active."""
+    return determine_trading_session(now) in {"DAY", "NIGHT"}
 class KOSPI200FuturesMonitor:
     """KOSPI200 Futures real-time monitor with anomaly detection"""
     
@@ -64,7 +106,7 @@ class KOSPI200FuturesMonitor:
         self.websocket: Optional[websocket.WebSocket] = None
         self.is_connected: bool = False
         self.reconnect_attempts: int = 0
-        self.max_reconnect_attempts: int = 10 if enabled else 0
+        self.max_reconnect_attempts: Optional[int] = None
         
         # Event handlers
         self.alert_callback: Optional[Callable] = None
@@ -91,27 +133,31 @@ class KOSPI200FuturesMonitor:
             
         logger.info("[DB증권] Starting K200 Futures monitoring")
         
-        while self.reconnect_attempts < self.max_reconnect_attempts:
+        while True:
+            if not is_trading_session():
+                logger.info("[DBSEC] 휴장일/비거래 시간 → WebSocket 연결 skip (대기)")
+                self.is_connected = False
+                self.reconnect_attempts = 0
+                await asyncio.sleep(60)
+                continue
+
             try:
                 await self._connect_and_monitor()
-                
+
             except (WebSocketConnectionClosedException, WebSocketException) as e:
                 self.reconnect_attempts += 1
                 logger.warning(f"WebSocket connection lost (attempt {self.reconnect_attempts}): {e}")
 
-                if self.reconnect_attempts < self.max_reconnect_attempts:
-                    # Exponential backoff: 2^attempt seconds (max 60s)
-                    backoff = min(2 ** self.reconnect_attempts, 60)
-                    logger.info(f"Reconnecting in {backoff} seconds...")
-                    await asyncio.sleep(backoff)
-                else:
-                    logger.error("Max reconnection attempts exceeded")
-                    break
-                    
+                backoff = min(2 ** self.reconnect_attempts, 60)
+                logger.info(f"Reconnecting in {backoff} seconds...")
+                await asyncio.sleep(backoff)
+
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 error_msg = str(e)
                 logger.error(f"Monitoring error: {error_msg}")
-                
+
                 # Handle token-related errors with longer backoff
                 if "token" in error_msg.lower() or "access" in error_msg.lower():
                     self.reconnect_attempts += 1
@@ -122,8 +168,6 @@ class KOSPI200FuturesMonitor:
                 else:
                     self.reconnect_attempts += 1
                     await asyncio.sleep(5)
-        
-        logger.error("WebSocket monitoring stopped")
         
     async def _connect_and_monitor(self):
         """Connect to WebSocket and start monitoring"""
@@ -192,7 +236,8 @@ class KOSPI200FuturesMonitor:
                 try:
                     message = await asyncio.to_thread(ws.recv)
                 except WebSocketTimeoutException:
-                    # Keep the loop alive if no data arrives in timeout window
+                    logger.warning("[DBSEC] WebSocket timeout, retrying...")
+                    await asyncio.sleep(5)
                     continue
 
                 if message is None:
@@ -343,33 +388,13 @@ class KOSPI200FuturesMonitor:
             
     def _determine_session(self) -> str:
         """Determine if current time is DAY or NIGHT session"""
-        from datetime import datetime, time
-        import pytz
-        
-        # Korean timezone
-        kst = pytz.timezone('Asia/Seoul')
-        now = datetime.now(kst)
-        current_time = now.time()
-        
-        # KOSPI200 futures trading hours (KST)
-        # Day session: 09:00 - 15:45 (includes closing auction)
-        # Night session: 18:00 - 05:00 (next day)
-        
-        day_start = time(9, 0)   # 09:00
-        day_end = time(15, 45)   # 15:45
-        night_start = time(18, 0) # 18:00
-        night_end = time(5, 0)    # 05:00 (next day)
-        
-        # Reset daily open at session start
-        if current_time == day_start or current_time == night_start:
+        session = determine_trading_session()
+
+        if session in {"DAY", "NIGHT"} and session != self.current_session:
+            # 세션 전환 시 일중 기준가 리셋
             self.daily_open_price = None
-        
-        if day_start <= current_time <= day_end:
-            return "DAY"
-        elif current_time >= night_start or current_time <= night_end:
-            return "NIGHT"
-        else:
-            return "CLOSED"
+
+        return session
             
     async def _check_anomaly(self, tick: Dict[str, Any]):
         """Check for price anomalies and trigger alerts"""

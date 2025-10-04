@@ -24,11 +24,18 @@ try:
 except ImportError:
     holidays = None
 
-def is_market_open():
-    today = datetime.date.today()
+
+def is_krx_trading_day(day: datetime.date) -> bool:
+    """Return True if the supplied day is a Korean trading day."""
     if holidays:
         kr_holidays = holidays.KR()
-        return today.weekday() < 5 and today not in kr_holidays
-    else:
-        # holidays 패키지가 없으면 단순 주말 체크만
-        return today.weekday() < 5
+        return day.weekday() < 5 and day not in kr_holidays
+
+    # holidays 패키지가 없으면 단순 주말 체크만
+    return day.weekday() < 5
+
+
+def is_market_open() -> bool:
+    """Return True if today is a Korean trading day."""
+    today = datetime.date.today()
+    return is_krx_trading_day(today)

@@ -7,6 +7,7 @@ import asyncio
 import json
 from unittest.mock import Mock, patch, MagicMock, AsyncMock
 from datetime import datetime, timedelta, timezone
+from websocket import WebSocketException
 
 # Mock environment variables before importing modules
 import os
@@ -109,13 +110,15 @@ class TestKOSPI200FuturesMonitor:
         monitor = KOSPI200FuturesMonitor(
             alert_threshold=1.0,
             warn_threshold=0.5,
-            buffer_size=100
+            buffer_size=100,
+            ws_url=os.getenv("DB_WS_URL")
         )
         
         assert monitor.alert_threshold == 1.0
         assert monitor.warn_threshold == 0.5
         assert monitor.buffer_size == 100
-        assert monitor.ws_url == "wss://test.dbsec.co.kr:9443/ws"
+        expected_ws_url = os.getenv("DB_WS_URL", "wss://openapi.dbsec.co.kr:9443/ws")
+        assert monitor.ws_url == expected_ws_url
         assert len(monitor.tick_buffer) == 0
     
     def test_session_determination(self):
@@ -279,27 +282,28 @@ class TestWebSocketReconnection:
             mock_tm.get_token.return_value = "test_token"
             mock_tm._is_in_backoff.return_value = False
             mock_token_mgr.return_value = mock_tm
-            
-            with patch('websockets.connect') as mock_ws:
+
+            with patch('services.dbsec_ws.is_trading_session', return_value=True), \
+                 patch('services.dbsec_ws.websocket.create_connection') as mock_ws:
                 # Simulate connection error then success
                 mock_ws.side_effect = [
-                    ConnectionError("Connection lost"),
-                    AsyncMock()  # Successful reconnection
+                    WebSocketException("Connection lost"),
+                    MagicMock()  # Successful reconnection
                 ]
-                
+
                 # Run monitoring (will attempt reconnect)
                 task = asyncio.create_task(monitor.start_monitoring())
-                
+
                 # Give it time to attempt reconnection
                 await asyncio.sleep(0.1)
-                
+
                 # Cancel the task
                 task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
-                
+
                 # Verify reconnection was attempted
                 assert monitor.reconnect_attempts > 0
 
