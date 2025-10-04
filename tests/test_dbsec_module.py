@@ -332,6 +332,13 @@ class TestSecretMasking:
 
         assert masked == "***"
 
+    def test_mask_secret_fixed_pattern(self):
+        """Ensure custom head/tail arguments do not alter the mask pattern."""
+        secret = "abcdefghijklmnop"
+        masked = mask_secret(secret, head=1, tail=5)
+
+        assert masked == secret[:4] + "***" + secret[-2:]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

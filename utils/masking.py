@@ -31,7 +31,7 @@ def _is_sensitive_key(key: str) -> bool:
 
 
 def mask_secret(value: Any, head: int = 4, tail: int = 2) -> str:
-    """Mask sensitive values following the 4-***-2 visibility pattern."""
+    """Mask sensitive values with a fixed 4-***-2 visibility pattern."""
     mask_token = "***"
 
     if value is None:
@@ -55,14 +55,12 @@ def mask_secret(value: Any, head: int = 4, tail: int = 2) -> str:
 
     visible_head = head if head > 0 else 0
     visible_tail = tail if tail > 0 else 0
-    threshold = visible_head + visible_tail + 3
+    threshold = visible_head + visible_tail + len(mask_token)
 
     if len(cleaned) <= threshold:
         return mask_token
 
-    prefix = cleaned[:visible_head] if visible_head else ""
-    suffix = cleaned[-visible_tail:] if visible_tail else ""
-    return f"{prefix}{mask_token}{suffix}"
+    return f"{cleaned[:4]}{mask_token}{cleaned[-2:]}"
 
 
 def redact_kv(
