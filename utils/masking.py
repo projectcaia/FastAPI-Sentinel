@@ -31,7 +31,7 @@ def _is_sensitive_key(key: str) -> bool:
 
 
 def mask_secret(value: Any, head: int = 4, tail: int = 2) -> str:
-    """Mask sensitive values with a 4-***-2 visibility rule."""
+    """Mask sensitive values following the 4-***-2 visibility pattern."""
     mask_token = "***"
 
     if value is None:
@@ -55,8 +55,9 @@ def mask_secret(value: Any, head: int = 4, tail: int = 2) -> str:
 
     visible_head = head if head > 0 else 0
     visible_tail = tail if tail > 0 else 0
+    threshold = visible_head + visible_tail + 3
 
-    if len(cleaned) <= visible_head + visible_tail + len(mask_token):
+    if len(cleaned) <= threshold:
         return mask_token
 
     prefix = cleaned[:visible_head] if visible_head else ""
