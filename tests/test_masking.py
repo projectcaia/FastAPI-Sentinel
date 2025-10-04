@@ -1,6 +1,8 @@
 """Unit tests for masking helpers used throughout the project."""
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
 from utils.masking import mask_secret, redact_dict, redact_headers, redact_ws_url
 
 
@@ -27,6 +29,14 @@ class TestMaskSecret:
         assert masked.startswith("abcd")
         assert masked.endswith("89")
         assert masked[4:7] == "***"
+
+    @pytest.mark.parametrize(
+        "value",
+        ["", "  ", []],
+    )
+    def test_mask_secret_handles_empty_like_values(self, value):
+        """Ensure empty or blank-like values collapse to the mask token."""
+        assert mask_secret(value) == "***"
 
 
 class TestRedactionHelpers:
@@ -72,6 +82,11 @@ class TestRedactionHelpers:
                 {"password": "secretvalue", "app_key": "1234"},
                 "public",
             ],
+            "set_values": {"api_key": "setsecretvalue", "note": "keep"},
+            "tuple_values": (
+                {"signature": "sigsecretvalue"},
+                "transparent",
+            ),
         }
 
         redacted = redact_dict(payload)
@@ -85,3 +100,13 @@ class TestRedactionHelpers:
         assert redacted["values"][0]["password"] == "secr***ue"
         assert redacted["values"][0]["app_key"] == "***"
         assert redacted["values"][1] == "public"
+        masked_set = redacted["set_values"]
+        assert masked_set["api_key"].startswith("sets")
+        assert masked_set["api_key"][4:7] == "***"
+        assert masked_set["api_key"].endswith("ue")
+        assert masked_set["note"] == "keep"
+        masked_tuple = redacted["tuple_values"]
+        assert masked_tuple[0]["signature"].startswith("sigs")
+        assert masked_tuple[0]["signature"][4:7] == "***"
+        assert masked_tuple[0]["signature"].endswith("ue")
+        assert masked_tuple[1] == "transparent"
