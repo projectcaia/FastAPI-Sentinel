@@ -3,6 +3,7 @@ DB증권 API Router for KOSPI200 Futures Monitoring
 FastAPI router for DB증권 integration endpoints
 """
 import os
+import asyncio
 import logging
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, BackgroundTasks
@@ -62,44 +63,62 @@ async def startup_dbsec():
     global _initialized
     if _initialized:
         return
-        
+
     try:
         logger.info("Initializing DB증권 K200 선물지수 monitoring services...")
-        
+
         # Check if DB증권 is enabled
         dbsec_enabled = os.getenv("DBSEC_ENABLE", "true").lower() in ["true", "1", "yes"]
         if not dbsec_enabled:
             logger.info("DB증권 services disabled by DBSEC_ENABLE=false")
             _initialized = True
             return
-        
+
         # Initialize token manager
         await init_token_manager()
-        
-        # Use REST API polling instead of WebSocket (more stable)
-        use_rest = os.getenv("DBSEC_USE_REST", "true").lower() in ["true", "1", "yes"]
-        
-        if use_rest:
-            # Start REST API polling
-            await start_futures_polling()
-            logger.info("DB증권 REST API polling started")
-        else:
-            # Start WebSocket monitoring (legacy)
+
+        async def _start_rest_polling() -> bool:
+            try:
+                await start_futures_polling()
+                logger.info("DB증권 REST API polling started")
+                return True
+            except Exception as polling_error:
+                logger.error(f"Failed to start REST polling: {polling_error}")
+                return False
+
+        async def _start_ws_monitoring() -> bool:
             try:
                 await start_futures_monitoring()
-                # Setup alert callback
                 futures_monitor = get_futures_monitor()
-                futures_monitor.set_alert_callback(alert_callback)
+                if futures_monitor and hasattr(futures_monitor, "set_alert_callback"):
+                    futures_monitor.set_alert_callback(alert_callback)
                 logger.info("DB증권 WebSocket monitoring started")
-            except Exception as ws_error:
-                logger.warning(f"WebSocket monitoring failed, falling back to REST: {ws_error}")
-                # Fallback to REST if WebSocket fails
-                await start_futures_polling()
-                logger.info("DB증권 REST API polling started (fallback)")
-        
+                return True
+            except Exception as monitoring_error:
+                logger.error(f"Failed to start WebSocket monitoring: {monitoring_error}")
+                return False
+
+        rest_result, ws_result = await asyncio.gather(
+            _start_rest_polling(),
+            _start_ws_monitoring(),
+            return_exceptions=False
+        )
+
+        if not rest_result:
+            logger.warning("DB증권 REST API polling unavailable; continuing with remaining services")
+
+        if not ws_result:
+            logger.warning("DB증권 WebSocket monitoring unavailable; continuing with remaining services")
+
+        if not rest_result and not ws_result:
+            logger.warning("DB증권 services failed to initialize; monitoring disabled")
+            await shutdown_token_manager()
+            return
+
         _initialized = True
         logger.info("DB증권 services initialized successfully")
-        
+        logger.info("[DBSEC] K200 Futures Monitoring Initialized — Mode: PRODUCTION")
+
     except Exception as e:
         logger.error(f"Failed to initialize DB증권 services: {e}")
         # Don't raise - allow main app to continue working
@@ -115,17 +134,24 @@ async def shutdown_dbsec():
         
     try:
         logger.info("Shutting down DB증권 services...")
-        
-        # Stop monitoring
-        use_rest = os.getenv("DBSEC_USE_REST", "true").lower() in ["true", "1", "yes"]
-        if use_rest:
-            await stop_futures_polling()
-        else:
-            await stop_futures_monitoring()
-        
+        stop_results = await asyncio.gather(
+            stop_futures_polling(),
+            stop_futures_monitoring(),
+            return_exceptions=True
+        )
+
+        for service_name, result in zip(
+            ["REST polling", "WebSocket monitoring"],
+            stop_results
+        ):
+            if isinstance(result, Exception):
+                logger.error(f"Error stopping {service_name}: {result}")
+            else:
+                logger.info(f"{service_name} stopped successfully")
+
         # Shutdown token manager
         await shutdown_token_manager()
-        
+
         _initialized = False
         logger.info("DB증권 services shutdown completed")
         
@@ -154,24 +180,43 @@ async def health_check():
         
         token_health = await token_manager.health_check()
         
-        # Check monitor status
-        use_rest = os.getenv("DBSEC_USE_REST", "true").lower() in ["true", "1", "yes"]
-        
-        if use_rest:
-            # REST API poller status
-            poller = get_futures_poller()
-            monitor_health = {
-                "mode": "REST_API",
-                "enabled": True,
-                "connected": poller.is_running if hasattr(poller, 'is_running') else False,
-                "last_price": poller.last_price if hasattr(poller, 'last_price') else None,
-                "poll_interval": poller.poll_interval if hasattr(poller, 'poll_interval') else 300
-            }
+        # Check monitor status for both services
+        poller = get_futures_poller()
+        rest_status = {
+            "mode": "REST_API",
+            "enabled": bool(poller),
+            "connected": bool(getattr(poller, "is_running", False)),
+            "last_price": getattr(poller, "last_price", None),
+            "poll_interval": getattr(poller, "poll_interval", 300)
+        }
+
+        futures_monitor = get_futures_monitor()
+        ws_status = {}
+        if futures_monitor:
+            try:
+                ws_status = futures_monitor.get_health_status()
+            except Exception as monitor_error:
+                logger.error(f"Failed to read WebSocket monitor health: {monitor_error}")
+                ws_status = {"mode": "WEBSOCKET", "connected": False, "error": str(monitor_error)}
         else:
-            # WebSocket monitor status
-            futures_monitor = get_futures_monitor()
-            monitor_health = futures_monitor.get_health_status()
-        
+            ws_status = {"mode": "WEBSOCKET", "connected": False}
+
+        rest_connected = rest_status.get("connected", False)
+        ws_connected = ws_status.get("connected", False)
+
+        monitor_health = {
+            "mode": "HYBRID",
+            "connected": rest_connected or ws_connected,
+            "rest": rest_status,
+            "websocket": ws_status,
+            "active_services": [
+                service for service, active in (
+                    ("REST", rest_connected),
+                    ("WEBSOCKET", ws_connected)
+                ) if active
+            ]
+        }
+
         # Determine overall status
         overall_status = "healthy"
         if not token_health.get("token_valid"):
