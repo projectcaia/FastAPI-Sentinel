@@ -60,23 +60,31 @@ class K200FuturesPoller:
             url = f"{self.api_base}/uapi/domestic-futureoption/v1/quotations/inquire-price"
 
             # DB증권 정식 API 헤더
+            tr_id = os.getenv("DB_FUTURES_TR_ID", "FHKIF10030000").strip() or "FHKIF10030000"
             headers = {
                 "content-type": "application/json; charset=utf-8",
                 "authorization": f"Bearer {token}",
                 "appkey": getattr(token_manager, "app_key", os.getenv("DB_APP_KEY", "").strip()),
                 "appsecret": getattr(token_manager, "app_secret", os.getenv("DB_APP_SECRET", "").strip()),
                 "custtype": "P",
-                "tr_id": os.getenv("DB_FUTURES_TR_ID", "FHKIF10100000").strip() or "FHKIF10100000",
+                "tr_id": tr_id,
             }
 
-            # DB증권 정식 API 바디 구조
-            request_body = {"fid_input_iscd": self.futures_code or "101C6000"}
+            market_div_code = os.getenv("DB_MARKET_DIV_CODE", "F").strip() or "F"
+            iscd_cd = os.getenv("DB_FUTURES_ISCD_CD", "1").strip() or "1"
+            params = {
+                "FID_COND_MRKT_DIV_CODE": market_div_code,
+                "FID_INPUT_ISCD": self.futures_code or "101C6000",
+                "FID_INPUT_ISCD_CD": iscd_cd,
+            }
 
             async with httpx.AsyncClient(verify=False) as client:  # DB증권 샘플에서 SSL 검증 비활성화
-                response = await client.post(url, headers=headers, json=request_body, timeout=10.0)
+                response = await client.get(url, headers=headers, params=params, timeout=10.0)
 
                 if response.status_code != 200:
-                    logger.error(f"[DBSEC] API request failed: {response.status_code}, URL: {url}")
+                    logger.error(
+                        f"[DBSEC] API request failed: {response.status_code}, URL: {url}, tr_id={tr_id}"
+                    )
                     try:
                         error_data = response.json()
                         logger.error(f"[DBSEC] Error response: {error_data}")
@@ -94,8 +102,10 @@ class K200FuturesPoller:
                 rsp_cd = str(data.get("rsp_cd", "")).strip()
                 rsp_msg = data.get("rsp_msg") or data.get("msg1") or data.get("msg") or "Unknown error"
                 if rsp_cd and rsp_cd != "00000":
-                    logger.error(f"[DBSEC] API Error: {rsp_msg}")
+                    logger.error(f"[DBSEC] API Error (tr_id={tr_id}): {rsp_msg}")
                     return None
+
+                logger.info(f"[DBSEC] inquire-price success (tr_id={tr_id})")
 
                 if not hasattr(self, "_debug_logged"):
                     logger.info(f"[DBSEC] API Response structure: {list(data.keys())}")

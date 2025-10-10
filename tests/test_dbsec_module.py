@@ -25,6 +25,7 @@ from services.dbsec_ws import (
     KOSPI200FuturesMonitor,
     get_futures_monitor,
 )
+from services.dbsec_rest import K200FuturesPoller
 from utils.masking import mask_secret
 from app.utils import determine_trading_session, KST
 
@@ -178,6 +179,7 @@ class TestKOSPI200FuturesMonitor:
         assert status["is_holiday"] is True
         assert status["next_open"] == datetime(2024, 1, 3, 9, 0, tzinfo=tz)
 
+
     def test_compute_next_open_helper(self, monkeypatch):
         """Ensure next open helper returns KST-aware timestamps."""
         import app.utils as utils
@@ -193,6 +195,7 @@ class TestKOSPI200FuturesMonitor:
         weekend_open = utils.compute_next_open_kst(datetime(2024, 1, 6, 7, 0, tzinfo=tz))
         assert weekend_open.weekday() == 0
         assert weekend_open.hour == 9
+
 
     def test_session_transition_logs_closed_to_day(self, caplog):
         """Ensure session transitions emit DBSEC info logs."""
@@ -462,6 +465,72 @@ class TestSecretMasking:
         masked = mask_secret(secret, head=1, tail=5)
 
         assert masked == secret[:4] + "***" + secret[-2:]
+
+
+@pytest.mark.asyncio
+async def test_k200_futures_poller_issues_get_request(monkeypatch, caplog):
+    """Ensure REST poller sends GET with params and parses output payload."""
+
+    class DummyTokenManager:
+        def __init__(self):
+            self.app_key = "env_app_key"
+            self.app_secret = "env_app_secret"
+
+        async def get_token(self):
+            return "dummy_access_token"
+
+    poller = K200FuturesPoller()
+
+    monkeypatch.setenv("DB_FUTURES_TR_ID", "FHKIF10030000")
+    dummy_manager = DummyTokenManager()
+    monkeypatch.setattr("services.dbsec_rest.get_token_manager", lambda: dummy_manager)
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.is_success = True
+    mock_response.json.return_value = {
+        "rsp_cd": "00000",
+        "rsp_msg": "OK",
+        "output1": {
+            "futs_prpr": "350.25",
+            "futs_oprc": "345.50",
+            "cntg_vol": "1200",
+        },
+    }
+
+    async_client_instance = AsyncMock()
+    async_client_instance.get.return_value = mock_response
+
+    async_client_cm = MagicMock()
+    async_client_cm.__aenter__.return_value = async_client_instance
+    async_client_cm.__aexit__.return_value = False
+
+    monkeypatch.setattr("httpx.AsyncClient", MagicMock(return_value=async_client_cm))
+
+    with caplog.at_level(logging.INFO):
+        price_data = await poller.get_current_price()
+
+    assert price_data is not None
+    assert price_data["price"] == pytest.approx(350.25)
+    assert price_data["volume"] == 1200
+    assert poller.daily_open_price == pytest.approx(345.50)
+
+    expected_url = f"{poller.api_base}/uapi/domestic-futureoption/v1/quotations/inquire-price"
+    expected_params = {
+        "FID_COND_MRKT_DIV_CODE": "F",
+        "FID_INPUT_ISCD": poller.futures_code,
+        "FID_INPUT_ISCD_CD": "1",
+    }
+
+    async_client_instance.get.assert_awaited_once()
+    awaited = async_client_instance.get.await_args
+    args, kwargs = awaited.args, awaited.kwargs
+    assert args[0] == expected_url
+    assert kwargs["headers"]["tr_id"] == "FHKIF10030000"
+    assert kwargs["params"] == expected_params
+
+    success_logs = [record for record in caplog.records if "inquire-price success" in record.message]
+    assert success_logs, "Expected success log when rsp_cd == '00000'"
 
 
 if __name__ == "__main__":
