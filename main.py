@@ -90,6 +90,14 @@ APP_VERSION = "sentinel-fastapi-v2-1.4.1-patched"
 
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
 
+# Include DB증권 router
+try:
+    from routers.dbsec import router as dbsec_router
+    app.include_router(dbsec_router)
+    log.info("DB증권 router included successfully")
+except Exception as e:
+    log.warning("Failed to include DB증권 router: %s", e)
+
 # ── ENV ──────────────────────────────────────────────────────────────
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 ASSISTANT_ID      = os.getenv("CAIA_ASSISTANT_ID", "")

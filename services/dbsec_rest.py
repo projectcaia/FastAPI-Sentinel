@@ -53,70 +53,114 @@ class K200FuturesPoller:
                 logger.error("[DBSEC] Failed to get access token")
                 return None
             
-            # DB증권 주식/ETF 현재가 조회 API 사용 (선물 API가 404 오류)
+            # DB증권 정식 API 엔드포인트 사용 - POST 방식
             # KODEX 200 ETF (069500) 사용하여 K200 추적
-            etf_code = "069500"  # KODEX 200 ETF
-            url = f"{self.api_base}/uapi/domestic-stock/v1/quotations/inquire-price"
+            etf_code = "069500"  # KODEX 200 ETF (A 제거)
+            url = f"{self.api_base}/api/v1/quote/kr-stock/inquiry/price"
             
-            # 필요한 헤더들
-            app_key = getattr(token_manager, "app_key", "")
-            app_secret = getattr(token_manager, "app_secret", "")
-            
+            # DB증권 정식 API 헤더
             headers = {
-                "Authorization": f"Bearer {token}",
-                "appkey": app_key,
-                "appsecret": app_secret,
-                "tr_id": "FHKST01010100",  # 주식현재가 시세
-                "Content-Type": "application/json; charset=utf-8"
+                "content-type": "application/json; charset=utf-8",
+                "authorization": f"Bearer {token}",
+                "cont_yn": "",
+                "cont_key": ""
             }
             
-            params = {
-                "FID_COND_MRKT_DIV_CODE": "J",  # 주식
-                "FID_INPUT_ISCD": etf_code  # KODEX 200 ETF
+            # DB증권 정식 API 바디 구조
+            request_body = {
+                "In": {
+                    "InputCondMrktDivCode": "J",  # 주식 시장
+                    "InputIscd1": etf_code  # KODEX 200 ETF 코드
+                }
             }
             
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, headers=headers, params=params, timeout=10.0)
+            async with httpx.AsyncClient(verify=False) as client:  # DB증권 샘플에서 SSL 검증 비활성화
+                response = await client.post(url, headers=headers, json=request_body, timeout=10.0)
                 
                 if response.status_code != 200:
                     logger.error(f"[DBSEC] API request failed: {response.status_code}, URL: {url}")
-                    if response.status_code == 404:
-                        logger.error(f"[DBSEC] Check API endpoint - may need different URL or parameters")
+                    try:
+                        error_data = response.json()
+                        logger.error(f"[DBSEC] Error response: {error_data}")
+                    except:
+                        logger.error(f"[DBSEC] Error text: {response.text}")
                     return None
                 
                 data = response.json()
+                logger.info(f"[DBSEC] API Response structure: {list(data.keys())}")
+                # 첫 번째 실행에서만 전체 응답을 로그로 출력 (디버깅용)
+                if not hasattr(self, '_debug_logged'):
+                    logger.info(f"[DBSEC] Full API Response (first time): {data}")
+                    self._debug_logged = True
                 
-                if data.get("rt_cd") != "0":
-                    logger.error(f"[DBSEC] API error: {data.get('msg1', 'Unknown error')}")
+                # DB증권 API 응답 구조 확인
+                if "Out" not in data:
+                    logger.error(f"[DBSEC] Invalid response format: {list(data.keys())}")
                     return None
                     
-                output = data.get("output", {})
+                output = data.get("Out", {})
                 
-                # Parse price data - 주식 API 필드명 사용
-                current_price = float(output.get("stck_prpr", 0))  # 주식 현재가
+                # DB증권 API 응답 필드 파싱 (정확한 필드명은 응답 확인 후 조정)
+                # 일반적으로 현재가, 시가, 거래량 등의 필드가 있을 것임
+                current_price = 0
+                open_price = 0
+                volume = 0
+                
+                # 응답 필드 탐색 (로그로 실제 필드명 확인)
+                price_fields = ["stck_prpr", "prpr", "price", "current_price", "now_prc", "curr_prc"]
+                open_fields = ["stck_oprc", "oprc", "open_price", "open_prc"]
+                volume_fields = ["acml_vol", "volume", "day_volume", "tot_vol"]
+                
+                for field in price_fields:
+                    if field in output and output[field]:
+                        try:
+                            current_price = float(output[field])
+                            if current_price > 0:
+                                break
+                        except (ValueError, TypeError):
+                            continue
+                            
+                for field in open_fields:
+                    if field in output and output[field]:
+                        try:
+                            open_price = float(output[field])
+                            if open_price > 0:
+                                break
+                        except (ValueError, TypeError):
+                            continue
+                            
+                for field in volume_fields:
+                    if field in output and output[field]:
+                        try:
+                            volume = int(output[field])
+                            break
+                        except (ValueError, TypeError):
+                            continue
+                
                 if current_price <= 0:
-                    # 다른 필드명 시도
-                    current_price = float(output.get("prpr", 0))
-                    if current_price <= 0:
-                        logger.error(f"[DBSEC] No valid price in response: {output.keys()}")
-                        return None
+                    logger.error(f"[DBSEC] No valid current price found in response fields: {list(output.keys())}")
+                    # 응답 전체 로깅으로 디버깅
+                    logger.error(f"[DBSEC] Full response for debugging: {output}")
+                    return None
                     
-                # Store open price
-                if not self.daily_open_price:
-                    self.daily_open_price = float(output.get("stck_oprc", current_price))  # 시가
+                # Store daily open price
+                if not self.daily_open_price and open_price > 0:
+                    self.daily_open_price = open_price
+                elif not self.daily_open_price:
+                    self.daily_open_price = current_price  # Fallback
                 
                 # Calculate change rate
                 change_rate = 0.0
                 if self.daily_open_price and self.daily_open_price > 0:
                     change_rate = ((current_price - self.daily_open_price) / self.daily_open_price) * 100
                 
-                # KODEX 200은 K200 지수의 1/100 스케일
-                k200_equivalent = current_price * 100
+                # KODEX 200은 실제 ETF 가격 (K200 지수 스케일 조정 불필요)
+                # 실제로는 ETF 자체 변동률만 추적
                 
                 return {
-                    "price": k200_equivalent,  # K200 지수 환산값
+                    "price": current_price,  # ETF 현재가
                     "change_rate": change_rate,
-                    "volume": int(output.get("acml_vol", 0)),  # 누적 거래량
+                    "volume": volume,
                     "timestamp": datetime.now(timezone.utc).isoformat()
                 }
                 
@@ -202,24 +246,32 @@ class K200FuturesPoller:
         
         while self.is_running:
             try:
-                # Check trading session
+                # Check trading session - KR 시간대만 확인
                 session = determine_trading_session()
-                if session.get("session") in ["DAY", "NIGHT"]:
+                current_session = session.get("session", "UNKNOWN")
+                
+                if current_session in ["DAY"]:  # 한국 주간 세션만 감시
                     # Get current price
                     price_data = await self.get_current_price()
                     if price_data:
                         self.last_price = price_data["price"]
                         self.price_buffer.append(price_data)
                         
-                        logger.info(f"[DBSEC] KODEX 200: {price_data['price']:.2f} ({price_data['change_rate']:+.2f}%)")
+                        logger.info(f"[DBSEC] KODEX 200 ETF: {price_data['price']:.2f}₩ ({price_data['change_rate']:+.2f}%)")
                         
                         # Check for alerts
                         await self.check_and_alert(price_data)
-                else:
-                    # Reset daily open price when session changes
-                    if session.get("session") == "CLOSED":
+                    else:
+                        logger.warning("[DBSEC] Failed to get price data")
+                elif current_session == "CLOSED":
+                    # Reset daily open price when market is closed
+                    if self.daily_open_price is not None:
+                        logger.info("[DBSEC] Market closed, resetting daily prices")
                         self.daily_open_price = None
-                        logger.debug("[DBSEC] Market closed, waiting...")
+                    logger.debug("[DBSEC] Market closed, waiting...")
+                else:
+                    # Night session or other - skip for KR ETF
+                    logger.debug(f"[DBSEC] Skipping {current_session} session for KR ETF")
                         
             except Exception as e:
                 logger.error(f"[DBSEC] Polling error: {e}")
