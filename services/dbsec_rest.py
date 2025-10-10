@@ -57,12 +57,36 @@ class K200FuturesPoller:
                 logger.error("[DBSEC] Failed to get access token")
                 return None
 
-            url = f"{self.api_base}/uapi/domestic-futureoption/v1/quotations/inquire-ccnl"
+            endpoint_path = os.getenv(
+                "DB_FUTURES_QUOTE_PATH",
+                "/dfutureoption/quotations/v1/inquire-price",
+            ).strip()
+            if not endpoint_path.startswith("/"):
+                endpoint_path = f"/{endpoint_path}"
+
+            url = f"{self.api_base}{endpoint_path}"
+
+            http_method = os.getenv("DB_FUTURES_HTTP_METHOD", "POST").strip().upper() or "POST"
+            if http_method not in {"GET", "POST"}:
+                logger.warning(
+                    "[DBSEC] Unsupported method %s for futures quote; falling back to POST",
+                    http_method,
+                )
+                http_method = "POST"
+
+            require_hashkey = os.getenv("DB_FUTURES_REQUIRE_HASHKEY", "true").strip().lower() == "true"
+            hashkey_path = os.getenv("DB_HASHKEY_PATH", "/uapi/hashkey").strip()
+            if hashkey_path and not hashkey_path.startswith("/"):
+                hashkey_path = f"/{hashkey_path}"
 
             # DB증권 정식 API 헤더
-            tr_id = os.getenv("DB_FUTURES_TR_ID", "FHKIF10040000").strip() or "FHKIF10040000"
+            rest_tr_id = os.getenv("DB_FUTURES_REST_TR_ID")
+            if not rest_tr_id:
+                rest_tr_id = os.getenv("DB_FUTURES_TR_ID")
+            tr_id = (rest_tr_id or "HHDFS76240000").strip() or "HHDFS76240000"
             headers = {
                 "content-type": "application/json; charset=utf-8",
+                "accept": "application/json",
                 "authorization": f"Bearer {token}",
                 "appkey": getattr(token_manager, "app_key", os.getenv("DB_APP_KEY", "").strip()),
                 "appsecret": getattr(token_manager, "app_secret", os.getenv("DB_APP_SECRET", "").strip()),
@@ -73,18 +97,40 @@ class K200FuturesPoller:
             market_div_code = os.getenv("DB_MARKET_DIV_CODE", "F").strip() or "F"
             iscd_cd = os.getenv("DB_FUTURES_ISCD_CD", "1").strip() or "1"
             futures_code = self.futures_code or "101C6000"
-            params = {
+            request_payload = {
                 "fid_cond_mrkt_div_code": market_div_code,
                 "fid_input_iscd": futures_code,
                 "fid_input_iscd_cd": iscd_cd,
             }
 
             async with httpx.AsyncClient(verify=False) as client:  # DB증권 샘플에서 SSL 검증 비활성화
-                response = await client.get(url, headers=headers, params=params, timeout=10.0)
+                request_kwargs: Dict[str, Any] = {
+                    "headers": headers,
+                    "timeout": 10.0,
+                }
+
+                if http_method == "GET":
+                    request_kwargs["params"] = request_payload
+                else:
+                    if require_hashkey:
+                        hashkey_value = await self._generate_hashkey(
+                            client,
+                            request_payload,
+                            headers,
+                            hashkey_path,
+                        )
+                        if not hashkey_value:
+                            logger.error("[DBSEC] Failed to generate hashkey for futures quote request")
+                            return None
+                        headers["hashkey"] = hashkey_value
+
+                    request_kwargs["json"] = request_payload
+
+                response = await client.request(http_method, url, **request_kwargs)
 
                 if response.status_code != 200:
                     logger.error(
-                        f"[DBSEC] API request failed: {response.status_code}, URL: {url}, tr_id={tr_id}"
+                        f"[DBSEC] API request failed: {response.status_code}, URL: {url}, method={http_method}, tr_id={tr_id}"
                     )
                     try:
                         error_data = response.json()
@@ -106,7 +152,9 @@ class K200FuturesPoller:
                     logger.error(f"[DBSEC] API Error ({rsp_cd}) — {rsp_msg}")
                     return None
 
-                logger.info(f"[DBSEC] inquire-ccnl success (tr_id={tr_id})")
+                logger.info(
+                    f"[DBSEC] {endpoint_path.split('/')[-1]} success (tr_id={tr_id}, method={http_method})"
+                )
 
                 if not hasattr(self, "_debug_logged"):
                     logger.info(f"[DBSEC] API Response structure: {list(data.keys())}")
@@ -209,7 +257,63 @@ class K200FuturesPoller:
         except Exception as e:
             logger.error(f"[DBSEC] Failed to get price: {e}")
             return None
-            
+
+    async def _generate_hashkey(
+        self,
+        client: httpx.AsyncClient,
+        payload: Dict[str, Any],
+        headers: Dict[str, str],
+        hashkey_path: str,
+    ) -> Optional[str]:
+        """Request DB Securities hashkey for POST payload."""
+
+        if not hashkey_path:
+            logger.error("[DBSEC] Hashkey path not configured")
+            return None
+
+        hash_url = f"{self.api_base}{hashkey_path}"
+        hash_headers = {
+            "content-type": "application/json; charset=utf-8",
+            "appkey": headers.get("appkey", ""),
+            "appsecret": headers.get("appsecret", ""),
+        }
+
+        try:
+            response = await client.post(
+                hash_url,
+                headers=hash_headers,
+                json=payload,
+                timeout=5.0,
+            )
+        except httpx.HTTPError as exc:
+            logger.error(f"[DBSEC] Hashkey request error: {exc}")
+            return None
+
+        if response.status_code != 200:
+            logger.error(
+                f"[DBSEC] Hashkey request failed: {response.status_code} URL: {hash_url}"
+            )
+            try:
+                logger.error(f"[DBSEC] Hashkey error response: {response.json()}")
+            except Exception:
+                logger.error(f"[DBSEC] Hashkey error text: {response.text}")
+            return None
+
+        try:
+            data = response.json()
+        except ValueError:
+            logger.error("[DBSEC] Hashkey response decoding failed")
+            logger.debug("[DBSEC] Raw hashkey response: %s", response.text)
+            return None
+
+        for key in ("HASH", "hash", "hashkey", "HASHKEY"):
+            hash_value = data.get(key)
+            if isinstance(hash_value, str) and hash_value.strip():
+                return hash_value.strip()
+
+        logger.error(f"[DBSEC] Hashkey missing in response keys: {list(data.keys())}")
+        return None
+
     async def check_and_alert(self, price_data: Dict[str, Any]):
         """Check price change and send alert if needed"""
         change_rate = price_data.get("change_rate", 0)

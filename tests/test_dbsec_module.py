@@ -512,8 +512,8 @@ class TestSecretMasking:
 
 
 @pytest.mark.asyncio
-async def test_k200_futures_poller_issues_get_request(monkeypatch, caplog):
-    """Ensure REST poller sends GET with params and parses output payload."""
+async def test_rest_poller_current_price_success(monkeypatch, caplog):
+    """Ensure REST poller POST request follows DB 사양."""
 
     class DummyTokenManager:
         def __init__(self):
@@ -522,6 +522,12 @@ async def test_k200_futures_poller_issues_get_request(monkeypatch, caplog):
 
         async def get_token(self):
             return "dummy_access_token"
+
+    monkeypatch.setenv("DB_FUTURES_QUOTE_PATH", "/dfutureoption/quotations/v1/inquire-price")
+    monkeypatch.setenv("DB_FUTURES_HTTP_METHOD", "POST")
+    monkeypatch.setenv("DB_FUTURES_REQUIRE_HASHKEY", "true")
+    monkeypatch.setenv("DB_HASHKEY_PATH", "/uapi/hashkey")
+    monkeypatch.setenv("DB_FUTURES_REST_TR_ID", "HHDFS76240000")
 
     poller = K200FuturesPoller()
 
@@ -541,8 +547,13 @@ async def test_k200_futures_poller_issues_get_request(monkeypatch, caplog):
         },
     }
 
+    hash_response = MagicMock()
+    hash_response.status_code = 200
+    hash_response.json.return_value = {"HASH": "hash-123"}
+
     async_client_instance = AsyncMock()
-    async_client_instance.get.return_value = mock_response
+    async_client_instance.request = AsyncMock(return_value=mock_response)
+    async_client_instance.post = AsyncMock(return_value=hash_response)
 
     async_client_cm = MagicMock()
     async_client_cm.__aenter__.return_value = async_client_instance
@@ -558,22 +569,92 @@ async def test_k200_futures_poller_issues_get_request(monkeypatch, caplog):
     assert price_data["volume"] == 1200
     assert poller.daily_open_price == pytest.approx(345.50)
 
-    expected_url = f"{poller.api_base}/uapi/domestic-futureoption/v1/quotations/inquire-ccnl"
-    expected_params = {
+    expected_url = f"{poller.api_base}/dfutureoption/quotations/v1/inquire-price"
+    expected_payload = {
         "fid_cond_mrkt_div_code": "F",
         "fid_input_iscd": poller.futures_code,
         "fid_input_iscd_cd": "1",
     }
 
-    async_client_instance.get.assert_awaited_once()
-    awaited = async_client_instance.get.await_args
-    args, kwargs = awaited.args, awaited.kwargs
-    assert args[0] == expected_url
-    assert kwargs["headers"]["tr_id"] == "FHKIF10040000"
-    assert kwargs["params"] == expected_params
+    async_client_instance.post.assert_awaited_once()
+    hash_args = async_client_instance.post.await_args
+    hash_kwargs = hash_args.kwargs
+    assert hash_args.args[0] == f"{poller.api_base}/uapi/hashkey"
+    assert hash_kwargs["headers"]["appkey"] == "env_app_key"
+    assert hash_kwargs["headers"]["appsecret"] == "env_app_secret"
+    assert hash_kwargs["json"] == expected_payload
 
-    success_logs = [record for record in caplog.records if "inquire-ccnl success" in record.message]
+    async_client_instance.request.assert_awaited_once()
+    awaited = async_client_instance.request.await_args
+    args, kwargs = awaited.args, awaited.kwargs
+    assert args == ("POST", expected_url)
+    assert kwargs["headers"]["tr_id"] == "HHDFS76240000"
+    assert kwargs["headers"]["hashkey"] == "hash-123"
+    assert kwargs["json"] == expected_payload
+
+    success_logs = [
+        record for record in caplog.records if "inquire-price success" in record.message
+    ]
     assert success_logs, "Expected success log when rsp_cd == '00000'"
+
+
+@pytest.mark.asyncio
+async def test_rest_poller_get_mode(monkeypatch, caplog):
+    """Ensure GET fallback skips hashkey and sends query params."""
+
+    class DummyTokenManager:
+        def __init__(self):
+            self.app_key = "env_app_key"
+            self.app_secret = "env_app_secret"
+
+        async def get_token(self):
+            return "dummy_access_token"
+
+    monkeypatch.setenv("DB_FUTURES_HTTP_METHOD", "GET")
+    monkeypatch.setenv("DB_FUTURES_REQUIRE_HASHKEY", "false")
+    monkeypatch.setenv("DB_FUTURES_REST_TR_ID", "HHDFS76240000")
+    monkeypatch.setenv("DB_FUTURES_QUOTE_PATH", "dfutureoption/quotations/v1/inquire-price")
+
+    poller = K200FuturesPoller()
+
+    dummy_manager = DummyTokenManager()
+    monkeypatch.setattr("services.dbsec_rest.get_token_manager", lambda: dummy_manager)
+
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "rsp_cd": "00000",
+        "rsp_msg": "OK",
+        "output1": {
+            "futs_prpr": "351.00",
+            "futs_oprc": "349.00",
+            "cntg_vol": "2200",
+        },
+    }
+
+    async_client_instance = AsyncMock()
+    async_client_instance.request = AsyncMock(return_value=mock_response)
+
+    async_client_cm = MagicMock()
+    async_client_cm.__aenter__.return_value = async_client_instance
+    async_client_cm.__aexit__.return_value = False
+
+    monkeypatch.setattr("httpx.AsyncClient", MagicMock(return_value=async_client_cm))
+
+    with caplog.at_level(logging.INFO):
+        price_data = await poller.get_current_price()
+
+    assert price_data is not None
+    expected_url = f"{poller.api_base}/dfutureoption/quotations/v1/inquire-price"
+    async_client_instance.request.assert_awaited_once()
+    args, kwargs = async_client_instance.request.await_args.args, async_client_instance.request.await_args.kwargs
+    assert args == ("GET", expected_url)
+    assert "hashkey" not in kwargs["headers"]
+    assert kwargs["params"]["fid_input_iscd"] == poller.futures_code
+    get_logs = [
+        record for record in caplog.records if "inquire-price success" in record.message
+    ]
+    assert get_logs
 
 
 if __name__ == "__main__":
