@@ -57,6 +57,8 @@ HUMAN_NAMES = {
     "^KS11":      "KOSPI",
     "069500.KS":  "KODEX 200",
     "102110.KS":  "TIGER 200",
+    "^KQ11F=F":   "K200 선물",
+    "^KS200F=F":  "KOSPI200 선물",
     "^GSPC":      "S&P 500",
     "^IXIC":      "NASDAQ",
     "^VIX":       "VIX",
@@ -67,8 +69,9 @@ HUMAN_NAMES = {
 def human_name(sym: str) -> str:
     return HUMAN_NAMES.get(sym, sym)
 
-# 심볼 정의
+# 심볼 정의 - K200 선물 추가
 KR_SPOT_PRIORITY = ["^KS11", "069500.KS", "102110.KS", "^KS200"]
+KR_FUTURES = ["^KQ11F=F", "^KS200F=F"]  # K200 선물 추가
 US_SPOT = ["^GSPC", "^IXIC", "^VIX"]
 FUTURES_SYMBOLS = ["ES=F", "NQ=F"]
 
@@ -327,19 +330,22 @@ def current_session() -> str:
         return "CLOSED"
     
     # 한국 공휴일 (간단 체크 - 필요시 확장)
+    # 2025년 기준 공휴일 목록 - 실제 휴장일만 포함
     kr_holidays = [
         (1, 1),   # 신정
-        (3, 1),   # 삼일절
+        (3, 1),   # 삼일절  
         (5, 5),   # 어린이날
         (6, 6),   # 현충일
         (8, 15),  # 광복절
         (10, 3),  # 개천절
-        (10, 9),  # 한글날
+        # (10, 9),  # 한글날 - 2025년 10월 9일은 목요일이므로 휴장이 아님
         (12, 25), # 크리스마스
     ]
     
+    # 10월 10일은 휴장일이 아님 - 정상 거래일
     if (now.month, now.day) in kr_holidays:
-        log.info("한국 공휴일 감지")
+        log.info("한국 공휴일 감지 - 시장 휴장")
+        return "CLOSED"
     
     hhmm = now.hour * 100 + now.minute
     
@@ -371,8 +377,13 @@ def check_and_alert():
     state = _load_state()
     sess = current_session()
     
+    # 강제 시장 오픈 환경변수 체크
+    FORCE_MARKET_OPEN = os.getenv("FORCE_MARKET_OPEN", "false").lower() in ["true", "1", "yes"]
+    
     log.info("="*60)
     log.info("시장 체크 시작 [세션: %s] %s", sess, _now_kst().strftime("%Y-%m-%d %H:%M:%S KST"))
+    if FORCE_MARKET_OPEN:
+        log.info("🔴 강제 시장 오픈 모드 활성화 - 휴장일에도 감시 계속")
     log.info("="*60)
     
     state["last_checked_at"] = _now_kst_iso()
@@ -383,20 +394,24 @@ def check_and_alert():
     current_time = time.time()
     force_alert = (current_time - last_alert_time) > (FORCE_ALERT_INTERVAL * 3600)
     
-    if sess == "CLOSED":
-        log.info("시장 휴장 중 - 감시 스킵")
+    if sess == "CLOSED" and not FORCE_MARKET_OPEN:
+        log.info("시장 휴장 중 - 감시 스킵 (강제 모드 비활성화)")
         _save_state(state)
         return
+    elif sess == "CLOSED" and FORCE_MARKET_OPEN:
+        # 강제 모드에서는 미국 시장 감시
+        log.info("🔴 강제 모드: 휴장 중에도 미국 시장 감시")
+        sess = "US"
     
     # 세션별 심볼 선택
     if sess == "KR":
-        symbols = KR_SPOT_PRIORITY[:1]  # KOSPI만
+        symbols = KR_SPOT_PRIORITY[:1] + KR_FUTURES[:1]  # KOSPI + K200선물
         session_name = "한국 정규장"
     elif sess == "US":
         symbols = US_SPOT
         session_name = "미국 정규장"
     elif sess == "FUTURES":
-        symbols = FUTURES_SYMBOLS
+        symbols = FUTURES_SYMBOLS + KR_FUTURES  # 미국선물 + 한국선물
         session_name = "선물 시장"
     else:
         _save_state(state)
