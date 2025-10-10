@@ -57,10 +57,10 @@ class K200FuturesPoller:
                 logger.error("[DBSEC] Failed to get access token")
                 return None
 
-            url = f"{self.api_base}/uapi/domestic-futureoption/v1/quotations/inquire-price"
+            url = f"{self.api_base}/uapi/domestic-futureoption/v1/quotations/inquire-ccnl"
 
             # DB증권 정식 API 헤더
-            tr_id = os.getenv("DB_FUTURES_TR_ID", "FHKIF10030000").strip() or "FHKIF10030000"
+            tr_id = os.getenv("DB_FUTURES_TR_ID", "FHKIF10040000").strip() or "FHKIF10040000"
             headers = {
                 "content-type": "application/json; charset=utf-8",
                 "authorization": f"Bearer {token}",
@@ -72,10 +72,11 @@ class K200FuturesPoller:
 
             market_div_code = os.getenv("DB_MARKET_DIV_CODE", "F").strip() or "F"
             iscd_cd = os.getenv("DB_FUTURES_ISCD_CD", "1").strip() or "1"
+            futures_code = self.futures_code or "101C6000"
             params = {
-                "FID_COND_MRKT_DIV_CODE": market_div_code,
-                "FID_INPUT_ISCD": self.futures_code or "101C6000",
-                "FID_INPUT_ISCD_CD": iscd_cd,
+                "fid_cond_mrkt_div_code": market_div_code,
+                "fid_input_iscd": futures_code,
+                "fid_input_iscd_cd": iscd_cd,
             }
 
             async with httpx.AsyncClient(verify=False) as client:  # DB증권 샘플에서 SSL 검증 비활성화
@@ -102,10 +103,10 @@ class K200FuturesPoller:
                 rsp_cd = str(data.get("rsp_cd", "")).strip()
                 rsp_msg = data.get("rsp_msg") or data.get("msg1") or data.get("msg") or "Unknown error"
                 if rsp_cd and rsp_cd != "00000":
-                    logger.error(f"[DBSEC] API Error (tr_id={tr_id}): {rsp_msg}")
+                    logger.error(f"[DBSEC] API Error ({rsp_cd}) — {rsp_msg}")
                     return None
 
-                logger.info(f"[DBSEC] inquire-price success (tr_id={tr_id})")
+                logger.info(f"[DBSEC] inquire-ccnl success (tr_id={tr_id})")
 
                 if not hasattr(self, "_debug_logged"):
                     logger.info(f"[DBSEC] API Response structure: {list(data.keys())}")
