@@ -23,7 +23,7 @@ class K200FuturesPoller:
     def __init__(self):
         self.api_base = os.getenv("DB_API_BASE", "https://openapi.dbsec.co.kr:8443").strip()
         self.futures_code = os.getenv("DB_FUTURES_CODE", "101V3000").strip()
-        self.poll_interval = int(os.getenv("DB_POLL_INTERVAL_SEC", "300"))  # 5분 기본값
+        self.poll_interval = int(os.getenv("DB_POLL_INTERVAL_SEC", "180"))  # 3분 기본값
         
         # Price tracking
         self.last_price: Optional[float] = None

@@ -2,6 +2,7 @@
 DB증권 API Router for KOSPI200 Futures Monitoring
 FastAPI router for DB증권 integration endpoints
 """
+import os
 import logging
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, BackgroundTasks
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 
 from utils.token_manager import get_token_manager, init_token_manager, shutdown_token_manager
 from services.dbsec_ws import get_futures_monitor, start_futures_monitoring, stop_futures_monitoring
+from services.dbsec_rest import get_futures_poller, start_futures_polling, stop_futures_polling
 
 logger = logging.getLogger(__name__)
 
@@ -67,12 +69,20 @@ async def startup_dbsec():
         # Initialize token manager
         await init_token_manager()
         
-        # Start futures monitoring
-        await start_futures_monitoring()
+        # Use REST API polling instead of WebSocket (more stable)
+        use_rest = os.getenv("DBSEC_USE_REST", "true").lower() in ["true", "1", "yes"]
         
-        # Setup alert callback
-        futures_monitor = get_futures_monitor()
-        futures_monitor.set_alert_callback(alert_callback)
+        if use_rest:
+            # Start REST API polling
+            await start_futures_polling()
+            logger.info("DB증권 REST API polling started")
+        else:
+            # Start WebSocket monitoring (legacy)
+            await start_futures_monitoring()
+            
+            # Setup alert callback
+            futures_monitor = get_futures_monitor()
+            futures_monitor.set_alert_callback(alert_callback)
         
         _initialized = True
         logger.info("DB증권 services initialized successfully")
@@ -92,8 +102,12 @@ async def shutdown_dbsec():
     try:
         logger.info("Shutting down DB증권 services...")
         
-        # Stop futures monitoring
-        await stop_futures_monitoring()
+        # Stop monitoring
+        use_rest = os.getenv("DBSEC_USE_REST", "true").lower() in ["true", "1", "yes"]
+        if use_rest:
+            await stop_futures_polling()
+        else:
+            await stop_futures_monitoring()
         
         # Shutdown token manager
         await shutdown_token_manager()
@@ -126,9 +140,23 @@ async def health_check():
         
         token_health = await token_manager.health_check()
         
-        # Check futures monitor
-        futures_monitor = get_futures_monitor()
-        monitor_health = futures_monitor.get_health_status()
+        # Check monitor status
+        use_rest = os.getenv("DBSEC_USE_REST", "true").lower() in ["true", "1", "yes"]
+        
+        if use_rest:
+            # REST API poller status
+            poller = get_futures_poller()
+            monitor_health = {
+                "mode": "REST_API",
+                "enabled": True,
+                "connected": poller.is_running if hasattr(poller, 'is_running') else False,
+                "last_price": poller.last_price if hasattr(poller, 'last_price') else None,
+                "poll_interval": poller.poll_interval if hasattr(poller, 'poll_interval') else 300
+            }
+        else:
+            # WebSocket monitor status
+            futures_monitor = get_futures_monitor()
+            monitor_health = futures_monitor.get_health_status()
         
         # Determine overall status
         overall_status = "healthy"

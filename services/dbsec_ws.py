@@ -268,25 +268,20 @@ class KOSPI200FuturesMonitor:
         if not app_key:
             raise Exception("DB_APP_KEY is not configured - check environment variables")
 
-        parsed_url = urlparse(self.ws_url)
-        query_params = dict(parse_qsl(parsed_url.query))
-        query_params.update({
+        # DB증권 WebSocket은 헤더로 인증 정보 전달
+        ws_url = self.ws_url
+
+        logger.info("Connecting to WebSocket: %s", self.ws_url)
+
+        # DB증권 WebSocket 인증 헤더
+        headers: Dict[str, str] = {
+            "authorization": f"Bearer {access_token}",
             "appkey": app_key,
-            "token": access_token,
-        })
-        ws_url = urlunparse(parsed_url._replace(query=urlencode(query_params)))
-
-        logger.debug("Connecting to WebSocket: %s", redact_ws_url(ws_url))
-
-        headers: Dict[str, str] = {}
-        send_auth_header = os.getenv("DBSEC_WS_SEND_AUTH_HEADER", "false").lower() in ("1", "true", "yes")
-        if send_auth_header:
-            token_type = getattr(token_manager, "token_type", "Bearer")
-            headers["Authorization"] = f"{token_type} {access_token}"
-            logger.debug(
-                "Including Authorization header for WebSocket handshake: %s",
-                redact_headers(headers),
-            )
+            "appsecret": getattr(token_manager, "app_secret", ""),
+            "custtype": "P",  # 개인
+            "tr_type": "1",   # 실시간 등록
+            "content-type": "utf-8"
+        }
 
         header_list = [f"{k}: {v}" for k, v in headers.items()]
 
@@ -367,15 +362,20 @@ class KOSPI200FuturesMonitor:
         tr_id = os.getenv("DB_FUTURES_TR_ID", "HDFSCNT0").strip() or "HDFSCNT0"
         tr_key = fut_code  # 종목코드를 tr_key로 사용
 
+        # DB증권 선물 실시간 구독 메시지
         subscribe_msg = {
             "header": {
-                "tr_type": "1",          # 1: 실시간 등록, 2: 실시간 해제
-                "content_type": "utf-8",  # 명세에 따른 인코딩 정보
+                "authorization": f"Bearer {await get_token_manager().get_token()}",
+                "appkey": getattr(get_token_manager(), "app_key", ""),
+                "appsecret": getattr(get_token_manager(), "app_secret", ""),
+                "custtype": "P",
+                "tr_type": "1",
+                "content-type": "utf-8"
             },
             "body": {
                 "input": {
                     "tr_id": tr_id,
-                    "tr_key": tr_key,  # 종목코드를 키로 사용
+                    "tr_key": tr_key
                 }
             }
         }

@@ -370,6 +370,22 @@ def trigger_caia_async(text: str) -> None:
 
 # ── HTTP ─────────────────────────────────────────────────────────────
 
+@app.get("/")
+def root():
+    """Root endpoint - system info"""
+    return {
+        "service": "Sentinel FastAPI v2",
+        "status": "operational",
+        "version": APP_VERSION,
+        "endpoints": {
+            "health": "/health",
+            "alert": "/sentinel/alert",
+            "inbox": "/sentinel/inbox",
+            "dbsec": "/sentinel/dbsec/health"
+        },
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S+09:00")
+    }
+
 @app.get("/health")
 def health():
     return {
