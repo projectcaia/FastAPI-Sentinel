@@ -41,9 +41,16 @@ Railway 대시보드에서 다음과 같이 **숫자만** 입력하세요:
 | **DB_APP_SECRET** | your-secret | DB증권 API 앱 시크릿 |
 | **DB_API_BASE** | **https://openapi.dbsec.co.kr:8443** | DB증권 API 베이스 URL |
 | **DB_WS_URL** | **wss://openapi.dbsec.co.kr:9443/ws** | DB증권 WebSocket URL |
+| **DB_FUTURES_REST_TR_ID** | **HHDFS76240000** | K200 선물 현재가 REST TR ID |
+| **DB_FUTURES_QUOTE_PATH** | **/dfutureoption/quotations/v1/inquire-price** | REST 현재가 조회 경로 |
+| **DB_FUTURES_HTTP_METHOD** | **POST** | REST 현재가 조회 HTTP 메서드 |
+| **DB_FUTURES_REQUIRE_HASHKEY** | **true** | HashKey 헤더 필수 여부 (POST 본문)|
+| **DB_HASHKEY_PATH** | **/dfutureoption/hashkey** | HashKey 생성 엔드포인트 |
 | **DB_ALERT_THRESHOLD** | **1.0** | K200 선물 CRITICAL 알림 기준(%) |
 | **DB_WARN_THRESHOLD** | **0.5** | K200 선물 WARN 알림 기준(%) |
 | **DB_BUFFER_SIZE** | **100** | 실시간 데이터 버퍼 크기 |
+
+> ℹ️ DB증권 OpenAPI 명세에 따르면 KOSPI200 선물 현재가 조회는 `POST /dfutureoption/quotations/v1/inquire-price`와 TR ID `HHDFS76240000` 조합을 사용하며, HashKey 헤더가 없으면 400 오류가 발생합니다. 위 표의 기본값을 그대로 입력하면 요구 조건을 충족합니다.
 
 ## 🔧 Railway에서 설정하는 방법
 
