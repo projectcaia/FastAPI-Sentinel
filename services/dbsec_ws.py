@@ -21,37 +21,12 @@ import requests
 
 from utils.masking import mask_secret, redact_headers, redact_ws_url, redact_dict
 from utils.token_manager import get_token_manager
-from app.utils import determine_trading_session, compute_next_open_kst, KST
+from utils.trading_session import determine_trading_session, is_krx_trading_day, KST
 
 logger = logging.getLogger(__name__)
 
 SUBSCRIBE_INFO_MESSAGE = "[DBSEC] Sent subscribe_msg for K200 Futures"
 TICK_INFO_PREFIX = "[DBSEC] K200 Futures tick:"
-
-async def sleep_until(target: datetime, max_cap_hours: Optional[int] = None) -> None:
-    """Sleep asynchronously until the target datetime with optional capping."""
-    if target.tzinfo is None:
-        target = target.replace(tzinfo=timezone.utc)
-
-    now = datetime.now(target.tzinfo)
-    wait_seconds = (target - now).total_seconds()
-
-    if max_cap_hours is not None and max_cap_hours > 0:
-        wait_seconds = min(wait_seconds, max_cap_hours * 3600)
-
-    if wait_seconds <= 0:
-        return
-
-    logger.debug(
-        "[DBSEC] 휴장 대기 - %.0f초 동안 슬립 (캡 %s시간)",
-        wait_seconds,
-        max_cap_hours,
-    )
-
-    try:
-        await asyncio.wait_for(asyncio.sleep(wait_seconds), timeout=wait_seconds)
-    except asyncio.TimeoutError:
-        logger.warning("[DBSEC] WebSocket timeout, retrying...")
 
 
 def is_trading_session(now: Optional[datetime] = None) -> bool:
@@ -151,7 +126,7 @@ class KOSPI200FuturesMonitor:
 
     def _log_closed_wait(self) -> None:
         """Emit standardized debug log for closed market waits."""
-        logger.debug("[DBSEC] 휴장일/비거래 시간, 30분 후 재확인")
+        logger.debug("[DBSEC] 비거래 시간, 30분 후 재확인")
 
     async def _sleep_until_poll(self):
         """Sleep for the configured poll interval with a single debug log."""
@@ -224,30 +199,24 @@ class KOSPI200FuturesMonitor:
             self._update_session_state(session)
             is_holiday = bool(status.get("is_holiday"))
 
-            if session == "CLOSED":
+            # If it's a holiday (weekend or KRX holiday), skip WebSocket connection
+            if is_holiday:
                 self.is_connected = False
                 self.reconnect_attempts = 0
-
-                if is_holiday:
-                    next_open = compute_next_open_kst()
-                    if next_open:
-                        if self._last_holiday_notice != next_open:
-                            logger.info(
-                                "[DBSEC] 휴장일 → 다음 개장 %s 까지 대기",
-                                self._format_kst(next_open),
-                            )
-                            self._last_holiday_notice = next_open
-
-                        self._log_closed_wait()
-                        await sleep_until(next_open, self.sleep_cap_hours)
-                        continue
-
-                self._last_holiday_notice = None
+                logger.info("[DBSEC] 휴장일 - 30분 후 재확인")
                 await self._sleep_until_poll()
                 continue
 
-            self._last_holiday_notice = None
+            # For CLOSED session on trading days, just wait briefly and recheck
+            # This handles the gaps between DAY and NIGHT sessions  
+            if session == "CLOSED":
+                self.is_connected = False
+                self.reconnect_attempts = 0
+                logger.debug("[DBSEC] 거래시간 외 - 30분 후 재확인")
+                await self._sleep_until_poll()
+                continue
 
+            # Session is DAY or NIGHT - connect WebSocket immediately
             try:
                 await self._connect_and_monitor()
 
@@ -497,7 +466,7 @@ class KOSPI200FuturesMonitor:
     def _determine_session(self) -> str:
         """Determine if current time is DAY or NIGHT session"""
         status = determine_trading_session()
-        session = status.get("session")
+        session = status.get("session", "CLOSED")
 
         if session in {"DAY", "NIGHT"} and session != self.current_session:
             # 세션 전환 시 일중 기준가 리셋
