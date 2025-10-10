@@ -69,9 +69,9 @@ HUMAN_NAMES = {
 def human_name(sym: str) -> str:
     return HUMAN_NAMES.get(sym, sym)
 
-# 심볼 정의 - K200 선물 추가
+# 심볼 정의 - K200 선물은 DB증권 API가 담당
 KR_SPOT_PRIORITY = ["^KS11", "069500.KS", "102110.KS", "^KS200"]
-KR_FUTURES = ["^KQ11F=F", "^KS200F=F"]  # K200 선물 추가
+# KR_FUTURES는 DB증권 REST API에서 처리하므로 여기서는 제외
 US_SPOT = ["^GSPC", "^IXIC", "^VIX"]
 FUTURES_SYMBOLS = ["ES=F", "NQ=F"]
 
@@ -282,24 +282,54 @@ def grade_level_vix_relative(change_pct: float) -> str | None:
 
 # ==================== 알림 전송 ====================
 def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str = "ALERT"):
-    """알림 전송"""
+    """알림 전송 - 지수 중심 포맷"""
     display_name = human_name(symbol)
+    is_vix = (symbol == "^VIX")
     
-    payload = {
-        "index": display_name,
-        "level": level or "INFO",
-        "delta_pct": round(data.get("change_pct", 0), 2),
-        "triggered_at": _now_kst_iso(),
-        "note": note,
-        "kind": kind,
-        "symbol": symbol,
-        "details": data.get("vix_context", {}) if "vix_context" in data else {
-            "current": data.get("current"),
-            "high": data.get("high"),
-            "low": data.get("low"),
-            "volatility": data.get("volatility", {})
+    # VIX는 보조 정보로, 주요 지수 정보를 우선 표시
+    if is_vix and "vix_context" in data:
+        vix_ctx = data["vix_context"]
+        # VIX 알림에서는 S&P500과 NASDAQ 변동을 메인으로 표시
+        sp_change = vix_ctx.get("sp500_change", 0)
+        nas_change = vix_ctx.get("nasdaq_change", 0)
+        
+        # 주요 지수명을 메인으로
+        primary_index = "S&P 500" if abs(sp_change) > abs(nas_change) else "NASDAQ"
+        primary_change = sp_change if abs(sp_change) > abs(nas_change) else nas_change
+        
+        payload = {
+            "index": primary_index,  # 메인: 지수명 (S&P 500 또는 NASDAQ)
+            "level": level or "INFO",
+            "delta_pct": round(primary_change, 2),  # 지수 변동률
+            "triggered_at": _now_kst_iso(),
+            "note": f"{note} | VIX {vix_ctx['value']:.1f} ({vix_ctx['change_pct']:+.1f}%)",  # VIX는 부가정보
+            "kind": "US",  # VIX 대신 미국 시장으로
+            "symbol": "^GSPC" if abs(sp_change) > abs(nas_change) else "^IXIC",
+            "details": {
+                "sp500_change": sp_change,
+                "nasdaq_change": nas_change,
+                "vix_value": vix_ctx["value"],
+                "vix_change": vix_ctx["change_pct"],
+                "index_volatility": vix_ctx.get("index_volatility", 0)
+            }
         }
-    }
+    else:
+        # 일반 지수 알림
+        payload = {
+            "index": display_name,
+            "level": level or "INFO",
+            "delta_pct": round(data.get("change_pct", 0), 2),
+            "triggered_at": _now_kst_iso(),
+            "note": note,
+            "kind": kind,
+            "symbol": symbol,
+            "details": {
+                "current": data.get("current"),
+                "high": data.get("high"),
+                "low": data.get("low"),
+                "volatility": data.get("volatility", {})
+            }
+        }
     
     headers = {"Content-Type": "application/json"}
     if SENTINEL_KEY:
@@ -405,14 +435,14 @@ def check_and_alert():
     
     # 세션별 심볼 선택
     if sess == "KR":
-        symbols = KR_SPOT_PRIORITY[:1] + KR_FUTURES[:1]  # KOSPI + K200선물
+        symbols = KR_SPOT_PRIORITY[:1]  # KOSPI만 (K200선물은 DB증권 API가 담당)
         session_name = "한국 정규장"
     elif sess == "US":
         symbols = US_SPOT
         session_name = "미국 정규장"
     elif sess == "FUTURES":
-        symbols = FUTURES_SYMBOLS + KR_FUTURES  # 미국선물 + 한국선물
-        session_name = "선물 시장"
+        symbols = FUTURES_SYMBOLS  # 미국선물만 (K200선물은 DB증권 API)
+        session_name = "선물 시장 (미국)"
     else:
         _save_state(state)
         return

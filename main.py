@@ -119,19 +119,20 @@ log = logging.getLogger("sentinel-fastapi-v2")
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
 
 # ── DB증권 Router Integration (로그 설정 이후) ────────────────────────
-# K200 선물 감시는 market_watcher.py가 담당하므로 DB증권 라우터는 비활성화
-DBSEC_ENABLE = os.getenv("DBSEC_ENABLE", "false").lower() in ["true", "1", "yes"]
+# K200 선물 감시 - DB증권 API를 통한 주간/야간 선물 모니터링
+DBSEC_ENABLE = os.getenv("DBSEC_ENABLE", "true").lower() in ["true", "1", "yes"]
 if DBSEC_ENABLE:
     try:
         from routers.dbsec import router as dbsec_router
         app.include_router(dbsec_router)
-        log.warning("⚠️ DB증권과 Market Watcher 동시 실행 - 중복 감시 주의")
-        log.info("✅ DB증권 K200 선물지수 모니터링 활성화")
+        log.info("✅ DB증권 K200 선물지수 모니터링 활성화 (주간/야간)")
+        log.info("   - 주간: 09:00-15:30 / 야간: 18:00-05:00")
+        log.info("   - REST API 폴링 모드 사용")
     except Exception as e:
         log.warning("⚠️ DB증권 라우터 포함 실패: %s", e)
         log.info("🔄 기존 센티넬 시스템은 정상 작동합니다")
 else:
-    log.info("🔄 K200 선물 감시는 Market Watcher가 담당 (DB증권 라우터 비활성화)")
+    log.info("🚫 DB증권 K200 선물 모니터링 비활성화")
 
 # Disable verbose logging from httpx, httpcore, and websocket libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
