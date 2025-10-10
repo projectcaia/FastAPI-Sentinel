@@ -25,7 +25,7 @@ from utils.trading_session import determine_trading_session, is_krx_trading_day,
 
 logger = logging.getLogger(__name__)
 
-SUBSCRIBE_INFO_MESSAGE = "[DBSEC] Sent subscribe_msg for K200 Futures"
+SUBSCRIPTION_CONFIRMED_TEMPLATE = "[DBSEC] WebSocket subscription confirmed for KOSPI200 Futures ({code})"
 TICK_INFO_PREFIX = "[DBSEC] K200 Futures tick:"
 
 
@@ -69,6 +69,11 @@ class KOSPI200FuturesMonitor:
         self.last_price: Optional[float] = None
         self.last_alert_time: Optional[datetime] = None
         self.daily_open_price: Optional[float] = None  # Store daily open for % calculation
+
+        # Cached authentication context for WebSocket subscription reuse
+        self._access_token: Optional[str] = None
+        self._app_key: Optional[str] = None
+        self._app_secret: Optional[str] = None
         
         # Connection state
         self.websocket: Optional[websocket.WebSocket] = None
@@ -274,10 +279,17 @@ class KOSPI200FuturesMonitor:
         logger.info("Connecting to WebSocket: %s", self.ws_url)
 
         # DB증권 WebSocket 인증 헤더
+        app_secret = getattr(token_manager, "app_secret", "").strip()
+
+        # Cache credentials for subsequent subscription calls
+        self._access_token = access_token
+        self._app_key = app_key
+        self._app_secret = app_secret
+
         headers: Dict[str, str] = {
             "authorization": f"Bearer {access_token}",
             "appkey": app_key,
-            "appsecret": getattr(token_manager, "app_secret", ""),
+            "appsecret": app_secret,
             "custtype": "P",  # 개인
             "tr_type": "1",   # 실시간 등록
             "content-type": "utf-8"
@@ -358,24 +370,28 @@ class KOSPI200FuturesMonitor:
         """Subscribe to KOSPI200 futures real-time data"""
         # DB증권 API 실시간 선물 구독 명세 기반 메시지 구성
         # K200 선물의 실제 종목코드 사용
-        fut_code = os.getenv("DB_FUTURES_CODE", "101V3000").strip()  # K200 선물 종목코드 
-        tr_id = os.getenv("DB_FUTURES_TR_ID", "HDFSCNT0").strip() or "HDFSCNT0"
-        tr_key = fut_code  # 종목코드를 tr_key로 사용
+        fut_code = os.getenv("DB_FUTURES_CODE", "101C6000").strip() or "101C6000"  # K200 선물 종목코드
+        tr_id = os.getenv("DB_FUTURES_TR_ID", "H0IFC0").strip() or "H0IFC0"
+        tr_type = "1"
+
+        if not self._access_token or not self._app_key:
+            raise RuntimeError("WebSocket subscription requires cached authentication context")
 
         # DB증권 선물 실시간 구독 메시지
         subscribe_msg = {
             "header": {
-                "authorization": f"Bearer {await get_token_manager().get_token()}",
-                "appkey": getattr(get_token_manager(), "app_key", ""),
-                "appsecret": getattr(get_token_manager(), "app_secret", ""),
+                "authorization": f"Bearer {self._access_token}",
+                "appkey": self._app_key,
+                "appsecret": self._app_secret or "",
                 "custtype": "P",
-                "tr_type": "1",
+                "tr_type": tr_type,
+                "tr_id": tr_id,
                 "content-type": "utf-8"
             },
             "body": {
                 "input": {
-                    "tr_id": tr_id,
-                    "tr_key": tr_key
+                    "tr_key": fut_code,
+                    "tr_type": tr_type
                 }
             }
         }
@@ -384,7 +400,7 @@ class KOSPI200FuturesMonitor:
             raise RuntimeError("WebSocket connection is not established")
 
         await asyncio.to_thread(self.websocket.send, json.dumps(subscribe_msg))
-        logger.info(SUBSCRIBE_INFO_MESSAGE)
+        logger.info(SUBSCRIPTION_CONFIRMED_TEMPLATE.format(code=fut_code))
         
     async def _handle_message(self, message: str):
         """Handle incoming WebSocket message"""

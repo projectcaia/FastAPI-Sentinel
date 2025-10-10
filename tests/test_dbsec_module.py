@@ -6,6 +6,7 @@ import pytest
 import asyncio
 import json
 import logging
+from typing import Any, Dict
 from unittest.mock import Mock, patch, MagicMock, AsyncMock
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
@@ -117,14 +118,57 @@ class TestKOSPI200FuturesMonitor:
             buffer_size=100,
             ws_url=os.getenv("DB_WS_URL")
         )
-        
+
         assert monitor.alert_threshold == 1.0
         assert monitor.warn_threshold == 0.5
         assert monitor.buffer_size == 100
         expected_ws_url = os.getenv("DB_WS_URL", "wss://openapi.dbsec.co.kr:9443/ws")
         assert monitor.ws_url == expected_ws_url
         assert len(monitor.tick_buffer) == 0
-    
+
+    @pytest.mark.asyncio
+    async def test_subscribe_futures_payload_structure(self, monkeypatch, caplog):
+        """Ensure subscription payload uses cached credentials and new schema."""
+        monkeypatch.delenv("DB_FUTURES_CODE", raising=False)
+        monkeypatch.delenv("DB_FUTURES_TR_ID", raising=False)
+
+        monitor = KOSPI200FuturesMonitor()
+        monitor.websocket = MagicMock()
+        monitor._access_token = "cached_access_token"
+        monitor._app_key = "cached_app_key"
+        monitor._app_secret = "cached_app_secret"
+
+        payload_container: Dict[str, Any] = {}
+
+        async def record_to_thread(func, *args, **kwargs):
+            payload_container["func"] = func
+            payload_container["args"] = args
+            payload_container["kwargs"] = kwargs
+            return func(*args, **kwargs)
+
+        with patch("asyncio.to_thread", new=AsyncMock(side_effect=record_to_thread)) as mock_to_thread:
+            with caplog.at_level(logging.INFO):
+                await monitor._subscribe_futures()
+
+        mock_to_thread.assert_awaited_once()
+        assert payload_container["func"] == monitor.websocket.send
+        assert len(payload_container["args"]) == 1
+
+        sent_payload = json.loads(payload_container["args"][0])
+
+        header = sent_payload["header"]
+        assert header["authorization"] == "Bearer cached_access_token"
+        assert header["appkey"] == "cached_app_key"
+        assert header["appsecret"] == "cached_app_secret"
+        assert header["tr_type"] == "1"
+        assert header["tr_id"] == "H0IFC0"
+
+        body_input = sent_payload["body"]["input"]
+        assert body_input == {"tr_key": "101C6000", "tr_type": "1"}
+
+        info_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+        assert "[DBSEC] WebSocket subscription confirmed for KOSPI200 Futures (101C6000)" in info_messages
+
     def test_determine_trading_session_helper(self, monkeypatch):
         """Verify the shared trading session helper covers day/night windows."""
         import app.utils as utils
