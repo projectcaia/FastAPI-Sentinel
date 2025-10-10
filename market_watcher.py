@@ -553,12 +553,23 @@ def check_and_alert():
     state["last_checked_at"] = _now_kst_iso()
     state["last_session"] = sess
     
-    # K200 선물 체크 (30분에 한 번)
+    # K200 선물 체크 (30분에 한 번) - 주간+야간 모두 감시
     last_k200_check = state.get("last_k200_check", 0)
     now_ts = time.time()
     k200_check_needed = (now_ts - last_k200_check) >= (K200_CHECK_INTERVAL * 60)
     
-    if K200_FUTURES_ENABLED and k200_check_needed and sess in ["KR", "FUTURES"]:
+    # K200 선물은 KR(주간 09:00-15:30) + NIGHT(야간 18:00-05:00) 세션에서 감시
+    now_kst = _now_kst()
+    hhmm = now_kst.hour * 100 + now_kst.minute
+    
+    # 야간 거래 시간 체크: 18:00-05:00 (다음날)
+    is_night_session = (hhmm >= 1800) or (hhmm < 500)
+    is_day_session = (900 <= hhmm <= 1530)
+    
+    # K200 거래 시간이면 체크
+    k200_trading_hours = is_day_session or is_night_session
+    
+    if K200_FUTURES_ENABLED and k200_check_needed and k200_trading_hours:
         log.info("📊 K200 선물 체크 시작...")
         try:
             k200_data = get_k200_futures_data()
