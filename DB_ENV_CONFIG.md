@@ -14,10 +14,10 @@ DB_FUTURES_CODE=101V3000    # K200 선물 종목코드 (중요!)
 DB_FUTURES_TR_ID=HDFSCNT0   # 실시간 TR ID (선물체결 구독)
 ```
 
-### 3. 알림 민감도 설정
+### 3. 알림 민감도 설정 (다른 지표와 동일)
 ```bash
-DB_ALERT_THRESHOLD=0.8    # CRITICAL 알림 임계값 (0.8% 이상)
-DB_WARN_THRESHOLD=0.3     # WARNING 알림 임계값 (0.3% 이상)
+DB_ALERT_THRESHOLD=1.5    # LV2 이상 알림 임계값 (1.5% 이상)
+DB_WARN_THRESHOLD=0.8     # LV1 알림 임계값 (0.8% 이상)
 ```
 
 ### 4. WebSocket 설정

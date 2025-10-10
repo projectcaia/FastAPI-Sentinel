@@ -38,8 +38,8 @@ class KOSPI200FuturesMonitor:
     
     def __init__(
         self,
-        alert_threshold: float = 0.8,  # 0.8% change threshold for CRITICAL (더 민감하게)
-        warn_threshold: float = 0.3,   # 0.3% change threshold for WARN (더 민감하게)
+        alert_threshold: float = 1.5,  # 1.5% change threshold for CRITICAL (다른 지표와 동일)
+        warn_threshold: float = 0.8,   # 0.8% change threshold for WARN (다른 지표와 동일)
         buffer_size: int = 100,
         ws_url: str = "wss://openapi.dbsec.co.kr:9443/ws",
         enabled: bool = True
@@ -338,9 +338,6 @@ class KOSPI200FuturesMonitor:
                     await self._handle_message(message)
             finally:
                 ping_task.cancel()
-
-            finally:
-                ping_task.cancel()
         except WebSocketConnectionClosedException as exc:
             raise exc
         finally:
@@ -553,19 +550,14 @@ class KOSPI200FuturesMonitor:
             
     async def _check_anomaly(self, tick: Dict[str, Any]):
         """Check for price anomalies and trigger alerts"""
-        change_rate = abs(tick.get("change_rate", 0))
+        change_rate = tick.get("change_rate", 0)
+        abs_change = abs(change_rate)
         
-        # Determine alert level based on change rate
-        alert_level = None
-        if change_rate >= self.alert_threshold:  # >= 1.0%
-            alert_level = "CRITICAL"
-        elif change_rate >= self.warn_threshold:  # >= 0.5%
-            alert_level = "WARN"
-        else:
-            alert_level = "INFO"
+        # Grade level using market_watcher standards
+        level = self._grade_level(change_rate)
         
-        # Only send alerts for WARN or higher
-        if alert_level in ["WARN", "CRITICAL"]:
+        # Only send alerts if level is determined (>= 0.8%)
+        if level:
             # Avoid spam: don't alert more than once per minute for same level
             now = datetime.now(timezone.utc)
             if (self.last_alert_time and 
@@ -578,13 +570,13 @@ class KOSPI200FuturesMonitor:
             alert_payload = {
                 "symbol": "K200_FUT",
                 "session": tick["session"],
-                "change": tick["change_rate"],
+                "change": change_rate,  # Use original signed value
                 "price": tick["price"],
                 "timestamp": tick["timestamp"],
-                "level": alert_level
+                "level": level
             }
             
-            logger.warning(f"ANOMALY DETECTED: K200_FUT {tick['change_rate']:.2f}% change in {tick['session']} session - Level: {alert_level}")
+            logger.warning(f"ANOMALY DETECTED: K200_FUT {change_rate:.2f}% change in {tick['session']} session - Level: {level}")
             
             # Send to MarketWatcher via Sentinel alert endpoint
             await self._send_to_market_watcher(alert_payload)
@@ -645,13 +637,14 @@ class KOSPI200FuturesMonitor:
     def _grade_level(self, change_pct: float) -> str:
         """Grade alert level based on change percentage (same logic as market_watcher)"""
         abs_change = abs(change_pct)
-        if abs_change >= 1.5:  # 더 민감하게 조정
+        # market_watcher.py와 동일한 기준 적용
+        if abs_change >= 2.5:
             return "LV3"
-        elif abs_change >= 0.8:
+        elif abs_change >= 1.5:
             return "LV2"
-        elif abs_change >= 0.3:
+        elif abs_change >= 0.8:
             return "LV1"
-        return "LV1"  # 기본값을 LV1으로
+        return None  # 0.8% 미만은 알림 없음
             
     def get_recent_ticks(self, limit: Optional[int] = None) -> list:
         """Get recent tick data from buffer"""
@@ -714,8 +707,8 @@ def get_futures_monitor() -> KOSPI200FuturesMonitor:
             logger.info("[DB증권] K200 Futures Monitor DISABLED by DBSEC_ENABLE=false")
         
         try:
-            alert_threshold = float(os.getenv("DB_ALERT_THRESHOLD", "0.8").strip())  # 더 민감하게
-            warn_threshold = float(os.getenv("DB_WARN_THRESHOLD", "0.3").strip())   # 더 민감하게
+            alert_threshold = float(os.getenv("DB_ALERT_THRESHOLD", "1.5").strip())  # 다른 지표와 동일
+            warn_threshold = float(os.getenv("DB_WARN_THRESHOLD", "0.8").strip())   # 다른 지표와 동일
             buffer_size = int(os.getenv("DB_BUFFER_SIZE", "100").strip())
             ws_url = os.getenv("DB_WS_URL", "wss://openapi.dbsec.co.kr:9443/ws").strip()
             
