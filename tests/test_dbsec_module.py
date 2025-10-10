@@ -525,7 +525,6 @@ async def test_k200_futures_poller_issues_get_request(monkeypatch, caplog):
 
     poller = K200FuturesPoller()
 
-    monkeypatch.setenv("DB_FUTURES_TR_ID", "FHKIF10030000")
     dummy_manager = DummyTokenManager()
     monkeypatch.setattr("services.dbsec_rest.get_token_manager", lambda: dummy_manager)
 
@@ -559,21 +558,21 @@ async def test_k200_futures_poller_issues_get_request(monkeypatch, caplog):
     assert price_data["volume"] == 1200
     assert poller.daily_open_price == pytest.approx(345.50)
 
-    expected_url = f"{poller.api_base}/uapi/domestic-futureoption/v1/quotations/inquire-price"
+    expected_url = f"{poller.api_base}/uapi/domestic-futureoption/v1/quotations/inquire-ccnl"
     expected_params = {
-        "FID_COND_MRKT_DIV_CODE": "F",
-        "FID_INPUT_ISCD": poller.futures_code,
-        "FID_INPUT_ISCD_CD": "1",
+        "fid_cond_mrkt_div_code": "F",
+        "fid_input_iscd": poller.futures_code,
+        "fid_input_iscd_cd": "1",
     }
 
     async_client_instance.get.assert_awaited_once()
     awaited = async_client_instance.get.await_args
     args, kwargs = awaited.args, awaited.kwargs
     assert args[0] == expected_url
-    assert kwargs["headers"]["tr_id"] == "FHKIF10030000"
+    assert kwargs["headers"]["tr_id"] == "FHKIF10040000"
     assert kwargs["params"] == expected_params
 
-    success_logs = [record for record in caplog.records if "inquire-price success" in record.message]
+    success_logs = [record for record in caplog.records if "inquire-ccnl success" in record.message]
     assert success_logs, "Expected success log when rsp_cd == '00000'"
 
 
