@@ -70,6 +70,10 @@ async def startup_dbsec():
         # Start futures monitoring
         await start_futures_monitoring()
         
+        # Setup alert callback
+        futures_monitor = get_futures_monitor()
+        futures_monitor.set_alert_callback(alert_callback)
+        
         _initialized = True
         logger.info("DB증권 services initialized successfully")
         
@@ -365,9 +369,4 @@ def alert_callback(alert_data: Dict[str, Any]):
     logger.info(f"Formatted Sentinel alert: {sentinel_alert}")
 
 
-# Initialize alert callback
-@router.on_event("startup")
-async def setup_alert_callback():
-    """Setup alert callback after startup"""
-    futures_monitor = get_futures_monitor()
-    futures_monitor.set_alert_callback(alert_callback)
+# Alert callback is set in the main startup function

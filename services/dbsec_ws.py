@@ -38,8 +38,8 @@ class KOSPI200FuturesMonitor:
     
     def __init__(
         self,
-        alert_threshold: float = 1.0,  # 1% change threshold for CRITICAL
-        warn_threshold: float = 0.5,   # 0.5% change threshold for WARN
+        alert_threshold: float = 0.8,  # 0.8% change threshold for CRITICAL (더 민감하게)
+        warn_threshold: float = 0.3,   # 0.3% change threshold for WARN (더 민감하게)
         buffer_size: int = 100,
         ws_url: str = "wss://openapi.dbsec.co.kr:9443/ws",
         enabled: bool = True
@@ -311,23 +311,36 @@ class KOSPI200FuturesMonitor:
             # Subscribe to KOSPI200 futures
             await self._subscribe_futures()
 
-            # Listen for messages
-            while self.is_connected:
-                try:
-                    message = await asyncio.to_thread(ws.recv)
-                except WebSocketTimeoutException:
-                    logger.warning("[DBSEC] WebSocket timeout, retrying...")
-                    await asyncio.sleep(5)
-                    continue
+            # Send periodic ping to keep connection alive
+            ping_task = asyncio.create_task(self._ping_loop(ws))
+            
+            try:
+                # Listen for messages
+                while self.is_connected:
+                    try:
+                        message = await asyncio.to_thread(ws.recv)
+                    except WebSocketTimeoutException:
+                        # Send ping on timeout
+                        try:
+                            await asyncio.to_thread(ws.ping)
+                            logger.debug("[DBSEC] Sent ping to keep connection alive")
+                        except:
+                            pass
+                        await asyncio.sleep(5)
+                        continue
 
-                if message is None:
-                    continue
+                    if message is None:
+                        continue
 
-                if isinstance(message, bytes):
-                    message = message.decode("utf-8", "ignore")
+                    if isinstance(message, bytes):
+                        message = message.decode("utf-8", "ignore")
 
-                await self._handle_message(message)
+                    await self._handle_message(message)
+            finally:
+                ping_task.cancel()
 
+            finally:
+                ping_task.cancel()
         except WebSocketConnectionClosedException as exc:
             raise exc
         finally:
@@ -337,13 +350,25 @@ class KOSPI200FuturesMonitor:
                     await asyncio.to_thread(self.websocket.close)
                 finally:
                     self.websocket = None
+    
+    async def _ping_loop(self, ws):
+        """Send periodic pings to keep WebSocket connection alive"""
+        while self.is_connected:
+            try:
+                await asyncio.sleep(30)  # Ping every 30 seconds
+                if self.is_connected and ws:
+                    await asyncio.to_thread(ws.ping)
+                    logger.debug("[DBSEC] Periodic ping sent")
+            except:
+                break
                 
     async def _subscribe_futures(self):
         """Subscribe to KOSPI200 futures real-time data"""
         # DB증권 API 실시간 선물 구독 명세 기반 메시지 구성
-        symbol = os.getenv("DB_FUTURES_SYMBOL", "K200").strip() or "K200"
-        exchange = os.getenv("DB_FUTURES_EXCHANGE", "FUT").strip() or "FUT"
+        # K200 선물의 실제 종목코드 사용
+        fut_code = os.getenv("DB_FUTURES_CODE", "101V3000").strip()  # K200 선물 종목코드 
         tr_id = os.getenv("DB_FUTURES_TR_ID", "HDFSCNT0").strip() or "HDFSCNT0"
+        tr_key = fut_code  # 종목코드를 tr_key로 사용
 
         subscribe_msg = {
             "header": {
@@ -353,8 +378,7 @@ class KOSPI200FuturesMonitor:
             "body": {
                 "input": {
                     "tr_id": tr_id,
-                    "symbol": symbol,
-                    "exchange": exchange,
+                    "tr_key": tr_key,  # 종목코드를 키로 사용
                 }
             }
         }
@@ -370,15 +394,22 @@ class KOSPI200FuturesMonitor:
         try:
             data = json.loads(message)
             
+            # Log raw message structure for debugging (first few times)
+            if len(self.tick_buffer) < 5:
+                logger.info(f"[DBSEC] Raw message keys: {list(data.keys())}")
+                if 'header' in data:
+                    logger.info(f"[DBSEC] Header: {data['header']}")
+            
             # Parse futures data (format depends on DB증권 API)
             tick_data = await self._parse_tick_data(data)
             if not tick_data:
+                logger.debug("[DBSEC] No valid tick data parsed from message")
                 return
                 
             # Add to buffer
             self.tick_buffer.append(tick_data)
 
-            logger.info("%s update processed", TICK_INFO_PREFIX)
+            logger.info(f"{TICK_INFO_PREFIX} Price: {tick_data['price']:.2f}, Change: {tick_data['change_rate']:.2f}%")
 
             if logger.isEnabledFor(logging.DEBUG):
                 tick_summary = {
@@ -422,20 +453,52 @@ class KOSPI200FuturesMonitor:
     async def _parse_tick_data(self, raw_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Parse raw WebSocket data into standardized tick format"""
         try:
-            # This is a placeholder parsing logic
-            # Actual implementation depends on DB증권 API response format
-            
-            # Example parsing (to be updated based on actual API spec):
+            # DB증권 실시간 데이터 형식
+            # header와 body로 구분되며, body.output에 실제 데이터가 있음
+            header = raw_data.get("header", {})
             body = raw_data.get("body", {})
             
-            current_price = float(body.get("stck_prpr", 0))  # 현재가
+            # tr_id로 메시지 타입 확인
+            tr_id = header.get("tr_id", "")
+            if not tr_id:
+                logger.debug("No tr_id in message, skipping")
+                return None
+            
+            # 실시간 선물 체결 데이터 처리
+            output = body.get("output", body)  # output이 없으면 body 자체 사용
+            
+            # 다양한 필드명 시도 (DB증권 API 문서 기반)
+            current_price = 0.0
+            price_fields = ["fut_prpr", "stck_prpr", "prpr", "price", "현재가"]
+            for field in price_fields:
+                if field in output:
+                    try:
+                        current_price = float(output[field])
+                        if current_price > 0:
+                            break
+                    except (ValueError, TypeError):
+                        continue
+            
             if current_price <= 0:
+                logger.debug(f"No valid price found in data: {output.keys()}")
                 return None
             
             # Store daily open price for % calculation
             if not self.daily_open_price:
-                self.daily_open_price = float(body.get("stck_oprc", current_price))  # 시가
+                open_fields = ["fut_oprc", "stck_oprc", "oprc", "open", "시가"]
+                for field in open_fields:
+                    if field in output:
+                        try:
+                            self.daily_open_price = float(output[field])
+                            if self.daily_open_price > 0:
+                                break
+                        except (ValueError, TypeError):
+                            continue
                 
+                # If no open price, use current price
+                if not self.daily_open_price:
+                    self.daily_open_price = current_price
+                    
             # Determine trading session
             session = self._determine_session()
             
@@ -444,11 +507,23 @@ class KOSPI200FuturesMonitor:
             if self.daily_open_price and self.daily_open_price > 0:
                 change_rate = ((current_price - self.daily_open_price) / self.daily_open_price) * 100
             
+            # Extract volume
+            volume = 0
+            volume_fields = ["cntg_vol", "acml_vol", "vol", "volume", "체결량"]
+            for field in volume_fields:
+                if field in output:
+                    try:
+                        volume = int(output[field])
+                        if volume > 0:
+                            break
+                    except (ValueError, TypeError):
+                        continue
+            
             tick = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "symbol": "K200_FUT",
                 "price": current_price,
-                "volume": int(body.get("cntg_vol", 0)),  # 체결량
+                "volume": volume,
                 "session": session,
                 "change_rate": change_rate,
                 "raw_data": raw_data
@@ -457,10 +532,12 @@ class KOSPI200FuturesMonitor:
             self.last_price = current_price
             self.current_session = session
             
+            logger.info(f"[DBSEC] Parsed tick: price={current_price:.2f}, change={change_rate:.2f}%, session={session}")
+            
             return tick
             
         except Exception as e:
-            logger.error(f"Tick parsing error: {e}")
+            logger.error(f"Tick parsing error: {e}, raw_data keys: {raw_data.keys() if raw_data else 'None'}")
             return None
             
     def _determine_session(self) -> str:
@@ -568,13 +645,13 @@ class KOSPI200FuturesMonitor:
     def _grade_level(self, change_pct: float) -> str:
         """Grade alert level based on change percentage (same logic as market_watcher)"""
         abs_change = abs(change_pct)
-        if abs_change >= 2.5:
+        if abs_change >= 1.5:  # 더 민감하게 조정
             return "LV3"
-        elif abs_change >= 1.5:
-            return "LV2"
         elif abs_change >= 0.8:
+            return "LV2"
+        elif abs_change >= 0.3:
             return "LV1"
-        return None
+        return "LV1"  # 기본값을 LV1으로
             
     def get_recent_ticks(self, limit: Optional[int] = None) -> list:
         """Get recent tick data from buffer"""
@@ -637,8 +714,8 @@ def get_futures_monitor() -> KOSPI200FuturesMonitor:
             logger.info("[DB증권] K200 Futures Monitor DISABLED by DBSEC_ENABLE=false")
         
         try:
-            alert_threshold = float(os.getenv("DB_ALERT_THRESHOLD", "1.0").strip())
-            warn_threshold = float(os.getenv("DB_WARN_THRESHOLD", "0.5").strip())
+            alert_threshold = float(os.getenv("DB_ALERT_THRESHOLD", "0.8").strip())  # 더 민감하게
+            warn_threshold = float(os.getenv("DB_WARN_THRESHOLD", "0.3").strip())   # 더 민감하게
             buffer_size = int(os.getenv("DB_BUFFER_SIZE", "100").strip())
             ws_url = os.getenv("DB_WS_URL", "wss://openapi.dbsec.co.kr:9443/ws").strip()
             
