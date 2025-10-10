@@ -106,10 +106,10 @@ class K200FuturesPoller:
                 open_price = 0
                 volume = 0
                 
-                # 응답 필드 탐색 (로그로 실제 필드명 확인)
-                price_fields = ["stck_prpr", "prpr", "price", "current_price", "now_prc", "curr_prc"]
-                open_fields = ["stck_oprc", "oprc", "open_price", "open_prc"]
-                volume_fields = ["acml_vol", "volume", "day_volume", "tot_vol"]
+                # DB증권 API 실제 응답 필드명 사용
+                price_fields = ["Prpr", "prpr", "stck_prpr", "price", "current_price"]
+                open_fields = ["Oprc", "oprc", "stck_oprc", "open_price"]
+                volume_fields = ["AcmlVol", "acml_vol", "volume", "day_volume"]
                 
                 for field in price_fields:
                     if field in output and output[field]:
