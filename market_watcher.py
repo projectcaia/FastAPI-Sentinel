@@ -1,7 +1,7 @@
 # market_watcher.py — FGPT Sentinel 시장감시 워커 (실시간 변동 감지)
 # -*- coding: utf-8 -*-
 
-import os, time, json, logging, requests, math
+import os, time, json, logging, requests, math, asyncio
 from datetime import datetime, timezone, timedelta
 from collections import deque
 
@@ -69,11 +69,15 @@ HUMAN_NAMES = {
 def human_name(sym: str) -> str:
     return HUMAN_NAMES.get(sym, sym)
 
-# 심볼 정의 - K200 선물은 DB증권 API가 담당
+# 심볼 정의
 KR_SPOT_PRIORITY = ["^KS11", "069500.KS", "102110.KS", "^KS200"]
-# KR_FUTURES는 DB증권 REST API에서 처리하므로 여기서는 제외
 US_SPOT = ["^GSPC", "^IXIC", "^VIX"]
 FUTURES_SYMBOLS = ["ES=F", "NQ=F"]
+
+# DB증권 K200 선물 설정
+K200_FUTURES_ENABLED = os.getenv("DBSEC_ENABLE", "true").lower() in ["true", "1", "yes"]
+K200_FUTURES_CODE = os.getenv("DB_FUTURES_CODE", "101C6000").strip()
+K200_CHECK_INTERVAL = parse_int_env("K200_CHECK_INTERVAL_MIN", 30)  # 30분 기본값
 
 # ==================== 시간 유틸 ====================
 def _now_kst():
@@ -138,6 +142,128 @@ def _http_get(url: str, params=None, timeout=10, max_retry=2):
     if last:
         raise last
     raise RuntimeError("HTTP 요청 실패")
+
+# ==================== DB증권 K200 선물 데이터 수집 ====================
+def get_k200_futures_data() -> dict | None:
+    """DB증권 API를 통한 K200 선물 데이터 조회"""
+    if not K200_FUTURES_ENABLED:
+        return None
+        
+    try:
+        # DB증권 API 설정
+        api_base = os.getenv("DB_API_BASE", "https://openapi.dbsec.co.kr:8443").strip()
+        app_key = os.getenv("DB_APP_KEY", "").strip()
+        app_secret = os.getenv("DB_APP_SECRET", "").strip()
+        
+        if not app_key or not app_secret:
+            log.warning("DB증권 API 키 미설정")
+            return None
+        
+        # 토큰 발급 (간단 버전)
+        token_url = f"{api_base}/oauth2/token"
+        token_params = {
+            "appkey": app_key,
+            "appsecretkey": app_secret,
+            "grant_type": "client_credentials",
+            "scope": "oob"
+        }
+        
+        token_resp = requests.post(
+            token_url,
+            params=token_params,
+            headers={"Accept": "application/json"},
+            timeout=10
+        )
+        
+        if token_resp.status_code != 200:
+            log.error("DB증권 토큰 발급 실패: %s", token_resp.status_code)
+            return None
+            
+        token_data = token_resp.json()
+        access_token = token_data.get("access_token")
+        
+        if not access_token:
+            log.error("DB증권 토큰 없음")
+            return None
+        
+        # K200 선물 가격 조회
+        quote_url = f"{api_base}/dfutureoption/quotations/v1/inquire-price"
+        tr_id = "HHDFS76240000"
+        
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {access_token}",
+            "appkey": app_key,
+            "appsecret": app_secret,
+            "custtype": "P",
+            "tr_id": tr_id
+        }
+        
+        payload = {
+            "fid_cond_mrkt_div_code": "F",
+            "fid_input_iscd": K200_FUTURES_CODE,
+            "fid_input_iscd_cd": "1"
+        }
+        
+        resp = requests.post(
+            quote_url,
+            headers=headers,
+            json=payload,
+            timeout=10,
+            verify=False
+        )
+        
+        if resp.status_code != 200:
+            log.error("K200 선물 가격 조회 실패: %s", resp.status_code)
+            return None
+        
+        data = resp.json()
+        
+        # 응답 파싱
+        for key in data.keys():
+            if key.lower().startswith("output"):
+                output = data[key]
+                if not isinstance(output, dict):
+                    continue
+                
+                # 현재가
+                current = 0
+                for field in ["futs_prpr", "stck_prpr", "prpr"]:
+                    if field in output and output[field]:
+                        try:
+                            current = float(output[field])
+                            if current > 0:
+                                break
+                        except:
+                            continue
+                
+                # 시가
+                open_price = 0
+                for field in ["futs_oprc", "stck_oprc", "oprc"]:
+                    if field in output and output[field]:
+                        try:
+                            open_price = float(output[field])
+                            if open_price > 0:
+                                break
+                        except:
+                            continue
+                
+                if current > 0 and open_price > 0:
+                    change_pct = ((current - open_price) / open_price) * 100
+                    
+                    return {
+                        "current": current,
+                        "open": open_price,
+                        "change_pct": change_pct,
+                        "timestamp": time.time()
+                    }
+        
+        log.error("K200 선물 데이터 파싱 실패")
+        return None
+        
+    except Exception as e:
+        log.error("K200 선물 조회 오류: %s", e)
+        return None
 
 # ==================== 데이터 수집 (개선) ====================
 def get_market_data(symbol: str) -> dict | None:
@@ -283,8 +409,14 @@ def grade_level_vix_relative(change_pct: float) -> str | None:
 # ==================== 알림 전송 ====================
 def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str = "ALERT"):
     """알림 전송 - 지수 중심 포맷"""
-    display_name = human_name(symbol)
     is_vix = (symbol == "^VIX")
+    is_k200f = (symbol == "K200F")
+    
+    # K200 선물은 명확한 이름으로
+    if is_k200f:
+        display_name = "K200 선물"
+    else:
+        display_name = human_name(symbol)
     
     # VIX는 보조 정보로, 주요 지수 정보를 우선 표시
     if is_vix and "vix_context" in data:
@@ -314,7 +446,7 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
             }
         }
     else:
-        # 일반 지수 알림
+        # 일반 지수 알림 (K200 선물 포함)
         payload = {
             "index": display_name,
             "level": level or "INFO",
@@ -414,10 +546,61 @@ def check_and_alert():
     log.info("시장 체크 시작 [세션: %s] %s", sess, _now_kst().strftime("%Y-%m-%d %H:%M:%S KST"))
     if FORCE_MARKET_OPEN:
         log.info("🔴 강제 시장 오픈 모드 활성화 - 휴장일에도 감시 계속")
+    if K200_FUTURES_ENABLED:
+        log.info("📊 K200 선물 감시 활성화 (DB증권 API)")
     log.info("="*60)
     
     state["last_checked_at"] = _now_kst_iso()
     state["last_session"] = sess
+    
+    # K200 선물 체크 (30분에 한 번)
+    last_k200_check = state.get("last_k200_check", 0)
+    now_ts = time.time()
+    k200_check_needed = (now_ts - last_k200_check) >= (K200_CHECK_INTERVAL * 60)
+    
+    if K200_FUTURES_ENABLED and k200_check_needed and sess in ["KR", "FUTURES"]:
+        log.info("📊 K200 선물 체크 시작...")
+        try:
+            k200_data = get_k200_futures_data()
+            if k200_data:
+                current_price = k200_data["current"]
+                change_pct = k200_data["change_pct"]
+                
+                log.info("✓ K200 선물: 현재=%.2f, 변화=%.2f%%", current_price, change_pct)
+                
+                # 레벨 판정
+                abs_change = abs(change_pct)
+                level = None
+                if abs_change >= 2.5:
+                    level = "LV3"
+                elif abs_change >= 1.5:
+                    level = "LV2"
+                elif abs_change >= 0.8:
+                    level = "LV1"
+                
+                # 알림 조건
+                state_key = f"K200F_{sess}"
+                prev_level = state.get(state_key, {}).get("level")
+                
+                if level and level != prev_level:
+                    direction = "상승" if change_pct > 0 else "하락"
+                    note = f"K200 선물 {direction} {abs(change_pct):.2f}% (DB증권 API)"
+                    
+                    post_alert(k200_data, level, "K200F", note, kind="FUTURES")
+                    log.info(">>> K200 선물 알림: [%s] %s", level, note)
+                    
+                    # 상태 업데이트
+                    state[state_key] = {
+                        "level": level,
+                        "change_pct": change_pct,
+                        "updated_at": _now_kst_iso()
+                    }
+                
+                state["last_k200_check"] = now_ts
+            else:
+                log.warning("⚠ K200 선물 데이터 수집 실패")
+        except Exception as e:
+            log.error("K200 선물 체크 오류: %s", e)
     
     # 강제 알림 체크
     last_alert_time = state.get("last_alert_time", 0)
