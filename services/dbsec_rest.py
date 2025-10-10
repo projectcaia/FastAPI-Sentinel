@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class K200FuturesPoller:
-    """Polls K200 futures price via REST API"""
+    """Polls KODEX 200 ETF price via REST API as K200 proxy"""
     
     def __init__(self):
         self.api_base = os.getenv("DB_API_BASE", "https://openapi.dbsec.co.kr:8443").strip()
@@ -53,26 +53,35 @@ class K200FuturesPoller:
                 logger.error("[DBSEC] Failed to get access token")
                 return None
             
-            # DB증권 선물 현재가 조회 API
-            url = f"{self.api_base}/uapi/domestic-futureoption/v1/quotations/inquire-price"
+            # DB증권 주식/ETF 현재가 조회 API 사용 (선물 API가 404 오류)
+            # KODEX 200 ETF (069500) 사용하여 K200 추적
+            etf_code = "069500"  # KODEX 200 ETF
+            url = f"{self.api_base}/uapi/domestic-stock/v1/quotations/inquire-price"
+            
+            # 필요한 헤더들
+            app_key = getattr(token_manager, "app_key", "")
+            app_secret = getattr(token_manager, "app_secret", "")
             
             headers = {
-                "authorization": f"Bearer {token}",
-                "appkey": getattr(token_manager, "app_key", ""),
-                "appsecret": getattr(token_manager, "app_secret", ""),
-                "tr_id": "FHMIF10000000"  # 선물 현재가 조회
+                "Authorization": f"Bearer {token}",
+                "appkey": app_key,
+                "appsecret": app_secret,
+                "tr_id": "FHKST01010100",  # 주식현재가 시세
+                "Content-Type": "application/json; charset=utf-8"
             }
             
             params = {
-                "FID_COND_MRKT_DIV_CODE": "F",  # 선물
-                "FID_INPUT_ISCD": self.futures_code  # K200 선물 종목코드
+                "FID_COND_MRKT_DIV_CODE": "J",  # 주식
+                "FID_INPUT_ISCD": etf_code  # KODEX 200 ETF
             }
             
             async with httpx.AsyncClient() as client:
                 response = await client.get(url, headers=headers, params=params, timeout=10.0)
                 
                 if response.status_code != 200:
-                    logger.error(f"[DBSEC] API request failed: {response.status_code}")
+                    logger.error(f"[DBSEC] API request failed: {response.status_code}, URL: {url}")
+                    if response.status_code == 404:
+                        logger.error(f"[DBSEC] Check API endpoint - may need different URL or parameters")
                     return None
                 
                 data = response.json()
@@ -83,22 +92,29 @@ class K200FuturesPoller:
                     
                 output = data.get("output", {})
                 
-                # Parse price data
-                current_price = float(output.get("fut_prpr", 0))  # 선물 현재가
+                # Parse price data - 주식 API 필드명 사용
+                current_price = float(output.get("stck_prpr", 0))  # 주식 현재가
                 if current_price <= 0:
-                    return None
+                    # 다른 필드명 시도
+                    current_price = float(output.get("prpr", 0))
+                    if current_price <= 0:
+                        logger.error(f"[DBSEC] No valid price in response: {output.keys()}")
+                        return None
                     
                 # Store open price
                 if not self.daily_open_price:
-                    self.daily_open_price = float(output.get("fut_oprc", current_price))  # 선물 시가
+                    self.daily_open_price = float(output.get("stck_oprc", current_price))  # 시가
                 
                 # Calculate change rate
                 change_rate = 0.0
                 if self.daily_open_price and self.daily_open_price > 0:
                     change_rate = ((current_price - self.daily_open_price) / self.daily_open_price) * 100
                 
+                # KODEX 200은 K200 지수의 1/100 스케일
+                k200_equivalent = current_price * 100
+                
                 return {
-                    "price": current_price,
+                    "price": k200_equivalent,  # K200 지수 환산값
                     "change_rate": change_rate,
                     "volume": int(output.get("acml_vol", 0)),  # 누적 거래량
                     "timestamp": datetime.now(timezone.utc).isoformat()
@@ -134,7 +150,7 @@ class K200FuturesPoller:
         
         # Send alert
         await self.send_alert({
-            "symbol": "K200_FUT",
+            "symbol": "KODEX200",
             "level": level,
             "change": change_rate,
             "price": price_data["price"],
@@ -151,13 +167,13 @@ class K200FuturesPoller:
                 
             # Format for Sentinel
             payload = {
-                "index": "K200 선물",
-                "symbol": "K200_FUT",
+                "index": "KODEX 200",  # KODEX 200 ETF로 표시
+                "symbol": "069500.KS",
                 "level": alert_data["level"],
                 "delta_pct": round(alert_data["change"], 2),
                 "triggered_at": alert_data["timestamp"],
                 "note": f"{'상승' if alert_data['change'] > 0 else '하락'} {abs(alert_data['change']):.2f}%",
-                "kind": "FUTURES"
+                "kind": "ETF"
             }
             
             headers = {"Content-Type": "application/json"}
@@ -174,7 +190,7 @@ class K200FuturesPoller:
                 )
                 
                 if response.is_success:
-                    logger.info(f"[DBSEC] Alert sent: K200 선물 {alert_data['change']:.2f}% Level {alert_data['level']}")
+                    logger.info(f"[DBSEC] Alert sent: KODEX 200 {alert_data['change']:.2f}% Level {alert_data['level']}")
                     
         except Exception as e:
             logger.error(f"[DBSEC] Failed to send alert: {e}")
@@ -182,7 +198,7 @@ class K200FuturesPoller:
     async def start_polling(self):
         """Start periodic price polling"""
         self.is_running = True
-        logger.info(f"[DBSEC] Starting K200 futures polling (interval: {self.poll_interval}s)")
+        logger.info(f"[DBSEC] Starting KODEX 200 polling (interval: {self.poll_interval}s)")
         
         while self.is_running:
             try:
@@ -195,7 +211,7 @@ class K200FuturesPoller:
                         self.last_price = price_data["price"]
                         self.price_buffer.append(price_data)
                         
-                        logger.debug(f"[DBSEC] K200 선물: {price_data['price']:.2f} ({price_data['change_rate']:+.2f}%)")
+                        logger.info(f"[DBSEC] KODEX 200: {price_data['price']:.2f} ({price_data['change_rate']:+.2f}%)")
                         
                         # Check for alerts
                         await self.check_and_alert(price_data)
@@ -214,7 +230,7 @@ class K200FuturesPoller:
     async def stop_polling(self):
         """Stop polling"""
         self.is_running = False
-        logger.info("[DBSEC] Stopped K200 futures polling")
+        logger.info("[DBSEC] Stopped KODEX 200 polling")
 
 
 # Global instance
@@ -233,7 +249,7 @@ async def start_futures_polling():
     """Start futures polling in background"""
     poller = get_futures_poller()
     asyncio.create_task(poller.start_polling())
-    logger.info("[DBSEC] K200 futures REST polling started")
+    logger.info("[DBSEC] KODEX 200 ETF REST polling started")
 
 
 async def stop_futures_polling():

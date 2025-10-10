@@ -14,11 +14,11 @@ TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_telegram_chat_id
 ```
 
-### 3. DB증권 API (K200 선물 감시)
+### 3. DB증권 API (KODEX 200 ETF 감시)
 ```bash
 DB_APP_KEY=your_db_app_key
 DB_APP_SECRET=your_db_app_secret
-DB_FUTURES_CODE=101V3000        # K200 선물 종목코드
+# KODEX 200 ETF(069500)를 통해 K200 지수 추적
 ```
 
 ### 4. Sentinel 설정
