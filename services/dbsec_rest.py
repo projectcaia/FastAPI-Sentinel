@@ -23,7 +23,7 @@ class K200FuturesPoller:
     def __init__(self):
         self.api_base = os.getenv("DB_API_BASE", "https://openapi.dbsec.co.kr:8443").strip()
         self.futures_code = os.getenv("DB_FUTURES_CODE", "101V3000").strip()
-        self.poll_interval = int(os.getenv("DB_POLL_INTERVAL_SEC", "180"))  # 3분 기본값
+        self.poll_interval = int(os.getenv("DB_POLL_INTERVAL_SEC", "1800"))  # 30분 기본값
         
         # Price tracking
         self.last_price: Optional[float] = None
@@ -38,6 +38,8 @@ class K200FuturesPoller:
         }
         
         self.last_alert_time: Optional[datetime] = None
+        self.last_alert_level: Optional[str] = None
+        self.alert_cooldown_minutes = 30  # 30분 중복 알림 방지
         self.is_running = False
         
     async def get_current_price(self) -> Optional[Dict[str, Any]]:
@@ -158,7 +160,8 @@ class K200FuturesPoller:
                 # 실제로는 ETF 자체 변동률만 추적
                 
                 return {
-                    "price": current_price,  # ETF 현재가
+                    "price": current_price,  # ETF 현재가 (원시 데이터)
+                    "k200_price": current_price / 100,  # K200 선물지수 환산가
                     "change_rate": change_rate,
                     "volume": volume,
                     "timestamp": datetime.now(timezone.utc).isoformat()
@@ -185,19 +188,23 @@ class K200FuturesPoller:
         if not level:
             return
             
-        # Rate limit alerts (1 per minute)
+        # 중복 알림 방지 (기존 시스템과 동일한 로직)
         now = datetime.now(timezone.utc)
-        if self.last_alert_time and (now - self.last_alert_time).total_seconds() < 60:
+        if (self.last_alert_time and 
+            self.last_alert_level == level and 
+            (now - self.last_alert_time).total_seconds() < self.alert_cooldown_minutes * 60):
+            logger.debug(f"[DBSEC] Alert suppressed - same level {level} within {self.alert_cooldown_minutes}min")
             return
             
         self.last_alert_time = now
+        self.last_alert_level = level
         
         # Send alert
         await self.send_alert({
-            "symbol": "KODEX200",
+            "symbol": "K200F",
             "level": level,
             "change": change_rate,
-            "price": price_data["price"],
+            "price": price_data["k200_price"],  # K200 선물지수 환산가 사용
             "timestamp": price_data["timestamp"]
         })
         
@@ -243,8 +250,9 @@ class K200FuturesPoller:
     async def start_polling(self):
         """Start periodic price polling"""
         self.is_running = True
-        logger.info(f"[DBSEC] Starting K200 선물지수 polling (interval: {self.poll_interval}s)")
+        logger.info(f"[DBSEC] Starting K200 선물지수 polling (interval: {self.poll_interval//60}분)")
         logger.info("[DBSEC] Monitoring: KR DAY (09:00-15:30) + NIGHT (18:00-05:00) sessions")
+        logger.info(f"[DBSEC] Alert suppression: {self.alert_cooldown_minutes}분 (기존 시스템과 동일)")
         
         consecutive_failures = 0
         max_consecutive_failures = 5
@@ -265,7 +273,9 @@ class K200FuturesPoller:
                             self.last_price = price_data["price"]
                             self.price_buffer.append(price_data)
                             
-                            logger.info(f"[DBSEC] K200 선물: {price_data['price']:.2f}₩ ({price_data['change_rate']:+.2f}%) Vol: {price_data['volume']:,}")
+                            # K200 선물지수 표시
+                            k200_price = price_data['k200_price']
+                            logger.info(f"[DBSEC] K200 선물: {k200_price:.2f} ({price_data['change_rate']:+.2f}%) Vol: {price_data['volume']:,}")
                             
                             # Check for alerts
                             await self.check_and_alert(price_data)
