@@ -67,7 +67,7 @@ async def startup_dbsec():
         logger.info("Initializing DB증권 K200 선물지수 monitoring services...")
         
         # Check if DB증권 is enabled
-        dbsec_enabled = os.getenv("DBSEC_ENABLE", "false").lower() in ["true", "1", "yes"]
+        dbsec_enabled = os.getenv("DBSEC_ENABLE", "true").lower() in ["true", "1", "yes"]
         if not dbsec_enabled:
             logger.info("DB증권 services disabled by DBSEC_ENABLE=false")
             _initialized = True

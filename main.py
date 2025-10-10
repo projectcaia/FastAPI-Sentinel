@@ -119,7 +119,7 @@ log = logging.getLogger("sentinel-fastapi-v2")
 app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
 
 # ── DB증권 Router Integration (로그 설정 이후) ────────────────────────
-DBSEC_ENABLE = os.getenv("DBSEC_ENABLE", "false").lower() in ["true", "1", "yes"]
+DBSEC_ENABLE = os.getenv("DBSEC_ENABLE", "true").lower() in ["true", "1", "yes"]
 if DBSEC_ENABLE:
     try:
         from routers.dbsec import router as dbsec_router
