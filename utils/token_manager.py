@@ -326,6 +326,17 @@ class DBSecTokenManager:
         if not self.access_token:
             return {}
         return {"Authorization": f"{self.token_type} {self.access_token}"}
+    
+    async def health_check(self) -> Dict[str, Any]:
+        """Get token manager health status"""
+        return {
+            "enabled": self.enabled,
+            "token_valid": self._is_token_valid(),
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "token_exists": bool(self.access_token),
+            "consecutive_failures": self._consecutive_failures,
+            "in_backoff": self._is_in_backoff()
+        }
 
 
 # Global instance
