@@ -64,7 +64,14 @@ async def startup_dbsec():
         return
         
     try:
-        logger.info("Initializing DB증권 services...")
+        logger.info("Initializing DB증권 K200 선물지수 monitoring services...")
+        
+        # Check if DB증권 is enabled
+        dbsec_enabled = os.getenv("DBSEC_ENABLE", "false").lower() in ["true", "1", "yes"]
+        if not dbsec_enabled:
+            logger.info("DB증권 services disabled by DBSEC_ENABLE=false")
+            _initialized = True
+            return
         
         # Initialize token manager
         await init_token_manager()
@@ -78,18 +85,25 @@ async def startup_dbsec():
             logger.info("DB증권 REST API polling started")
         else:
             # Start WebSocket monitoring (legacy)
-            await start_futures_monitoring()
-            
-            # Setup alert callback
-            futures_monitor = get_futures_monitor()
-            futures_monitor.set_alert_callback(alert_callback)
+            try:
+                await start_futures_monitoring()
+                # Setup alert callback
+                futures_monitor = get_futures_monitor()
+                futures_monitor.set_alert_callback(alert_callback)
+                logger.info("DB증권 WebSocket monitoring started")
+            except Exception as ws_error:
+                logger.warning(f"WebSocket monitoring failed, falling back to REST: {ws_error}")
+                # Fallback to REST if WebSocket fails
+                await start_futures_polling()
+                logger.info("DB증권 REST API polling started (fallback)")
         
         _initialized = True
         logger.info("DB증권 services initialized successfully")
         
     except Exception as e:
         logger.error(f"Failed to initialize DB증권 services: {e}")
-        raise
+        # Don't raise - allow main app to continue working
+        logger.warning("DB증권 services will be disabled, main sentinel system continues")
 
 
 @router.on_event("shutdown")

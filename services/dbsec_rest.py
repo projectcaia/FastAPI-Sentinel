@@ -209,15 +209,16 @@ class K200FuturesPoller:
                 logger.warning("[DBSEC] SENTINEL_BASE_URL not configured")
                 return
                 
-            # Format for Sentinel
+            # Format for Sentinel (기존 market_watcher와 동일한 형식)
             payload = {
-                "index": "KODEX 200",  # KODEX 200 ETF로 표시
-                "symbol": "069500.KS",
+                "index": "K200 선물",  # K200 선물지수로 표시
+                "symbol": "K200F",
                 "level": alert_data["level"],
                 "delta_pct": round(alert_data["change"], 2),
                 "triggered_at": alert_data["timestamp"],
-                "note": f"{'상승' if alert_data['change'] > 0 else '하락'} {abs(alert_data['change']):.2f}%",
-                "kind": "ETF"
+                "note": f"K200 선물 {'상승' if alert_data['change'] > 0 else '하락'} {abs(alert_data['change']):.2f}% (DB증권)",
+                "kind": "FUTURES",
+                "source": "dbsec_api"  # 소스 구분
             }
             
             headers = {"Content-Type": "application/json"}
@@ -234,7 +235,7 @@ class K200FuturesPoller:
                 )
                 
                 if response.is_success:
-                    logger.info(f"[DBSEC] Alert sent: KODEX 200 {alert_data['change']:.2f}% Level {alert_data['level']}")
+                    logger.info(f"[DBSEC] Alert sent: K200 선물 {alert_data['change']:.2f}% Level {alert_data['level']}")
                     
         except Exception as e:
             logger.error(f"[DBSEC] Failed to send alert: {e}")
@@ -242,42 +243,72 @@ class K200FuturesPoller:
     async def start_polling(self):
         """Start periodic price polling"""
         self.is_running = True
-        logger.info(f"[DBSEC] Starting KODEX 200 polling (interval: {self.poll_interval}s)")
+        logger.info(f"[DBSEC] Starting K200 선물지수 polling (interval: {self.poll_interval}s)")
+        logger.info("[DBSEC] Monitoring: KR DAY (09:00-15:30) + NIGHT (18:00-05:00) sessions")
+        
+        consecutive_failures = 0
+        max_consecutive_failures = 5
         
         while self.is_running:
             try:
                 # Check trading session - KR 시간대만 확인
                 session = determine_trading_session()
                 current_session = session.get("session", "UNKNOWN")
+                is_holiday = session.get("is_holiday", False)
                 
-                if current_session in ["DAY"]:  # 한국 주간 세션만 감시
-                    # Get current price
-                    price_data = await self.get_current_price()
-                    if price_data:
-                        self.last_price = price_data["price"]
-                        self.price_buffer.append(price_data)
+                if current_session in ["DAY", "NIGHT"] and not is_holiday:  
+                    # K200 선물: 주간(09:00-15:30) + 야간(18:00-05:00) 세션 모두 감시
+                    try:
+                        # Get current price
+                        price_data = await self.get_current_price()
+                        if price_data:
+                            self.last_price = price_data["price"]
+                            self.price_buffer.append(price_data)
+                            
+                            logger.info(f"[DBSEC] K200 선물: {price_data['price']:.2f}₩ ({price_data['change_rate']:+.2f}%) Vol: {price_data['volume']:,}")
+                            
+                            # Check for alerts
+                            await self.check_and_alert(price_data)
+                            consecutive_failures = 0  # Reset failure count on success
+                        else:
+                            consecutive_failures += 1
+                            logger.warning(f"[DBSEC] Failed to get price data ({consecutive_failures}/{max_consecutive_failures})")
+                            
+                            # If too many failures, increase poll interval temporarily
+                            if consecutive_failures >= max_consecutive_failures:
+                                logger.error(f"[DBSEC] Too many consecutive failures, backing off to {self.poll_interval * 2}s interval")
+                                await asyncio.sleep(self.poll_interval)  # Extra delay
+                                
+                    except Exception as api_error:
+                        consecutive_failures += 1
+                        logger.error(f"[DBSEC] API error ({consecutive_failures}/{max_consecutive_failures}): {api_error}")
                         
-                        logger.info(f"[DBSEC] KODEX 200 ETF: {price_data['price']:.2f}₩ ({price_data['change_rate']:+.2f}%)")
-                        
-                        # Check for alerts
-                        await self.check_and_alert(price_data)
-                    else:
-                        logger.warning("[DBSEC] Failed to get price data")
-                elif current_session == "CLOSED":
+                elif current_session == "CLOSED" or is_holiday:
                     # Reset daily open price when market is closed
                     if self.daily_open_price is not None:
                         logger.info("[DBSEC] Market closed, resetting daily prices")
                         self.daily_open_price = None
-                    logger.debug("[DBSEC] Market closed, waiting...")
+                        consecutive_failures = 0  # Reset on market close
+                    
+                    if is_holiday:
+                        logger.debug("[DBSEC] Holiday detected, waiting...")
+                    else:
+                        logger.debug("[DBSEC] Market closed, waiting...")
+                        
+                # NIGHT 세션은 이제 위에서 처리됨 (K200 선물은 야간거래 포함)
                 else:
-                    # Night session or other - skip for KR ETF
-                    logger.debug(f"[DBSEC] Skipping {current_session} session for KR ETF")
+                    logger.debug(f"[DBSEC] Unknown session: {current_session}")
                         
             except Exception as e:
-                logger.error(f"[DBSEC] Polling error: {e}")
+                logger.error(f"[DBSEC] Polling loop error: {e}", exc_info=True)
+                consecutive_failures += 1
                 
-            # Wait for next poll
-            await asyncio.sleep(self.poll_interval)
+            # Wait for next poll - adaptive interval based on failures
+            poll_delay = self.poll_interval
+            if consecutive_failures >= max_consecutive_failures:
+                poll_delay = self.poll_interval * 2  # Double interval on persistent failures
+                
+            await asyncio.sleep(poll_delay)
             
     async def stop_polling(self):
         """Stop polling"""
