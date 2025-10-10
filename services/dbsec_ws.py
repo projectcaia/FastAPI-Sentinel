@@ -88,7 +88,7 @@ class KOSPI200FuturesMonitor:
         self.sentinel_key = os.getenv("SENTINEL_KEY", "").strip()
 
         poll_minutes_env = os.getenv("DBSEC_POLL_MINUTES", "").strip()
-        self.poll_minutes: int = 30
+        self.poll_minutes: int = 30  # 30분마다 재확인
         if poll_minutes_env:
             try:
                 self.poll_minutes = max(1, int(poll_minutes_env))
@@ -222,16 +222,16 @@ class KOSPI200FuturesMonitor:
 
             except asyncio.TimeoutError:
                 self.is_connected = False
-                await self._apply_backoff("WebSocket timeout", base=2, cap=60)
+                # 타임아웃 시 더 긴 대기 시간 (30분)
+                logger.warning("[DBSEC] WebSocket timeout - waiting 30 minutes before retry")
+                await self._sleep_until_poll()
                 continue
 
             except (WebSocketConnectionClosedException, WebSocketException) as exc:
                 self.is_connected = False
-                await self._apply_backoff(
-                    f"WebSocket connection lost: {exc}",
-                    base=2,
-                    cap=60,
-                )
+                logger.warning(f"[DBSEC] WebSocket connection lost: {exc} - waiting 30 minutes")
+                await self._sleep_until_poll()
+                continue
 
             except asyncio.CancelledError:
                 raise
@@ -276,7 +276,7 @@ class KOSPI200FuturesMonitor:
         })
         ws_url = urlunparse(parsed_url._replace(query=urlencode(query_params)))
 
-        logger.info("Connecting to WebSocket: %s", redact_ws_url(ws_url))
+        logger.debug("Connecting to WebSocket: %s", redact_ws_url(ws_url))
 
         headers: Dict[str, str] = {}
         send_auth_header = os.getenv("DBSEC_WS_SEND_AUTH_HEADER", "false").lower() in ("1", "true", "yes")
@@ -294,7 +294,7 @@ class KOSPI200FuturesMonitor:
             websocket.create_connection,
             ws_url,
             header=header_list,
-            timeout=30,
+            timeout=60,  # 연결 타임아웃을 60초로 증가
             enable_multithread=True,
         )
 
@@ -305,7 +305,7 @@ class KOSPI200FuturesMonitor:
         logger.info("WebSocket connected successfully")
 
         # Ensure recv does not block forever
-        await asyncio.to_thread(ws.settimeout, 30)
+        await asyncio.to_thread(ws.settimeout, 60)  # recv 타임아웃도 60초로
 
         try:
             # Subscribe to KOSPI200 futures
@@ -393,9 +393,9 @@ class KOSPI200FuturesMonitor:
             
             # Log raw message structure for debugging (first few times)
             if len(self.tick_buffer) < 5:
-                logger.info(f"[DBSEC] Raw message keys: {list(data.keys())}")
+                logger.debug(f"[DBSEC] Raw message keys: {list(data.keys())}")
                 if 'header' in data:
-                    logger.info(f"[DBSEC] Header: {data['header']}")
+                    logger.debug(f"[DBSEC] Header: {data['header']}")
             
             # Parse futures data (format depends on DB증권 API)
             tick_data = await self._parse_tick_data(data)

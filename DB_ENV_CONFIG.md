@@ -29,8 +29,9 @@ DB_API_BASE=https://openapi.dbsec.co.kr:8443   # REST API URL
 ### 5. 모니터링 설정
 ```bash
 DBSEC_ENABLE=true              # DB증권 모듈 활성화
-DBSEC_POLL_MINUTES=5           # 휴장 시 재확인 주기 (분)
-DBSEC_WS_SEND_AUTH_HEADER=true # WebSocket 인증 헤더 포함
+DBSEC_POLL_MINUTES=30          # 재연결 시도 주기 (30분 권장)
+DBSEC_WS_SEND_AUTH_HEADER=false # WebSocket 인증 헤더 불필요
+LOG_LEVEL=INFO                 # 로그 레벨 (INFO 권장)
 ```
 
 ### 6. Sentinel 통합

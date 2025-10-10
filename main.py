@@ -97,7 +97,7 @@ TELEGRAM_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 SENTINEL_KEY      = os.getenv("SENTINEL_KEY", "")  # x-sentinel-key 로 사용
 SENTINEL_ACTIONS_BASE = os.getenv("SENTINEL_ACTIONS_BASE", "https://fastapi-sentinel-production.up.railway.app").strip()
-LOG_LEVEL         = os.getenv("LOG_LEVEL", "DEBUG").upper()  # Changed to DEBUG for detailed logging
+LOG_LEVEL         = os.getenv("LOG_LEVEL", "INFO").upper()  # INFO level for production
 CAIA_VERBOSE      = os.getenv("CAIA_VERBOSE", "0") == "1"   # 0:요약로그, 1:상세로그
 
 # 타임아웃/폴링 ENV (필요 시 조정)
@@ -117,6 +117,13 @@ ALERT_CAP         = _env_int("ALERT_CAP", 2000)
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger("sentinel-fastapi-v2")
+
+# Disable verbose logging from httpx, httpcore, and websocket libraries
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("websocket").setLevel(logging.WARNING)
+logging.getLogger("httpcore.connection").setLevel(logging.WARNING)
+logging.getLogger("httpcore.http11").setLevel(logging.WARNING)
 
 log.info("ENV: OPENAI=%s ASSIST=%s TG=%s KEY=%s INBOX=%s", 
          "SET" if OPENAI_API_KEY else "NO",
