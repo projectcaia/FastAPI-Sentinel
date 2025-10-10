@@ -88,16 +88,6 @@ from fastapi import FastAPI, Header, Request, Query
 
 APP_VERSION = "sentinel-fastapi-v2-1.4.1-patched"
 
-app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
-
-# Include DB증권 router
-try:
-    from routers.dbsec import router as dbsec_router
-    app.include_router(dbsec_router)
-    log.info("DB증권 router included successfully")
-except Exception as e:
-    log.warning("Failed to include DB증권 router: %s", e)
-
 # ── ENV ──────────────────────────────────────────────────────────────
 OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY", "")
 ASSISTANT_ID      = os.getenv("CAIA_ASSISTANT_ID", "")
@@ -126,6 +116,21 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log = logging.getLogger("sentinel-fastapi-v2")
 
+app = FastAPI(title="Sentinel FastAPI v2", version=APP_VERSION)
+
+# ── DB증권 Router Integration (로그 설정 이후) ────────────────────────
+DBSEC_ENABLE = os.getenv("DBSEC_ENABLE", "false").lower() in ["true", "1", "yes"]
+if DBSEC_ENABLE:
+    try:
+        from routers.dbsec import router as dbsec_router
+        app.include_router(dbsec_router)
+        log.info("✅ DB증권 K200 선물지수 모니터링 활성화")
+    except Exception as e:
+        log.warning("⚠️ DB증권 라우터 포함 실패: %s", e)
+        log.info("🔄 기존 센티넬 시스템은 정상 작동합니다")
+else:
+    log.info("🚫 DB증권 모니터링 비활성화")
+
 # Disable verbose logging from httpx, httpcore, and websocket libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -153,19 +158,7 @@ def within_dedup(idx: str, lvl: str) -> bool:
     _last_fired[k] = now
     return False
 
-# ── DB증권 Router Integration ────────────────────────────────────────
-# DB증권 기능은 환경변수로 제어 (기본값: 비활성화)
-DBSEC_ENABLE = os.getenv("DBSEC_ENABLE", "false").lower() in ["true", "1", "yes"]
-if DBSEC_ENABLE:
-    try:
-        from routers.dbsec import router as dbsec_router
-        app.include_router(dbsec_router)
-        log.info("✅ DB증권 K200 선물지수 모니터링 활성화")
-    except Exception as e:
-        log.warning("⚠️ DB증권 라우터 포함 실패: %s", e)
-        log.info("🔄 기존 센티넬 시스템은 정상 작동합니다")
-else:
-    log.info("🚫 DB증권 모니터링 비활성화 (DBSEC_ENABLE=false)")
+# ── DB증권 Router Integration은 위에서 처리됨 ────────────────────────
 
 # ── Utils ────────────────────────────────────────────────────────────
 
