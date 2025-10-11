@@ -1,0 +1,137 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔧 SENTINEL 필수 환경 변수 - Railway 설정용
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─────────────────────────────────────────────────────────────┐
+│ 1️⃣  SENTINEL (메인 서버) - 4개만                              │
+└─────────────────────────────────────────────────────────────┘
+
+LOG_LEVEL=INFO
+DBSEC_ROUTER_ENABLE=false
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+
+
+┌─────────────────────────────────────────────────────────────┐
+│ 2️⃣  SENTINEL-WORKER (감시자) - 12개                           │
+└─────────────────────────────────────────────────────────────┘
+
+# === 기본 설정 ===
+LOG_LEVEL=INFO
+FORCE_MARKET_OPEN=true
+WATCH_INTERVAL_SEC=180
+
+# === VIX 필터 ===
+VIX_FILTER_THRESHOLD=0.8
+
+# === K200 선물 (DB증권 API) ===
+DBSEC_ENABLE=true
+K200_CHECK_INTERVAL_MIN=30
+DB_FUTURES_CODE=101RB000
+DB_API_BASE=https://openapi.dbsec.co.kr:8443
+DB_APP_KEY=your_db_app_key
+DB_APP_SECRET=your_db_app_secret
+
+# === Sentinel 연결 ===
+SENTINEL_BASE_URL=https://your-sentinel-url.railway.app
+SENTINEL_KEY=your_sentinel_auth_key
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🚨 가장 중요한 변수 (Sentinel-Worker)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔴 FORCE_MARKET_OPEN=true
+   → 야간 선물 감시(18:00-05:00)를 위해 반드시 true!
+   → false면 야간 선물 놓침!
+
+⏱️  WATCH_INTERVAL_SEC=180
+   → 3분 주기 권장 (1800은 너무 느림)
+
+📊 K200_CHECK_INTERVAL_MIN=30
+   → 30분 주기로 K200 선물 체크
+
+🔑 DB_FUTURES_CODE=101RB000
+   → 분기별 업데이트 필요! (최근월물)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📋 빠른 복사용 템플릿
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+┌─ Sentinel (메인 서버) ─────────────────────────────────────┐
+│                                                              │
+│ LOG_LEVEL=INFO                                               │
+│ DBSEC_ROUTER_ENABLE=false                                    │
+│ TELEGRAM_BOT_TOKEN=                                          │
+│ TELEGRAM_CHAT_ID=                                            │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+
+┌─ Sentinel-Worker (감시자) ────────────────────────────────┐
+│                                                              │
+│ LOG_LEVEL=INFO                                               │
+│ FORCE_MARKET_OPEN=true                                       │
+│ WATCH_INTERVAL_SEC=180                                       │
+│ VIX_FILTER_THRESHOLD=0.8                                     │
+│ DBSEC_ENABLE=true                                            │
+│ K200_CHECK_INTERVAL_MIN=30                                   │
+│ DB_FUTURES_CODE=101RB000                                     │
+│ DB_API_BASE=https://openapi.dbsec.co.kr:8443                 │
+│ DB_APP_KEY=                                                  │
+│ DB_APP_SECRET=                                               │
+│ SENTINEL_BASE_URL=                                           │
+│ SENTINEL_KEY=                                                │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📝 설정 순서
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Sentinel 서비스 먼저 배포
+   - 4개 환경 변수 설정
+   - Public URL 확인 (예: https://sentinel-prod-1234.railway.app)
+
+2. Sentinel-Worker 서비스 배포
+   - 12개 환경 변수 설정
+   - SENTINEL_BASE_URL에 위의 URL 입력
+
+3. 배포 확인
+   - Sentinel: /health 엔드포인트 접속
+   - Worker: 로그에서 "시장 체크 시작" 확인
+
+4. 야간 테스트 (18:00-05:00)
+   - 로그에서 "K200 선물 체크 시작" 확인
+   - 텔레그램 알림 수신 확인
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ 배포 체크리스트
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Sentinel (메인 서버):
+☐ LOG_LEVEL=INFO
+☐ DBSEC_ROUTER_ENABLE=false (중요!)
+☐ TELEGRAM_BOT_TOKEN
+☐ TELEGRAM_CHAT_ID
+
+Sentinel-Worker (감시자):
+☐ LOG_LEVEL=INFO
+☐ FORCE_MARKET_OPEN=true (가장 중요!)
+☐ WATCH_INTERVAL_SEC=180 (3분)
+☐ VIX_FILTER_THRESHOLD=0.8
+☐ DBSEC_ENABLE=true
+☐ K200_CHECK_INTERVAL_MIN=30
+☐ DB_FUTURES_CODE=101RB000 (최근월물 확인!)
+☐ DB_API_BASE=https://openapi.dbsec.co.kr:8443
+☐ DB_APP_KEY
+☐ DB_APP_SECRET
+☐ SENTINEL_BASE_URL (Sentinel URL)
+☐ SENTINEL_KEY
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+작성일: 2025-10-10
+버전: 1.0
