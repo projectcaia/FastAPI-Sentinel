@@ -553,12 +553,24 @@ def check_and_alert():
     state["last_checked_at"] = _now_kst_iso()
     state["last_session"] = sess
     
-    # K200 선물 체크 (30분에 한 번)
+    # K200 선물 체크 (30분에 한 번) - 주간+야간 모두 감시
     last_k200_check = state.get("last_k200_check", 0)
     now_ts = time.time()
     k200_check_needed = (now_ts - last_k200_check) >= (K200_CHECK_INTERVAL * 60)
     
-    if K200_FUTURES_ENABLED and k200_check_needed and sess in ["KR", "FUTURES"]:
+    # K200 선물 거래 시간 체크: 주간(09:00-15:30) + 야간(18:00-05:00)
+    now_kst = _now_kst()
+    hhmm = now_kst.hour * 100 + now_kst.minute
+    is_night_session = (hhmm >= 1800) or (hhmm < 500)  # 18:00-05:00
+    is_day_session = (900 <= hhmm <= 1530)             # 09:00-15:30
+    k200_trading_hours = is_day_session or is_night_session
+    
+    # 주말/공휴일 체크 - K200 선물도 쉬는 날
+    is_weekend = now_kst.weekday() >= 5
+    kr_holidays = [(1, 1), (3, 1), (5, 5), (6, 6), (8, 15), (10, 3), (12, 25)]
+    is_holiday = (now_kst.month, now_kst.day) in kr_holidays
+    
+    if K200_FUTURES_ENABLED and k200_check_needed and k200_trading_hours and not is_weekend and not is_holiday:
         log.info("📊 K200 선물 체크 시작...")
         try:
             k200_data = get_k200_futures_data()
@@ -607,24 +619,41 @@ def check_and_alert():
     current_time = time.time()
     force_alert = (current_time - last_alert_time) > (FORCE_ALERT_INTERVAL * 3600)
     
-    if sess == "CLOSED" and not FORCE_MARKET_OPEN:
-        log.info("시장 휴장 중 - 감시 스킵 (강제 모드 비활성화)")
-        _save_state(state)
-        return
-    elif sess == "CLOSED" and FORCE_MARKET_OPEN:
-        # 강제 모드에서는 미국 시장 감시
-        log.info("🔴 강제 모드: 휴장 중에도 미국 시장 감시")
-        sess = "US"
+    # 휴장일 체크 (주말/공휴일/CLOSED 세션)
+    if sess == "CLOSED":
+        # 주말인지 확인
+        if now_kst.weekday() >= 5:
+            log.info("주말 휴장 - 모든 시장 감시 중단")
+            _save_state(state)
+            return
+        
+        # 공휴일인지 확인
+        if (now_kst.month, now_kst.day) in kr_holidays:
+            log.info("공휴일 휴장 - 모든 시장 감시 중단")
+            _save_state(state)
+            return
+        
+        # FORCE_MARKET_OPEN 체크 (테스트 모드용)
+        if not FORCE_MARKET_OPEN:
+            log.info("시장 휴장 중 - 감시 스킵 (강제 모드 비활성화)")
+            _save_state(state)
+            return
+        else:
+            log.warning("⚠️ 테스트 모드: FORCE_MARKET_OPEN=true - 휴장 시간에도 감시")
+            # 테스트 모드에서도 휴장 시간에는 감시 안 함
+            log.info("휴장 시간 - 감시 중단")
+            _save_state(state)
+            return
     
     # 세션별 심볼 선택
     if sess == "KR":
-        symbols = KR_SPOT_PRIORITY[:1]  # KOSPI만 (K200선물은 DB증권 API가 담당)
+        symbols = KR_SPOT_PRIORITY  # 한국 지수들 (KOSPI, KODEX, TIGER, KS200)
         session_name = "한국 정규장"
     elif sess == "US":
-        symbols = US_SPOT
+        symbols = US_SPOT  # S&P 500, NASDAQ, VIX
         session_name = "미국 정규장"
     elif sess == "FUTURES":
-        symbols = FUTURES_SYMBOLS  # 미국선물만 (K200선물은 DB증권 API)
+        symbols = FUTURES_SYMBOLS  # 미국 선물 (ES, NQ)
         session_name = "선물 시장 (미국)"
     else:
         _save_state(state)
