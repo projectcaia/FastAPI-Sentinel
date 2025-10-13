@@ -70,7 +70,10 @@ def human_name(sym: str) -> str:
     return HUMAN_NAMES.get(sym, sym)
 
 # 심볼 정의
-KR_SPOT_PRIORITY = ["^KS11", "069500.KS", "102110.KS", "^KS200"]
+# 한국 시장: 주요 지수만 감시 (ETF는 보조용으로만 사용)
+KR_MAIN_INDEX = "^KS11"  # KOSPI 메인
+KR_ETF_BACKUP = ["069500.KS", "102110.KS"]  # KODEX, TIGER - KOSPI 데이터 없을 때만
+KR_SPOT_PRIORITY = ["^KS11", "069500.KS", "102110.KS", "^KS200"]  # 호환성 유지
 US_SPOT = ["^GSPC", "^IXIC", "^VIX"]
 FUTURES_SYMBOLS = ["ES=F", "NQ=F"]
 
@@ -176,7 +179,7 @@ def get_k200_futures_data() -> dict | None:
         )
         
         if token_resp.status_code != 200:
-            log.error("DB증권 토큰 발급 실패: %s", token_resp.status_code)
+            log.error("DB증권 토큰 발급 실패: %s - %s", token_resp.status_code, token_resp.text[:200])
             return None
             
         token_data = token_resp.json()
@@ -214,7 +217,8 @@ def get_k200_futures_data() -> dict | None:
         )
         
         if resp.status_code != 200:
-            log.error("K200 선물 가격 조회 실패: %s", resp.status_code)
+            log.error("K200 선물 가격 조회 실패: %s - 종목코드:%s - %s", 
+                     resp.status_code, K200_FUTURES_CODE, resp.text[:200])
             return None
         
         data = resp.json()
@@ -272,7 +276,7 @@ def get_market_data(symbol: str) -> dict | None:
         url = "https://query2.finance.yahoo.com/v7/finance/quote"
         params = {
             "symbols": symbol,
-            "fields": "regularMarketPrice,regularMarketOpen,regularMarketPreviousClose,regularMarketDayHigh,regularMarketDayLow,regularMarketChangePercent",
+            "fields": "regularMarketPrice,regularMarketOpen,regularMarketPreviousClose,regularMarketDayHigh,regularMarketDayLow,regularMarketChangePercent,regularMarketTime",
             "crumb": str(int(time.time()))
         }
         r = _http_get(url, params=params)
@@ -281,6 +285,15 @@ def get_market_data(symbol: str) -> dict | None:
         items = data.get("quoteResponse", {}).get("result", [])
         if items:
             q = items[0]
+            market_time = q.get("regularMarketTime", 0)
+            
+            # 데이터 신선도 체크 (6시간 이상 오래된 데이터는 무시)
+            now_ts = time.time()
+            if market_time > 0 and (now_ts - market_time) > (6 * 3600):
+                log.warning("%s: 오래된 데이터 감지 (%.1f시간 전) - 무시", 
+                           symbol, (now_ts - market_time) / 3600)
+                return None
+            
             return {
                 "current": q.get("regularMarketPrice"),
                 "open": q.get("regularMarketOpen"),
@@ -288,7 +301,7 @@ def get_market_data(symbol: str) -> dict | None:
                 "high": q.get("regularMarketDayHigh"),
                 "low": q.get("regularMarketDayLow"),
                 "change_pct": q.get("regularMarketChangePercent"),
-                "timestamp": time.time()
+                "timestamp": market_time or time.time()
             }
     except Exception as e:
         log.debug("Quote API 실패(%s): %s", symbol, e)
@@ -515,19 +528,38 @@ def current_session() -> str:
     if 900 <= hhmm <= 1530:
         return "KR"
     
-    # 미국 정규장 (서머타임): 22:30 ~ 05:00
-    # 미국 정규장 (표준시): 23:30 ~ 06:00
+    # 미국 시장 휴장일 체크 (주말 제외는 이미 위에서 처리)
+    # 미국 주요 공휴일 (2025년 기준)
+    us_holidays = [
+        (1, 1),   # New Year's Day
+        (1, 20),  # Martin Luther King Jr. Day (3rd Monday)
+        (2, 17),  # Presidents Day (3rd Monday)
+        (4, 18),  # Good Friday
+        (5, 26),  # Memorial Day (Last Monday)
+        (7, 4),   # Independence Day
+        (9, 1),   # Labor Day (1st Monday)
+        (11, 27), # Thanksgiving (4th Thursday)
+        (12, 25), # Christmas
+    ]
+    
+    # 미국 공휴일 체크 (월요일 새벽은 전날 = 일요일 휴장)
+    # 예: 월요일 새벽 3시는 일요일 밤이므로 미국장 CLOSED
+    is_us_holiday = (now.month, now.day) in us_holidays
+    
+    # 미국 정규장 시간대 체크
     month = now.month
-    is_dst = 3 <= month <= 11
+    is_dst = 3 <= month <= 11  # 서머타임
     
     if is_dst:
-        if (hhmm >= 2230) or (hhmm < 500):
-            return "US"
+        us_trading_time = (hhmm >= 2230) or (hhmm < 500)  # 22:30 ~ 05:00
     else:
-        if (hhmm >= 2330) or (hhmm < 600):
-            return "US"
+        us_trading_time = (hhmm >= 2330) or (hhmm < 600)  # 23:30 ~ 06:00
     
-    # 선물 시간
+    # 미국장 시간대이고 휴장일이 아닐 때만 US 세션
+    if us_trading_time and not is_us_holiday:
+        return "US"
+    
+    # 선물 시간 (15:30 ~ 22:30)
     if 1530 < hhmm < 2230:
         return "FUTURES"
     
@@ -618,7 +650,9 @@ def check_and_alert():
     
     # 세션별 심볼 선택
     if sess == "KR":
-        symbols = KR_SPOT_PRIORITY[:1]  # KOSPI만 (K200선물은 DB증권 API가 담당)
+        # 한국 시장: KOSPI 메인, ETF는 백업용
+        # KOSPI 데이터 먼저 시도, 실패시 ETF 사용
+        symbols = [KR_MAIN_INDEX]  # KOSPI만
         session_name = "한국 정규장"
     elif sess == "US":
         symbols = US_SPOT
@@ -646,6 +680,29 @@ def check_and_alert():
                 else:
                     ndx_delta = data["change_pct"]
                 max_index_move = max(max_index_move, abs(data["change_pct"]))
+    
+    # 한국 시장 특별 처리: KOSPI 실패시 ETF 백업
+    if sess == "KR":
+        kospi_data = get_market_data(KR_MAIN_INDEX)
+        if not kospi_data or kospi_data.get("current") is None:
+            log.warning("⚠ KOSPI 데이터 수집 실패 - ETF 백업 시도")
+            # ETF로 백업
+            for etf_symbol in KR_ETF_BACKUP:
+                etf_data = get_market_data(etf_symbol)
+                if etf_data and etf_data.get("current") is not None:
+                    log.info("✓ %s 백업 데이터 사용", human_name(etf_symbol))
+                    kospi_data = etf_data
+                    # KOSPI 이름으로 처리
+                    break
+        
+        # KOSPI 데이터가 있으면 처리
+        if kospi_data and kospi_data.get("current") is not None:
+            # 한국 지수는 한 번만 처리 (중복 알림 방지)
+            symbols = [KR_MAIN_INDEX]
+        else:
+            log.error("⚠ 한국 시장 데이터 전체 수집 실패")
+            _save_state(state)
+            return
     
     # 각 심볼 감시
     for symbol in symbols:
