@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# Environment Variables (실제 키 포함)
+.env
+.env.local
+.env.*.local
+RAILWAY_ENV_*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+market_watcher.log
+market_watcher_bg.log
+system_fix.log
+
+# State Files
+market_state.json
+
+# OS
+.DS_Store
+Thumbs.db

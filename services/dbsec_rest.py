@@ -50,11 +50,29 @@ class K200FuturesPoller:
             token_manager = get_token_manager()
             if not token_manager:
                 logger.error("[DBSEC] Token manager not available")
+                # DB API 연결 실패 알림
+                await self.send_alert({
+                    "symbol": "K200F",
+                    "level": "ERROR",
+                    "change": 0,
+                    "price": 0,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "error_message": "DB API 연결 실패 - Token Manager 초기화 안 됨"
+                })
                 return None
 
             token = await token_manager.get_token()
             if not token:
                 logger.error("[DBSEC] Failed to get access token")
+                # DB API 토큰 발급 실패 알림
+                await self.send_alert({
+                    "symbol": "K200F",
+                    "level": "ERROR",
+                    "change": 0,
+                    "price": 0,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "error_message": "DB API 토큰 발급 실패"
+                })
                 return None
 
             endpoint_path = os.getenv(
@@ -233,7 +251,22 @@ class K200FuturesPoller:
                     logger.error(f"[DBSEC] No valid current price found in response fields: {list(output.keys())}")
                     # 응답 전체 로깅으로 디버깅
                     logger.error(f"[DBSEC] Full response for debugging: {output}")
+                    
+                    # DB API 파싱 실패 알림 전송
+                    await self.send_alert({
+                        "symbol": "K200F",
+                        "level": "ERROR",
+                        "change": 0,
+                        "price": 0,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "error_message": "DB 응답 파싱 오류 - 가격 필드를 찾을 수 없음"
+                    })
                     return None
+                
+                # open_price fallback 개선
+                if open_price <= 0:
+                    logger.warning(f"[DBSEC] No valid open price found, using current_price as fallback")
+                    open_price = current_price  # current_price를 fallback으로 사용
 
                 # Store daily open price
                 if not self.daily_open_price and open_price > 0:
@@ -358,6 +391,12 @@ class K200FuturesPoller:
             if not sentinel_url:
                 logger.warning("[DBSEC] SENTINEL_BASE_URL not configured")
                 return
+            
+            # 에러 메시지 처리
+            if alert_data.get("error_message"):
+                note = f"⚠️ {alert_data['error_message']}"
+            else:
+                note = f"K200 선물 {'상승' if alert_data['change'] > 0 else '하락'} {abs(alert_data['change']):.2f}% (DB증권)"
                 
             # Format for Sentinel (기존 market_watcher와 동일한 형식)
             payload = {
@@ -366,7 +405,7 @@ class K200FuturesPoller:
                 "level": alert_data["level"],
                 "delta_pct": round(alert_data["change"], 2),
                 "triggered_at": alert_data["timestamp"],
-                "note": f"K200 선물 {'상승' if alert_data['change'] > 0 else '하락'} {abs(alert_data['change']):.2f}% (DB증권)",
+                "note": note,
                 "kind": "FUTURES",
                 "source": "dbsec_api"  # 소스 구분
             }
