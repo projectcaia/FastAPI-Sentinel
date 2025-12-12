@@ -1,247 +1,310 @@
-# 센티넬 시스템 배포 가이드
+# Sentinel 배포 가이드
 
-## 🚀 Railway 배포 필수 환경변수
+## 🎯 배포 전 체크리스트
 
-### 1. OpenAI & Assistant (필수)
+- [ ] PR 생성 및 메인 브랜치 병합 완료
+- [ ] Railway 환경변수 설정 완료
+- [ ] Cron Job 설정 확인
+- [ ] 배포 후 테스트 준비
+
+---
+
+## 📋 Railway 환경변수 설정
+
+### 1️⃣ Sentinel (Main API) 프로젝트
+
+Railway Dashboard → FastAPI-Sentinel 프로젝트 → Variables 탭
+
+**아래 변수들을 Railway Variables에 입력:**
+
 ```bash
-OPENAI_API_KEY=sk-proj-...
-CAIA_ASSISTANT_ID=asst_...
-CAIA_THREAD_ID=thread_...  # 고정 스레드 사용 권장
-```
-
-### 2. Telegram 알림 (필수)
-```bash
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-```
-
-### 3. Sentinel 설정
-```bash
+OPENAI_API_KEY=[현재 사용 중인 OpenAI API 키]
+CAIA_ASSISTANT_ID=[현재 사용 중인 Assistant ID]
+CAIA_THREAD_ID=[현재 사용 중인 Thread ID]
+CAIA_PUSH_MODE=telegram
+TELEGRAM_BOT_TOKEN=[현재 사용 중인 Bot Token]
+TELEGRAM_CHAT_ID=[현재 사용 중인 Chat ID]
+HUB_URL=https://connector-hub-production.up.railway.app/bridge/ingest
+CONNECTOR_SECRET=[현재 사용 중인 Connector Secret]
 SENTINEL_BASE_URL=https://fastapi-sentinel-production.up.railway.app
-SENTINEL_KEY=your_secret_key  # 선택사항
+WATCH_INTERVAL_SEC=1800
+WATCHER_STATE_PATH=./market_state.json
+DEDUP_WINDOW_MIN=30
+USE_PROXY_TICKERS=true
+BOLL_K_SIGMA=2.0
+BOLL_WINDOW=20
+DB_API_BASE=https://openapi.dbsec.co.kr:8443
+DB_APP_KEY=[현재 사용 중인 DB API Key]
+DB_APP_SECRET=[현재 사용 중인 DB API Secret]
+DB_SCOPE=oob
+DBSEC_ROUTER_ENABLE=false
 LOG_LEVEL=INFO
 ```
 
-### 4. DB증권 K200 선물 감시 (필수)
-```bash
-# DB증권 API 인증
-DB_APP_KEY=your_db_app_key
-DB_APP_SECRET=your_db_app_secret
+**중요**: 
+- `DBSEC_ROUTER_ENABLE=false` - 메인 API에서는 DB증권 라우터 비활성화
+- Caia Agent는 Actions GPT로 동작하므로 별도 URL 불필요
+- **[현재 사용 중인 ...]** 부분은 기존 Railway Variables에서 복사해서 사용
 
-# DB증권 모듈 활성화
+---
+
+### 2️⃣ Sentinel Worker (Cron Job) 프로젝트
+
+Railway Dashboard → Sentinel Worker 프로젝트 → Variables 탭
+
+**Sentinel (Main API)의 모든 변수 + 아래 Worker 전용 변수 추가:**
+
+```bash
+# === 위의 Sentinel Main API 변수 모두 포함 ===
+
+# === Worker 전용 추가 변수 ===
+DATA_PROVIDERS=alphavantage,yfinance,yahoo
+ALPHAVANTAGE_API_KEY=[현재 사용 중인 AlphaVantage API Key]
+YF_ENABLED=true
+SEND_MODE=on_change
+BRIDGE_MODE=hub
+ALIGN_SLOTS=true
 DBSEC_ENABLE=true
-DBSEC_USE_REST=true  # REST API 모드 (WebSocket 대신)
-
-# 폴링 간격 설정 (초)
-DB_POLL_INTERVAL_SEC=180  # 3분 간격 (기본값)
-
-# 알림 임계값 (기존 시스템과 동일)
-DB_ALERT_THRESHOLD=1.5  # LV2: 1.5%
-DB_WARN_THRESHOLD=0.8   # LV1: 0.8%
+DB_FUTURES_CODE=101C6000
+K200_CHECK_INTERVAL_MIN=30
+FORCE_MARKET_OPEN=false
+VIX_FILTER_THRESHOLD=0.6
 ```
 
-### 5. Market Watcher 설정
+**중요**:
+- `DBSEC_ENABLE=true` - Worker에서 DB증권 API 활성화
+- `DB_FUTURES_CODE=101C6000` - 현재 선물 종목 코드 (분기별 업데이트 필요)
+- **[현재 사용 중인 ...]** 부분은 기존 Railway Variables에서 복사해서 사용
+
+---
+
+## 🚀 배포 순서
+
+### Step 1: PR 병합
 ```bash
-# 감시 간격
-WATCH_INTERVAL_SEC=180  # 3분 (DB증권과 동일)
-
-# VIX 필터
-VIX_FILTER_THRESHOLD=0.6  # 지수 0.6% 이상 변동시 VIX 감지
-
-# 강제 시장 오픈 (휴장일에도 미국장 감시)
-FORCE_MARKET_OPEN=true
+# GitHub에서 PR 확인 및 병합
+https://github.com/projectcaia/FastAPI-Sentinel/compare/main...genspark_ai_developer
 ```
 
----
+### Step 2: Railway 자동 배포 확인
+- Railway Dashboard에서 자동 배포 시작 확인
+- 빌드 로그 모니터링
+- 배포 완료 대기 (약 2-3분)
 
-## 📊 시스템 구조
+### Step 3: Cron Job 활성화 확인
+Railway Dashboard → Settings → Cron Jobs 탭에서 확인:
 
-### 센티넬 메인 (main.py)
-- **알림 수신 엔드포인트**: `/sentinel/alert`
-- **알림 조회**: `/sentinel/inbox`
-- **DB증권 상태**: `/sentinel/dbsec/health`
-- **Telegram 전송**: 모든 알림을 텔레그램으로 전송
-- **Caia AI 통합**: Assistant API로 알림 분석
-
-### DB증권 K200 선물 감시 (REST API)
-- **주간거래**: 09:00 - 15:30 KST
-- **야간거래**: 18:00 - 05:00 KST (다음날)
-- **폴링 간격**: 3분 (180초)
-- **알림 기준**:
-  - LV1: ±0.8% 이상
-  - LV2: ±1.5% 이상
-  - LV3: ±2.5% 이상
-- **중복 방지**: 동일 레벨 30분 내 중복 알림 차단
-
-### Market Watcher (별도 워커)
-- **한국 정규장** (09:00-15:30): KOSPI 현물
-- **미국 정규장** (22:30-05:00): S&P 500, NASDAQ, VIX
-- **선물 시장** (15:30-22:30): 미국 선물 (ES=F, NQ=F)
-- **강제 모드**: 휴장일에도 미국 시장 감시
-
----
-
-## 🎯 알림 형식 (개선)
-
-### ✅ 지수 중심 알림 (NEW)
-```json
-{
-  "index": "S&P 500",           // 메인: 지수명
-  "level": "LV2",
-  "delta_pct": -2.23,           // 지수 변동률
-  "note": "LV2 진입 | VIX 21.1 (+28.5%)",  // VIX는 부가정보
-  "kind": "US"
-}
+```
+Name: market-watcher
+Schedule: */30 * * * * (매 30분마다)
+Command: python market_watcher.py
+Status: Active
 ```
 
-### ❌ 기존 VIX 중심 (OLD)
-```json
-{
-  "index": "VIX",               // VIX가 메인
-  "level": "LV2",
-  "delta_pct": 28.48,          // VIX 변동률
-  "note": "VIX LV2 진입",
-  "kind": "VIX"
-}
-```
+### Step 4: 배포 검증
 
----
-
-## 🔧 Railway 배포 순서
-
-### 1. 환경변수 설정
-Railway 프로젝트 > Variables 탭에서 위의 모든 환경변수 설정
-
-### 2. Procfile 확인
-```
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
-```
-
-### 3. 배포 확인
+#### 4.1 API Health Check
 ```bash
-# Health Check
-curl https://your-project.railway.app/health
-
-# DB증권 상태 확인
-curl https://your-project.railway.app/sentinel/dbsec/health
+curl https://fastapi-sentinel-production.up.railway.app/health
+# 예상 응답: {"status":"ok","version":"..."}
 ```
 
-### 4. 로그 모니터링
-Railway 대시보드에서 로그 확인:
-- `[DBSEC] K200 선물지수 monitoring services...`
-- `[DBSEC] Starting K200 선물지수 polling (interval: 3분)`
-- `[DBSEC] K200 선물: 350.25 (+0.85%) Vol: ...`
+#### 4.2 Cron Job 실행 로그 확인
+Railway Dashboard → Deployments → Logs에서:
+```
+✅ Sentinel 시장감시 시작 (Cron Job 단일 실행)
+✅ 시장 감시 완료 - 프로세스 종료
+```
 
----
-
-## 📝 알림 테스트
-
-### 1. 수동 테스트 알림 전송
+#### 4.3 알림 테스트
 ```bash
-curl -X POST https://your-project.railway.app/sentinel/alert \
+# 테스트 알림 전송
+curl -X POST https://fastapi-sentinel-production.up.railway.app/sentinel/alert \
   -H "Content-Type: application/json" \
-  -H "x-sentinel-key: your_key" \
   -d '{
     "index": "TEST",
-    "level": "LV1",
+    "symbol": "TEST",
+    "level": "INFO",
     "delta_pct": 1.5,
-    "triggered_at": "2025-10-11T04:00:00+09:00",
-    "note": "테스트 알림"
+    "triggered_at": "2025-10-16T10:00:00Z",
+    "note": "배포 테스트",
+    "kind": "INDEX"
   }'
 ```
 
-### 2. DB증권 테스트 알림
+확인 사항:
+- [ ] Telegram 메시지 수신
+- [ ] Caia Thread에 메시지 전송
+- [ ] Hub로 전달 성공 로그
+
+---
+
+## 🔧 트러블슈팅
+
+### 문제 1: Cron Job이 실행되지 않음
+
+**확인 사항**:
 ```bash
-curl -X POST https://your-project.railway.app/sentinel/dbsec/alert/test
+# railway.json 파일 존재 확인
+ls -la railway.json
+
+# 파일 내용 확인
+cat railway.json
 ```
 
-### 3. 실제 알림 예시
-#### K200 선물 알림
-```
-📡 [LV2] K200 선물 +1.52% / ⏱ 2025-10-11T13:45:23+09:00
-📝 K200 선물 상승 1.52% (DB증권)
-```
-
-#### 미국 지수 알림 (VIX 포함)
-```
-📡 [LV2] S&P 500 -2.23% / ⏱ 2025-10-11T04:29:30+09:00
-📝 LV2 진입 | VIX 21.1 (+28.5%)
-```
+**해결책**:
+- Railway Dashboard에서 수동으로 Cron Job 추가
+- Settings → Cron Jobs → Add Cron Job
+  - Name: `market-watcher`
+  - Schedule: `*/30 * * * *`
+  - Command: `python market_watcher.py`
 
 ---
 
-## 🚨 문제 해결
+### 문제 2: DB증권 API 오류
 
-### DB증권 토큰 오류
+**확인 사항**:
 ```bash
-# 수동 토큰 갱신
-curl -X POST https://your-project.railway.app/sentinel/dbsec/token/refresh
+# 환경변수 확인
+echo $DB_APP_KEY
+echo $DB_APP_SECRET
+echo $DB_FUTURES_CODE
 ```
 
-### 알림이 오지 않음
-1. **환경변수 확인**: `DB_APP_KEY`, `DB_APP_SECRET` 설정 확인
-2. **거래 시간 확인**: 주간(09:00-15:30) 또는 야간(18:00-05:00) 시간대인지 확인
-3. **변동률 확인**: 0.8% 이상 변동해야 알림 발생
-4. **중복 방지**: 동일 레벨 30분 내 중복 알림 차단
-
-### WebSocket 타임아웃
-- `DBSEC_USE_REST=true` 설정하여 REST API 모드 사용 (권장)
-
-### K200 선물 데이터 없음
-1. **거래 시간 확인**: 주간/야간 거래 시간대인지 확인
-2. **API 로그 확인**: Railway 로그에서 `[DBSEC]` 라인 확인
-3. **선물 코드 확인**: 기본값 `101C6000` (현재 월물)
+**해결책**:
+- `DB_FUTURES_CODE` 분기별 업데이트 확인
+  - 2025년 12월물: `101C6000` 
+  - 2026년 3월물: `101RC000`
+- API 키/시크릿 재확인
+- `DBSEC_ENABLE=true` 설정 확인 (Worker만)
 
 ---
 
-## 📊 모니터링 대시보드
+### 문제 3: 알림이 전송되지 않음
 
-### Railway 로그 필터
-- `[DBSEC]` - DB증권 K200 선물 관련
-- `[market-watcher]` - Market Watcher 일반 감시
-- `[CAIA]` - AI Assistant 호출
-- `>>> 알림 전송` - 실제 알림 발송
+**확인 사항**:
+```bash
+# 로그 확인
+# Railway Dashboard → Logs
 
-### 주요 로그 메시지
+# 텔레그램 토큰 확인
+echo $TELEGRAM_BOT_TOKEN
+echo $TELEGRAM_CHAT_ID
+
+# Hub URL 확인
+echo $HUB_URL
+echo $CONNECTOR_SECRET
 ```
-✅ 정상 작동:
-[DBSEC] K200 선물: 350.25 (+0.85%) Vol: 123,456
-[DBSEC] Alert sent: K200 선물 +0.85% Level LV1
 
-⚠️ 경고:
-[DBSEC] Failed to get price data (3/5)
-[DBSEC] API request failed: 401
+**해결책**:
+1. Telegram Bot 토큰 재확인
+2. Chat ID 재확인 (숫자만)
+3. Hub URL 및 시크릿 키 재확인
+4. 네트워크 연결 상태 확인
 
-❌ 오류:
-[DBSEC] Token manager not available
-[DBSEC] Failed to initialize DB증권 services
+---
+
+### 문제 4: Worker가 종료되지 않음
+
+**증상**: Cron Job이 계속 실행 중
+
+**해결책**:
+```python
+# market_watcher.py의 run_loop() 함수가 제거되었는지 확인
+# check_and_alert_once()만 존재해야 함
+
+# 강제 종료 후 재배포
+# Railway Dashboard → Deployments → Force Redeploy
 ```
 
 ---
 
-## 🎯 성능 최적화
+## 📊 모니터링
 
-### 폴링 간격 조정
-- **빠른 감지**: `DB_POLL_INTERVAL_SEC=60` (1분)
-- **표준**: `DB_POLL_INTERVAL_SEC=180` (3분, 권장)
-- **절약 모드**: `DB_POLL_INTERVAL_SEC=300` (5분)
+### 1. Railway 로그 모니터링
+```
+Railway Dashboard → Deployments → Logs → Filter: "Sentinel"
+```
 
-### 중복 알림 제어
-- **짧게**: `alert_cooldown_minutes=15` (15분)
-- **표준**: `alert_cooldown_minutes=30` (30분, 기본값)
-- **길게**: `alert_cooldown_minutes=60` (1시간)
+주요 로그 메시지:
+- `✅ Sentinel 시장감시 시작` - Cron 실행 시작
+- `✅ 시장 감시 완료` - Cron 실행 종료
+- `❌ 시장 감시 오류` - 에러 발생
+
+### 2. Cron 실행 이력
+```
+Railway Dashboard → Settings → Cron Jobs → Executions
+```
+
+확인 항목:
+- 실행 횟수 (시간당 2회 = 정상)
+- 실행 시간 (30분 간격)
+- 성공/실패 상태
+
+### 3. 알림 도달 확인
+- Telegram 챗봇 메시지 확인
+- Caia Thread 메시지 확인
+- Hub 전달 로그 확인
+
+---
+
+## 🔄 롤백 절차
+
+긴급 상황 시 이전 버전으로 롤백:
+
+### Railway Dashboard 롤백
+1. Railway Dashboard → Deployments
+2. 이전 정상 배포 버전 선택
+3. "Redeploy" 버튼 클릭
+
+### GitHub 롤백
+```bash
+# 이전 커밋으로 롤백
+git revert HEAD
+git push origin main
+
+# 또는 특정 커밋으로 리셋
+git reset --hard <이전-커밋-해시>
+git push -f origin main
+```
+
+### Cron Job 긴급 비활성화
+```bash
+# railway.json 수정
+{
+  "cron": []  # 빈 배열로 설정
+}
+
+# 또는 Railway Dashboard에서 수동 비활성화
+Settings → Cron Jobs → market-watcher → Disable
+```
+
+---
+
+## ✅ 배포 완료 체크리스트
+
+- [ ] PR 병합 완료
+- [ ] Railway 자동 배포 성공
+- [ ] Sentinel (Main API) 환경변수 설정
+- [ ] Sentinel Worker 환경변수 설정
+- [ ] Cron Job 활성화 확인
+- [ ] Health Check API 응답 확인
+- [ ] 첫 번째 Cron 실행 로그 확인 (30분 이내)
+- [ ] 테스트 알림 전송 성공
+- [ ] Telegram 메시지 수신 확인
+- [ ] Caia Thread 메시지 확인
+- [ ] Hub 전달 로그 확인
+- [ ] DB증권 API 정상 작동 확인 (Worker)
+- [ ] 로그 레벨 및 에러 모니터링 설정
 
 ---
 
 ## 📞 지원
 
-문제가 발생하면:
-1. Railway 로그 확인
-2. Health Check 엔드포인트 호출
-3. 환경변수 재확인
-4. 수동 토큰 갱신 시도
+문제 발생 시:
+1. `CRON_SETUP_GUIDE.md` 참고
+2. Railway 로그 확인
+3. GitHub Issues 생성
+4. 긴급 시 롤백 실행
 
----
-
-**시스템 버전**: v2.0.0 (2025-10-11)  
-**업데이트**: K200 선물 감시 추가, 알림 형식 개선, 지수 중심 알림
+**배포 완료 후 24시간 모니터링 권장**

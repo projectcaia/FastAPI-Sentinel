@@ -4,6 +4,7 @@
 import os, time, json, logging, requests, math, asyncio
 from datetime import datetime, timezone, timedelta
 from collections import deque
+from zoneinfo import ZoneInfo
 
 # ==================== 설정/로그 ====================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -83,8 +84,14 @@ K200_FUTURES_CODE = os.getenv("DB_FUTURES_CODE", "101C6000").strip()
 K200_CHECK_INTERVAL = parse_int_env("K200_CHECK_INTERVAL_MIN", 30)  # 30분 기본값
 
 # ==================== 시간 유틸 ====================
+KST = ZoneInfo("Asia/Seoul")
+NYC = ZoneInfo("America/New_York")
+
 def _now_kst():
-    return datetime.now(timezone(timedelta(hours=9)))
+    return datetime.now(KST)
+
+def _now_nyc():
+    return datetime.now(NYC)
 
 def _now_kst_iso():
     return _now_kst().isoformat(timespec="seconds")
@@ -419,9 +426,51 @@ def grade_level_vix_relative(change_pct: float) -> str | None:
     if a >= 10.0: return "LV1"  # VIX 10% 이상 변화
     return None
 
+# ==================== 알림 Hint/Action 규칙 ====================
+def get_alert_hint_action(session: str, level: str | None) -> tuple[str | None, str | None]:
+    """세션과 레벨에 따른 hint/action 생성
+    
+    Args:
+        session: "KR", "KR_FUTURES", "US", "FUTURES"
+        level: "LV1", "LV2", "LV3" or None
+    
+    Returns:
+        (hint, action) 튜플
+    """
+    if not level:
+        return (None, None)
+    
+    # 한국장 (메인 감시 대상)
+    if session in ["KR", "KR_FUTURES", "FUTURES"]:
+        hints = {
+            "LV1": "If 정규장 변동 확대 → 코어 유지, 증거금/델타 체크",
+            "LV2": "If 추세 이탈 징후 → 방어 헤지 후보",
+            "LV3": "If 급변/리스크 급증 → 우선 생존(증거금/리스크 축소)"
+        }
+        actions = {
+            "LV1": "monitor_delta",
+            "LV2": "prep_hedge",
+            "LV3": "reduce_risk"
+        }
+    # 미국장 (부수 감시 - 야간 참고/리스크 시그널)
+    else:  # US
+        hints = {
+            "LV1": "If 하락 지속 + 변동성 확대 → 헤지 준비",
+            "LV2": "If 급락 확장/리스크 확대 → 방어적 헤지 고려",
+            "LV3": "If 패닉/갭다운 → 리스크 축소 + 헷지 강화"
+        }
+        actions = {
+            "LV1": "prep_hedge",
+            "LV2": "activate_hedge",
+            "LV3": "reduce_risk"
+        }
+    
+    return (hints.get(level), actions.get(level))
+
+
 # ==================== 알림 전송 ====================
 def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str = "ALERT"):
-    """알림 전송 - 지수 중심 포맷"""
+    """알림 전송 - 지수 중심 포맷 + hint/action/session/observed_at 확장"""
     is_vix = (symbol == "^VIX")
     is_k200f = (symbol == "K200F")
     
@@ -430,6 +479,20 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
         display_name = "K200 선물"
     else:
         display_name = human_name(symbol)
+    
+    # 세션 타입 결정 (hint/action 생성용)
+    if kind in ["KR", "FUTURES"]:
+        session_type = "KR_FUTURES"
+    elif kind == "US" or is_vix:
+        session_type = "US"
+    else:
+        session_type = kind
+    
+    # hint/action 생성
+    hint, action = get_alert_hint_action(session_type, level)
+    
+    # 공통 필드 (optional - 하위호환 유지)
+    observed_at_kst = _now_kst_iso()
     
     # VIX는 보조 정보로, 주요 지수 정보를 우선 표시
     if is_vix and "vix_context" in data:
@@ -443,13 +506,18 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
         primary_change = sp_change if abs(sp_change) > abs(nas_change) else nas_change
         
         payload = {
-            "index": primary_index,  # 메인: 지수명 (S&P 500 또는 NASDAQ)
+            "index": primary_index,
             "level": level or "INFO",
-            "delta_pct": round(primary_change, 2),  # 지수 변동률
+            "delta_pct": round(primary_change, 2),
             "triggered_at": _now_kst_iso(),
-            "note": f"{note} | VIX {vix_ctx['value']:.1f} ({vix_ctx['change_pct']:+.1f}%)",  # VIX는 부가정보
-            "kind": "US",  # VIX 대신 미국 시장으로
+            "note": f"{note} | VIX {vix_ctx['value']:.1f} ({vix_ctx['change_pct']:+.1f}%)",
+            "kind": "US",
             "symbol": "^GSPC" if abs(sp_change) > abs(nas_change) else "^IXIC",
+            # 확장 필드 (optional)
+            "session": "US",
+            "observed_at": observed_at_kst,
+            "hint": hint,
+            "action": action,
             "details": {
                 "sp500_change": sp_change,
                 "nasdaq_change": nas_change,
@@ -468,6 +536,11 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
             "note": note,
             "kind": kind,
             "symbol": symbol,
+            # 확장 필드 (optional)
+            "session": session_type,
+            "observed_at": observed_at_kst,
+            "hint": hint,
+            "action": action,
             "details": {
                 "current": data.get("current"),
                 "high": data.get("high"),
@@ -490,79 +563,114 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
         if not r.ok:
             log.error("알림 전송 실패 %s %s", r.status_code, r.text)
         else:
-            log.info(">>> 알림 전송: [%s] %s %s (%s)", 
-                    kind, display_name, level or "INFO", note)
+            log.info(">>> 알림 전송: [%s] %s %s (%s) hint=%s action=%s", 
+                    kind, display_name, level or "INFO", note, hint, action)
     except Exception as e:
         log.error("알림 전송 오류: %s", e)
 
 # ==================== 시장 시간 판정 ====================
+# 미국 주요 휴장일 (2025년 기준) - TODO: 매년 업데이트 필요
+US_HOLIDAYS_2025 = [
+    (1, 1),   # New Year's Day
+    (1, 20),  # Martin Luther King Jr. Day (3rd Monday)
+    (2, 17),  # Presidents Day (3rd Monday)
+    (4, 18),  # Good Friday
+    (5, 26),  # Memorial Day (Last Monday)
+    (6, 19),  # Juneteenth
+    (7, 4),   # Independence Day
+    (9, 1),   # Labor Day (1st Monday)
+    (11, 27), # Thanksgiving (4th Thursday)
+    (12, 25), # Christmas
+]
+
+# 한국 공휴일 (2025년 기준) - 실제 휴장일만 포함
+KR_HOLIDAYS_2025 = [
+    (1, 1),   # 신정
+    (1, 28), (1, 29), (1, 30),  # 설연휴
+    (3, 1),   # 삼일절
+    (5, 5),   # 어린이날 (월요일)
+    (5, 6),   # 대체공휴일
+    (6, 6),   # 현충일
+    (8, 15),  # 광복절
+    (10, 3),  # 개천절
+    (10, 6), (10, 7), (10, 8),  # 추석연휴
+    (12, 25), # 크리스마스
+]
+
+def is_us_market_open(now_nyc: datetime = None) -> bool:
+    """NYSE 정규장 오픈 여부 판정 (America/New_York 기준)
+    
+    NYSE 정규장: 월~금 09:30 ~ 16:00 (NY 현지시간)
+    주말/공휴일: 휴장
+    
+    Args:
+        now_nyc: NY 현지 시간 (None이면 현재 시간)
+    
+    Returns:
+        bool: 미국장 오픈 여부
+    """
+    if now_nyc is None:
+        now_nyc = _now_nyc()
+    
+    # NY 기준 주말 체크
+    if now_nyc.weekday() >= 5:  # 토요일(5), 일요일(6)
+        return False
+    
+    # NY 기준 공휴일 체크
+    if (now_nyc.month, now_nyc.day) in US_HOLIDAYS_2025:
+        return False
+    
+    # NY 정규장: 09:30 ~ 16:00
+    ny_hhmm = now_nyc.hour * 100 + now_nyc.minute
+    return 930 <= ny_hhmm <= 1600
+
+
 def current_session() -> str:
-    """현재 세션 판정"""
-    now = _now_kst()
+    """현재 세션 판정
     
-    # 주말
-    if now.weekday() >= 5:
-        return "CLOSED"
+    세션 우선순위:
+    1. KR (한국 정규장 09:00~15:30 KST) - 메인 감시 대상
+    2. US (미국 정규장 09:30~16:00 NY) - 부수 감시 대상  
+    3. FUTURES (한국 야간선물 18:00~05:00 KST + 미국선물)
+    4. CLOSED (휴장)
     
-    # 한국 공휴일 (간단 체크 - 필요시 확장)
-    # 2025년 기준 공휴일 목록 - 실제 휴장일만 포함
-    kr_holidays = [
-        (1, 1),   # 신정
-        (3, 1),   # 삼일절  
-        (5, 5),   # 어린이날
-        (6, 6),   # 현충일
-        (8, 15),  # 광복절
-        (10, 3),  # 개천절
-        # (10, 9),  # 한글날 - 2025년 10월 9일은 목요일이므로 휴장이 아님
-        (12, 25), # 크리스마스
-    ]
+    핵심 변경:
+    - 미국장 판정은 KST가 아닌 America/New_York 현지시간 기준
+    - 토요일 새벽(KST)도 NY 금요일 장중이면 US로 판정
+    - 월요일 새벽(KST)은 NY 일요일이므로 US 판정 안함
+    """
+    now_kst = _now_kst()
+    now_nyc = _now_nyc()
     
-    # 10월 10일은 휴장일이 아님 - 정상 거래일
-    if (now.month, now.day) in kr_holidays:
-        log.info("한국 공휴일 감지 - 시장 휴장")
-        return "CLOSED"
+    kst_hhmm = now_kst.hour * 100 + now_kst.minute
     
-    hhmm = now.hour * 100 + now.minute
+    # 1. 한국 정규장 체크 (KST 기준)
+    kr_weekday = now_kst.weekday()
+    if kr_weekday < 5:  # 평일
+        if (now_kst.month, now_kst.day) not in KR_HOLIDAYS_2025:
+            if 900 <= kst_hhmm <= 1530:
+                return "KR"
     
-    # 한국 정규장: 09:00 ~ 15:30
-    if 900 <= hhmm <= 1530:
-        return "KR"
-    
-    # 미국 시장 휴장일 체크 (주말 제외는 이미 위에서 처리)
-    # 미국 주요 공휴일 (2025년 기준)
-    us_holidays = [
-        (1, 1),   # New Year's Day
-        (1, 20),  # Martin Luther King Jr. Day (3rd Monday)
-        (2, 17),  # Presidents Day (3rd Monday)
-        (4, 18),  # Good Friday
-        (5, 26),  # Memorial Day (Last Monday)
-        (7, 4),   # Independence Day
-        (9, 1),   # Labor Day (1st Monday)
-        (11, 27), # Thanksgiving (4th Thursday)
-        (12, 25), # Christmas
-    ]
-    
-    # 미국 공휴일 체크 (월요일 새벽은 전날 = 일요일 휴장)
-    # 예: 월요일 새벽 3시는 일요일 밤이므로 미국장 CLOSED
-    is_us_holiday = (now.month, now.day) in us_holidays
-    
-    # 미국 정규장 시간대 체크
-    month = now.month
-    is_dst = 3 <= month <= 11  # 서머타임
-    
-    if is_dst:
-        us_trading_time = (hhmm >= 2230) or (hhmm < 500)  # 22:30 ~ 05:00
-    else:
-        us_trading_time = (hhmm >= 2330) or (hhmm < 600)  # 23:30 ~ 06:00
-    
-    # 미국장 시간대이고 휴장일이 아닐 때만 US 세션
-    if us_trading_time and not is_us_holiday:
+    # 2. 미국 정규장 체크 (NY 현지시간 기준) - 핵심 수정
+    if is_us_market_open(now_nyc):
         return "US"
     
-    # 선물 시간 (15:30 ~ 22:30)
-    if 1530 < hhmm < 2230:
-        return "FUTURES"
+    # 3. 선물 세션 체크 (KST 기준)
+    # 한국 야간선물: 18:00 ~ 익일 05:00
+    # 조건: KST 평일이고 공휴일이 아닐 때만
+    is_kr_futures_time = (kst_hhmm >= 1800) or (kst_hhmm < 500)
     
+    if is_kr_futures_time:
+        # 야간선물은 전날 정규장 기준 (00:00~05:00은 전날 세션)
+        if kst_hhmm < 500:
+            ref_day = now_kst.date() - timedelta(days=1)
+        else:
+            ref_day = now_kst.date()
+        
+        if ref_day.weekday() < 5 and (ref_day.month, ref_day.day) not in KR_HOLIDAYS_2025:
+            return "FUTURES"
+    
+    # 4. 그 외는 휴장
     return "CLOSED"
 
 # ==================== 메인 감시 로직 ====================
@@ -891,13 +999,16 @@ def check_and_alert():
     log.info("체크 완료")
     log.info("-"*60)
 
-# ==================== 메인 루프 ====================
-def run_loop():
+# ==================== Cron Job용 단일 실행 ====================
+async def check_and_alert_once():
+    """
+    시장 감시를 한 번만 실행하고 종료하는 함수 (Cron Job용)
+    Railway Cron Job에서 30분마다 이 스크립트를 실행
+    """
     log.info("="*60)
-    log.info("Sentinel 시장감시 시작 (실시간 변동성 모드)")
+    log.info("Sentinel 시장감시 시작 (Cron Job 단일 실행)")
     log.info("="*60)
     log.info("설정:")
-    log.info("  - 체크 간격: %d초", WATCH_INTERVAL)
     log.info("  - 전일대비: 0.8% / 1.5% / 2.5%")
     log.info("  - 일중변동: 1.0% / 2.0% / 3.0%")
     log.info("  - VIX 변화율: 10% / 20% / 30%")
@@ -905,19 +1016,14 @@ def run_loop():
     log.info("  - 변동성 윈도우: %d분", VOLATILITY_WINDOW)
     log.info("-"*60)
     
-    # 초기 체크
     try:
+        # 한 번만 체크하고 종료
         check_and_alert()
+        log.info("✅ 시장 감시 완료 - 프로세스 종료")
     except Exception as e:
-        log.error("초기 체크 실패: %s", e, exc_info=True)
-    
-    # 주기적 체크
-    while True:
-        time.sleep(WATCH_INTERVAL)
-        try:
-            check_and_alert()
-        except Exception as e:
-            log.error("주기 체크 오류: %s", e, exc_info=True)
+        log.error("❌ 시장 감시 오류: %s", e, exc_info=True)
+        raise  # 에러를 Cron Job 시스템에 전달
 
 if __name__ == "__main__":
-    run_loop()
+    # asyncio.run()을 사용하여 한 번만 실행
+    asyncio.run(check_and_alert_once())
