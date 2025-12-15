@@ -469,8 +469,67 @@ def get_alert_hint_action(session: str, level: str | None) -> tuple[str | None, 
 
 
 # ==================== 알림 전송 ====================
+def build_rich_message(level: str | None, session_type: str, data: dict, base_note: str) -> str:
+    """풍부한 알림 메시지 생성
+    
+    포맷:
+    [레벨] 기본노트
+    📊 현재가 / 변동률 / 일중변동
+    💡 전략 힌트
+    🏷️ #action_tag
+    """
+    change_pct = data.get("change_pct", 0)
+    current = data.get("current", 0)
+    volatility = data.get("volatility", {})
+    max_swing = volatility.get("max_swing", 0)
+    
+    # 방향 이모지
+    direction_emoji = "📉" if change_pct < 0 else "📈"
+    
+    # 전략 힌트 (레벨+세션 기반)
+    if session_type in ["KR", "KR_FUTURES", "FUTURES"]:
+        strategy_hints = {
+            "LV1": "💡 변동 확대 구간 → 델타/증거금 점검, 코어 유지",
+            "LV2": "⚠️ 추세 이탈 징후 → 방어 헤지 준비, 리스크 점검",
+            "LV3": "🚨 급변/고위험 → 생존 우선! 증거금 확보, 리스크 즉시 축소"
+        }
+        action_tags = {
+            "LV1": "#monitor_delta",
+            "LV2": "#prep_hedge #risk_check",
+            "LV3": "#reduce_risk #survival_mode"
+        }
+    else:  # US
+        strategy_hints = {
+            "LV1": "💡 야간 변동 확대 → 익일 갭 대비 헤지 검토",
+            "LV2": "⚠️ 리스크 시그널 → 방어적 헤지 고려",
+            "LV3": "🚨 패닉/급락 → 익일 갭다운 대비, 헤지 강화"
+        }
+        action_tags = {
+            "LV1": "#overnight_watch",
+            "LV2": "#activate_hedge",
+            "LV3": "#reduce_risk #gap_protection"
+        }
+    
+    # 메시지 빌드
+    parts = [base_note]
+    
+    # 시장 데이터 라인
+    if current > 0:
+        data_line = f"{direction_emoji} {current:,.2f} ({change_pct:+.2f}%)"
+        if max_swing >= 0.5:
+            data_line += f" | 일중 {max_swing:.1f}% 변동"
+        parts.append(data_line)
+    
+    # 전략 힌트 + 액션 태그
+    if level and level in strategy_hints:
+        parts.append(strategy_hints[level])
+        parts.append(action_tags[level])
+    
+    return "\n".join(parts)
+
+
 def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str = "ALERT"):
-    """알림 전송 - 지수 중심 포맷 + hint/action/session/observed_at 확장"""
+    """알림 전송 - 지수 중심 포맷 + 풍부한 메시지"""
     is_vix = (symbol == "^VIX")
     is_k200f = (symbol == "K200F")
     
@@ -480,7 +539,7 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
     else:
         display_name = human_name(symbol)
     
-    # 세션 타입 결정 (hint/action 생성용)
+    # 세션 타입 결정
     if kind in ["KR", "FUTURES"]:
         session_type = "KR_FUTURES"
     elif kind == "US" or is_vix:
@@ -488,32 +547,34 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
     else:
         session_type = kind
     
-    # hint/action 생성
+    # hint/action 생성 (payload용)
     hint, action = get_alert_hint_action(session_type, level)
     
-    # 공통 필드 (optional - 하위호환 유지)
+    # 공통 필드
     observed_at_kst = _now_kst_iso()
     
-    # VIX는 보조 정보로, 주요 지수 정보를 우선 표시
+    # VIX 알림
     if is_vix and "vix_context" in data:
         vix_ctx = data["vix_context"]
-        # VIX 알림에서는 S&P500과 NASDAQ 변동을 메인으로 표시
         sp_change = vix_ctx.get("sp500_change", 0)
         nas_change = vix_ctx.get("nasdaq_change", 0)
         
-        # 주요 지수명을 메인으로
         primary_index = "S&P 500" if abs(sp_change) > abs(nas_change) else "NASDAQ"
         primary_change = sp_change if abs(sp_change) > abs(nas_change) else nas_change
+        
+        # VIX용 풍부한 메시지
+        vix_data = {"change_pct": primary_change, "current": 0, "volatility": {}}
+        base_note = f"{note} | VIX {vix_ctx['value']:.1f} ({vix_ctx['change_pct']:+.1f}%)"
+        rich_note = build_rich_message(level, "US", vix_data, base_note)
         
         payload = {
             "index": primary_index,
             "level": level or "INFO",
             "delta_pct": round(primary_change, 2),
             "triggered_at": _now_kst_iso(),
-            "note": f"{note} | VIX {vix_ctx['value']:.1f} ({vix_ctx['change_pct']:+.1f}%)",
+            "note": rich_note,
             "kind": "US",
             "symbol": "^GSPC" if abs(sp_change) > abs(nas_change) else "^IXIC",
-            # 확장 필드 (optional)
             "session": "US",
             "observed_at": observed_at_kst,
             "hint": hint,
@@ -527,16 +588,17 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
             }
         }
     else:
-        # 일반 지수 알림 (K200 선물 포함)
+        # 일반 지수/선물 알림 - 풍부한 메시지 생성
+        rich_note = build_rich_message(level, session_type, data, note)
+        
         payload = {
             "index": display_name,
             "level": level or "INFO",
             "delta_pct": round(data.get("change_pct", 0), 2),
             "triggered_at": _now_kst_iso(),
-            "note": note,
+            "note": rich_note,
             "kind": kind,
             "symbol": symbol,
-            # 확장 필드 (optional)
             "session": session_type,
             "observed_at": observed_at_kst,
             "hint": hint,
@@ -563,8 +625,8 @@ def post_alert(data: dict, level: str | None, symbol: str, note: str, kind: str 
         if not r.ok:
             log.error("알림 전송 실패 %s %s", r.status_code, r.text)
         else:
-            log.info(">>> 알림 전송: [%s] %s %s (%s) hint=%s action=%s", 
-                    kind, display_name, level or "INFO", note, hint, action)
+            log.info(">>> 알림 전송: [%s] %s %s action=%s", 
+                    kind, display_name, level or "INFO", action)
     except Exception as e:
         log.error("알림 전송 오류: %s", e)
 
