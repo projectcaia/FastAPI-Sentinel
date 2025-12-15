@@ -1061,31 +1061,35 @@ def check_and_alert():
     log.info("체크 완료")
     log.info("-"*60)
 
-# ==================== Cron Job용 단일 실행 ====================
-async def check_and_alert_once():
-    """
-    시장 감시를 한 번만 실행하고 종료하는 함수 (Cron Job용)
-    Railway Cron Job에서 30분마다 이 스크립트를 실행
-    """
+# ==================== 메인 루프 (30분 간격 상시 실행) ====================
+def run_loop():
+    """30분 간격으로 시장 감시를 계속 실행하는 메인 루프"""
     log.info("="*60)
-    log.info("Sentinel 시장감시 시작 (Cron Job 단일 실행)")
+    log.info("Sentinel 시장감시 시작 (30분 간격 상시 실행)")
     log.info("="*60)
     log.info("설정:")
-    log.info("  - 전일대비: 0.8% / 1.5% / 2.5%")
-    log.info("  - 일중변동: 1.0% / 2.0% / 3.0%")
-    log.info("  - VIX 변화율: 10% / 20% / 30%")
+    log.info("  - 체크 간격: %d초 (%d분)", WATCH_INTERVAL, WATCH_INTERVAL // 60)
+    log.info("  - 전일대비: 0.8%% / 1.5%% / 2.5%%")
+    log.info("  - 일중변동: 1.0%% / 2.0%% / 3.0%%")
+    log.info("  - VIX 변화율: 10%% / 20%% / 30%%")
     log.info("  - VIX 필터: 지수 %.1f%% 미만 변동시 무시", VIX_FILTER_THRESHOLD)
     log.info("  - 변동성 윈도우: %d분", VOLATILITY_WINDOW)
     log.info("-"*60)
     
+    # 초기 체크
     try:
-        # 한 번만 체크하고 종료
         check_and_alert()
-        log.info("✅ 시장 감시 완료 - 프로세스 종료")
     except Exception as e:
-        log.error("❌ 시장 감시 오류: %s", e, exc_info=True)
-        raise  # 에러를 Cron Job 시스템에 전달
+        log.error("초기 체크 오류: %s", e, exc_info=True)
+    
+    # 30분 간격으로 계속 실행
+    while True:
+        time.sleep(WATCH_INTERVAL)
+        try:
+            check_and_alert()
+        except Exception as e:
+            log.error("주기 체크 오류: %s", e, exc_info=True)
+            # 오류가 나도 루프는 계속 실행
 
 if __name__ == "__main__":
-    # asyncio.run()을 사용하여 한 번만 실행
-    asyncio.run(check_and_alert_once())
+    run_loop()
