@@ -821,15 +821,26 @@ def check_and_alert():
     # 세션별 심볼 선택
     if sess == "KR":
         # 한국 시장: KOSPI 메인, ETF는 백업용
-        # KOSPI 데이터 먼저 시도, 실패시 ETF 사용
         symbols = [KR_MAIN_INDEX]  # KOSPI만
         session_name = "한국 정규장"
     elif sess == "US":
         symbols = US_SPOT
         session_name = "미국 정규장"
     elif sess == "FUTURES":
-        symbols = FUTURES_SYMBOLS  # 미국선물만 (K200선물은 DB증권 API)
-        session_name = "선물 시장 (미국)"
+        # FUTURES 세션은 한국 야간선물 시간 (18:00~05:00 KST)
+        # 하지만 미국 선물은 이 시간대에 장 전이므로 감시 제외
+        # 미국 선물은 US 세션 (NY 09:30~16:00)에만 감시
+        now_nyc = _now_nyc()
+        if is_us_market_open(now_nyc):
+            # NY장이 열려 있으면 미국 선물 감시
+            symbols = FUTURES_SYMBOLS
+            session_name = "선물 시장 (미국)"
+            log.info("✅ NY장 오픈 확인 - 미국 선물 감시")
+        else:
+            # NY장 휴장이면 K200 선물만 감시 (DB증권 API)
+            log.info("🚫 NY장 휴장 - 미국 선물 감시 스킵, K200 선물만 감시")
+            symbols = []  # 미국 선물 제외
+            session_name = "선물 시장 (K200)"
     else:
         _save_state(state)
         return
